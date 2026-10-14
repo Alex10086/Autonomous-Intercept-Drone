@@ -17,7 +17,7 @@
  * │  统计记录（仅用于数据分析，不参与导引计算）                             │
  * │    输入：/px4_2/fmu/out/vehicle_gps_position (目标真实GPS，统计专用)  │
  * │          /px4_1/fmu/out/vehicle_gps_position (自身GPS，统计专用)      │
- * │    输出：intercept_stats.csv（记录拦截全程数据）                       │
+ * │    输出：vpng_intercept_stats.csv（记录拦截全程数据）                  │
  * └─────────────────────────────────────────────────────────────────────┘
  *
  * 算法原理：
@@ -275,7 +275,7 @@ private:
 
     // CSV 文件
     std::ofstream csv_file_;
-    std::string   csv_path_ = "/home/verser/ros2_ws/vpng_intercept_stats.csv";
+    std::string   csv_path_ = "vpng_intercept_stats.csv";
 
     // 拦截统计摘要
     struct InterceptStats {

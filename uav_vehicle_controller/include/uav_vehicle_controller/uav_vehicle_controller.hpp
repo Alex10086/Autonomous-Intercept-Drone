@@ -11,7 +11,7 @@
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 
-#include "../../../../build/px4_msgs/rosidl_generator_cpp/px4_msgs/msg/detail/vehicle_odometry__struct.hpp"
+#include <thread>
 
 class uav_vehicle_controller : public rclcpp::Node
 {

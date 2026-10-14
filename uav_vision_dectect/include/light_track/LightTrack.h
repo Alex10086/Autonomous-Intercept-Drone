@@ -17,7 +17,7 @@ typedef struct Bbox {
 
 class LightTrack {
 public:
-    LightTrack(const char *model_init, const char *model_update);
+    LightTrack(const char *model_init, const char *model_update, bool use_cuda);
     ~LightTrack() = default;
 
     void init(const uint8_t *img, Bbox &box, int im_h, int im_w);

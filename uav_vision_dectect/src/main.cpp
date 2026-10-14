@@ -1,32 +1,29 @@
 //
 // Created by verse on 24-10-9.
 //
+#include <exception>
+#include <iostream>
 #include <memory>
-#include <rclcpp/executors.hpp>
-#include <rclcpp/node.hpp>
-#include <rclcpp/utilities.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 
 #include "uav_topic_subscrib.hpp"
-#include "uav_control.hpp"
 
 
 int main(int argc, char const *argv[])
 {
     rclcpp::init(argc, argv);
 
-    //图像检测节点
-    auto uav_image_detector_node = std::make_shared<UavTopicSubscrib>();
-
-    // auto uav_offboard_control_node = std::make_shared<UavControl>();
-
-    rclcpp::executors::MultiThreadedExecutor executor;
-
-    executor.add_node(uav_image_detector_node);
-    // executor.add_node(uav_offboard_control_node);
-
-    executor.spin();
-
+    int exit_code = 0;
+    try {
+        auto detector = std::make_shared<UavTopicSubscrib>();
+        rclcpp::executors::SingleThreadedExecutor executor;
+        executor.add_node(detector);
+        executor.spin();
+    } catch (const std::exception& e) {
+        std::cerr << "Vision initialization/inference failed: " << e.what() << '\n';
+        exit_code = 1;
+    }
     rclcpp::shutdown();
-    return 0;
+    return exit_code;
 }

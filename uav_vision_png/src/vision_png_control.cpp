@@ -146,7 +146,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
 
     // 飞行状态（判断 Offboard）
     status_sub_ = create_subscription<VehicleStatus>(
-        "/px4_1/fmu/out/vehicle_status", qos,
+        "/px4_1/fmu/out/vehicle_status_v1", qos,
         [this](const VehicleStatus::SharedPtr msg) {
             offboard_active_ =
                 (msg->nav_state == msg->NAVIGATION_STATE_OFFBOARD);

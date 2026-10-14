@@ -19,6 +19,7 @@ struct DetectorConfig {
     std::string modelPath;
     int inputWidth = 640;
     int inputHeight = 640;
+    bool useCuda = true;
 };
 
 class YoloDetector {

@@ -104,7 +104,7 @@ The following shows the system performance in typical interception tasks, which 
 ## Quick Start
 
 ### 1. Environment Requirements
-*   **ROS 2 Version**: Humble
+*   **ROS 2 Version**: Humble; native Ubuntu 24.04 / Jazzy simulation and visual guidance setup is described in sections 2.1 and 2.2. RL inference requires separate setup.
 *   **Gazebo**: Gazebo Harmonic (gz-sim 8.12.0)
 *   **PX4 Firmware**: v1.16 (**Micro-XRCE-DDS-Agent** version v2.4.x recommended)
 *   **Dependencies**: OpenCV, onnx, colcon
@@ -116,6 +116,116 @@ cd ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
+
+### 2.1 Native Ubuntu 24.04 / Jazzy
+
+Verified combination: Jazzy, Gazebo Harmonic 8.11.0, PX4 v1.16.0, and Micro-XRCE-DDS-Agent v2.4.3. Verification covers both vehicles' GPS/position/status messages, the 1920×1080 RGB camera bridge, and dual Offboard takeoff using `uav_target_sim` + `uav_png_intercept`. Visual guidance uses the detector below; RL and a completed interception are outside this verification scope.
+
+Version and configuration requirements:
+
+* Pin PX4 to `v1.16.0` (`6ea3539157ca358c70a515878b77077af7d4611d`), with the default source directory `~/PX4-Autopilot`.
+* Use `px4_msgs` from `release/1.16` at `392e831c1f659429ca83902e66820d7094591410`; all 226 message definitions match this firmware. Restore submodules with `git submodule update --init px4_msgs px4_ros_com`.
+* The firmware publishes `/px4_N/fmu/out/vehicle_status_v1`, not the old unversioned status topic.
+* `uav_vision_png` also needs the following entry in the firmware's `src/modules/uxrce_dds_client/dds_topics.yaml` under `publications`, followed by a firmware rebuild:
+
+  ```yaml
+  - topic: /fmu/out/hover_thrust_estimate
+    type: px4_msgs::msg::HoverThrustEstimate
+  ```
+
+* The DDS Agent may be installed to `~/.local/opt/intercept/agent`, with its command linked into `~/.local/bin/MicroXRCEAgent`. Reuse Jazzy's Fast-DDS 2.14 / Fast-CDR 2.2, but use upstream spdlog v1.9.2 for Agent v2.4.3 rather than the host's incompatible spdlog 1.12 / fmt 9.
+* Keep a real [QGroundControl ground station](https://docs.qgroundcontrol.com/Stable_V5.1/en/qgc-user-guide/getting_started/download_and_install.html) connected. PX4 may reject arming without it; do not replace the missing connection by disabling preflight checks or forcing arming.
+* Link the repository once at `~/intercept_ws/src/Autonomous-Intercept-Drone`. Do not separately link the same dependency packages.
+
+Build PX4 with an isolated Python environment instead of modifying system Python. For the prepared environment:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/.local/opt/intercept/px4-venv/bin/activate
+export CMAKE_PREFIX_PATH="/opt/ros/jazzy${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export GZ_DISTRO=harmonic
+cmake -S ~/PX4-Autopilot -B ~/PX4-Autopilot/build/px4_sitl_default \
+  -G Ninja -DCONFIG=px4_sitl_default -DPYTHON_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build ~/PX4-Autopilot/build/px4_sitl_default \
+  --target px4 px4_gz_plugins --parallel 4
+```
+
+Do not use `DONT_RUN=1 make ... gz_x500` as a build-only command for this tag: the Gazebo target still launches simulation. Leave the Python virtual environment before building the ROS workspace:
+
+```bash
+deactivate
+source /opt/ros/jazzy/setup.bash
+cd ~/intercept_ws
+colcon build --packages-select \
+  px4_msgs uav_common_msg uav_vehicle_controller uav_target_sim \
+  uav_png_intercept uav_keyboard_control uav_vision_png ros2_helloworld \
+  --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF
+source install/setup.bash
+```
+
+This build excludes `uav_vision_dectect`, `uav_rl_guidance`, and upstream `px4_ros_com` examples.
+
+Load this environment in every ROS terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/intercept_ws/install/setup.bash
+export PATH="$HOME/.local/bin:$PATH"
+export ROS_DOMAIN_ID=173
+export GZ_PARTITION=intercept_jazzy
+```
+
+Run these commands in four separate terminals:
+
+1. `~/.local/bin/qgroundcontrol` (the prepared user-local launcher; keep it open).
+2. `bash ~/PX4-Autopilot/run_swarm.sh`. First place the repository world at PX4's `Tools/simulation/gz/worlds/grass_world.sdf`; the launcher can be linked into the PX4 root. Set `PX4_ROOT` to override the default source directory, or `HEADLESS=1` to omit the Gazebo GUI.
+3. `ros2 run uav_target_sim uav_target_sim`.
+4. `ros2 run uav_png_intercept uav_png_intercept --ros-args -p csv_path:="$HOME/intercept_ws/intercept_data.csv"`.
+
+`run_swarm.sh` stops only its own process groups and no longer globally kills other simulations or deletes historical logs. Stopping control nodes triggers normal Offboard-loss protection; verification covers takeoff and communication, not a completed interception.
+
+
+### 2.2 Jazzy Visual Detection and Guidance
+
+Verification passed with default CUDA model detection/tracking, actual bounding-box publication, converged hover-thrust estimation, and `uav_vision_png` transitioning from takeoff through `SEARCHING` to `INTERCEPT`. ONNX profiles recorded CUDA convolution operations for all three models, rather than merely listing a Provider or injecting fake boxes. A completed interception and RL remain unverified.
+
+The vision chain is `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`. The detector publishes no flight-control commands; do not simultaneously run `uav_png_intercept` or another interceptor controller.
+
+Use ONNX Runtime C++ GPU SDK 1.23.2 with Blackwell-capable CUDA 12.8 and cuDNN 9 runtime libraries. A full CUDA Toolkit, PyTorch, and TensorRT are not required. The SDK may reside at `~/.local/opt/intercept/onnxruntime`; keep CUDA/cuDNN libraries in an isolated user-local environment instead of changing system Python. See the [ONNX CUDA dependency documentation](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/.local/opt/intercept/vision-env.bash
+cd ~/intercept_ws
+colcon build --symlink-install --packages-select uav_vision_dectect uav_vision_png \
+  --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+  -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT"
+source install/setup.bash
+export ROS_DOMAIN_ID=173
+```
+
+Models are installed in the ROS package share directory, so startup is independent of the working directory. `--symlink-install` avoids duplicate model copies. Defaults are `GDUT_UAV.onnx` and the LightTrack init/update models; retain the accompanying `.onnx.data` file. This YOLO model outputs `[1,25200,6]`, and published bounding boxes use original 1920×1080 image coordinates, not the 640×640 network input.
+
+Keep QGroundControl, dual SITL, and target control from the previous section running. In two terminals with the ROS/inference environment above loaded, run:
+
+```bash
+ros2 run uav_vision_dectect uav_vision_dectect
+```
+
+```bash
+ros2 run uav_vision_png uav_vision_png \
+  --ros-args -p csv_path:="$HOME/intercept_ws/vpng_intercept_stats.csv"
+```
+
+Detector parameters:
+
+* `use_cuda` defaults to `true`. CUDA initialization/inference failures exit with an error rather than silently falling back to CPU; explicit CPU diagnostics use `-p use_cuda:=false`.
+* `enable_tracking` and `show_debug_window` default to `true`; use `-p show_debug_window:=false` without a display.
+* Override default installed models with `yolo_model_path`, `tracker_init_model_path`, and `tracker_update_model_path`.
+* Original thresholds remain: inference confidence 0.4, IoU 0.45, and target acquisition strictly `>0.8`. One result is published per processed image with its original timestamp. Lost targets use `-1` for all four bbox fields; stale boxes are not repeatedly stamped as fresh detections.
+
+Guidance enters `SEARCHING` after reaching standby altitude and converging hover-thrust estimation, then enters `INTERCEPT` on a valid detection. `/vpng_data` exposes actual LOS and pixel errors; a running process or an existing topic alone does not prove detection or interception.
 
 ### 3. Running the Interception Task (Step Sequence)
 Please run each node in a separate terminal in the following order:

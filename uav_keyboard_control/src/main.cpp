@@ -8,6 +8,7 @@
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <termios.h>
 #include <unistd.h>
+#include <thread>
 
 using namespace std::chrono;
 using namespace px4_msgs::msg;
@@ -42,7 +43,7 @@ class DroneKeyboardControl : public rclcpp::Node
             trajectory_setpoint_publisher_ = this->create_publisher<TrajectorySetpoint>("/px4_1/fmu/in/trajectory_setpoint", 10);
             vehicle_command_publisher_ = this->create_publisher<VehicleCommand>("/px4_1/fmu/in/vehicle_command", 10);
             status_subscription_ =  this->create_subscription<px4_msgs::msg::VehicleStatus>(
-            "/px4_1/fmu/out/vehicle_status", 10, std::bind(&DroneKeyboardControl::status_callback, this, std::placeholders::_1));
+            "/px4_1/fmu/out/vehicle_status_v1", rclcpp::SensorDataQoS(), std::bind(&DroneKeyboardControl::status_callback, this, std::placeholders::_1));
 
             control_thread_ = std::thread(&DroneKeyboardControl::uav_takeoff_loop, this);
             RCLCPP_INFO(this->get_logger(), "Drone Keyboard Control Node Started. Use W/A/S/D for movement and Q/E for altitude.");

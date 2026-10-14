@@ -1,6 +1,7 @@
 #include "LightTrack.h"
-#include "timer.h"
 #include <algorithm>
+#include <array>
+#include <stdexcept>
 #include <cmath>
 #include <iostream>
 
@@ -61,15 +62,12 @@ static std::vector<float> ratio_change_fun(std::vector<float> w, std::vector<flo
 }
 
 
-LightTrack::LightTrack(const char *model_init, const char *model_update)
+LightTrack::LightTrack(const char *model_init, const char *model_update, bool use_cuda)
     : env_(ORT_LOGGING_LEVEL_WARNING, "LightTrack")
     , session_init_(nullptr)
     , session_update_(nullptr)
 {
     score_size = int(round(this->instance_size / this->total_stride));
-
-    std::string model_init_str = model_init;
-    std::string model_update_str = model_update;
 
     std::cout << "Loading model init from: " << model_init << std::endl;
     std::cout << "Loading model update from: " << model_update << std::endl;
@@ -78,24 +76,43 @@ LightTrack::LightTrack(const char *model_init, const char *model_update)
     opts.SetIntraOpNumThreads(4);
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-    try {
-        OrtCUDAProviderOptions cuda_opts;
+    if (use_cuda) {
+        OrtCUDAProviderOptions cuda_opts{};
         cuda_opts.device_id = 0;
         opts.AppendExecutionProvider_CUDA(cuda_opts);
-        std::cout << "LightTrack: CUDA provider enabled" << std::endl;
-    } catch (const Ort::Exception& e) {
-        std::cerr << "LightTrack: CUDA unavailable, using CPU" << std::endl;
     }
 
-    std::string init_path = model_init_str + ".onnx";
-    std::string update_path = model_update_str + ".onnx";
+    session_init_ = Ort::Session(env_, model_init, opts);
+    session_update_ = Ort::Session(env_, model_update, opts);
+    // These shipped graphs have fixed layouts; fail before inference if a path
+    // override supplies an incompatible model instead of indexing its buffers.
+    if (session_init_.GetInputCount() != 1 || session_init_.GetOutputCount() != 1 ||
+        session_update_.GetInputCount() != 2 || session_update_.GetOutputCount() != 2) {
+        throw std::runtime_error("LightTrack model input/output counts do not match the init/update contract");
+    }
+    Ort::AllocatorWithDefaultOptions allocator;
+    const auto require_tensor = [&](const Ort::Session& session, bool input, size_t index,
+                                    const char* name, const std::vector<int64_t>& shape) {
+        const auto actual_name = input ? session.GetInputNameAllocated(index, allocator)
+                                       : session.GetOutputNameAllocated(index, allocator);
+        const auto type = input ? session.GetInputTypeInfo(index) : session.GetOutputTypeInfo(index);
+        const auto info = type.GetTensorTypeAndShapeInfo();
+        if (std::string(actual_name.get()) != name ||
+            info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+            info.GetShape() != shape) {
+            throw std::runtime_error(std::string("LightTrack model tensor contract mismatch: ") + name);
+        }
+    };
+    require_tensor(session_init_, true, 0, "input1", {1, 3, exemplar_size, exemplar_size});
+    require_tensor(session_init_, false, 0, "output.1", {1, ZF_CHANNELS, ZF_SIZE, ZF_SIZE});
+    require_tensor(session_update_, true, 0, "input1", {1, ZF_CHANNELS, ZF_SIZE, ZF_SIZE});
+    require_tensor(session_update_, true, 1, "input2", {1, 3, instance_size, instance_size});
+    require_tensor(session_update_, false, 0, "output.1", {1, 1, score_size, score_size});
+    require_tensor(session_update_, false, 1, "output.2", {1, 4, score_size, score_size});
 
-    session_init_ = Ort::Session(env_, init_path.c_str(), opts);
-    session_update_ = Ort::Session(env_, update_path.c_str(), opts);
-
-    std::cout << "LightTrack models loaded:" << std::endl;
-    std::cout << "  Init:   " << init_path << std::endl;
-    std::cout << "  Update: " << update_path << std::endl;
+    std::cout << "LightTrack sessions initialized (" << (use_cuda ? "CUDA requested" : "CPU") << "):" << std::endl;
+    std::cout << "  Init:   " << model_init << std::endl;
+    std::cout << "  Update: " << model_update << std::endl;
 }
 
 std::vector<float> LightTrack::preprocess(const cv::Mat& img) {
@@ -223,8 +240,6 @@ void LightTrack::update(const cv::Mat &x_crops, float scale_z) {
     auto max_it = std::max_element(cls_score_sigmoid.begin(), cls_score_sigmoid.end());
     cls_score_position = std::distance(cls_score_sigmoid.begin(), max_it);
     track_score = *max_it;
-    std::cout << "The maximum value in the vector is: " << track_score
-              << " at position " << cls_score_position << std::endl;
 
     // Parse bbox_pred [1, 4, 18, 18]
     const float* bbox_pred_data = outputs[1].GetTensorData<float>();

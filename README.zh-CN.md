@@ -108,7 +108,7 @@
 ## 快速上手
 
 ### 1. 环境依赖
-*   **ROS 2 Version**: Humble
+*   **ROS 2 Version**: Humble；Ubuntu 24.04 上的 Jazzy 原生仿真与视觉制导配置见 2.1、2.2 节。RL 推理需单独配置。
 *   **Gazebo**:Gazebo Harmonic（gz-sim 8.12.0）
 *   **PX4 Firmware**: v1.16 (**Micro-XRCE-DDS-Agent**版本推荐v2.4.x)
 *   **Dependencies**: OpenCV, onnx, colcon
@@ -120,6 +120,116 @@ cd ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
+
+### 2.1 Ubuntu 24.04 / Jazzy 原生环境
+
+验证组合：Jazzy、Gazebo Harmonic 8.11.0、PX4 v1.16.0、Micro-XRCE-DDS-Agent v2.4.3。已验证双机 GPS/位置/状态消息、1920×1080 RGB 相机桥接，以及 `uav_target_sim` + `uav_png_intercept` 的双机 Offboard 起飞。视觉制导使用下节的检测节点；RL 和完整拦截命中不在本次验证范围内。
+
+版本与配置要求：
+
+* PX4 固件固定为 `v1.16.0`（`6ea3539157ca358c70a515878b77077af7d4611d`），源码目录默认为 `~/PX4-Autopilot`。
+* `px4_msgs` 使用 `release/1.16` 的 `392e831c1f659429ca83902e66820d7094591410`，其 226 个消息定义与上述固件一致。执行 `git submodule update --init px4_msgs px4_ros_com` 补齐子模块。
+* 该固件的飞行状态话题为 `/px4_N/fmu/out/vehicle_status_v1`，不是无版本后缀的旧话题。
+* `uav_vision_png` 需要额外发布悬停推力估计。在 PX4 的 `src/modules/uxrce_dds_client/dds_topics.yaml` 的 `publications` 中添加以下条目后重新编译：
+
+  ```yaml
+  - topic: /fmu/out/hover_thrust_estimate
+    type: px4_msgs::msg::HoverThrustEstimate
+  ```
+
+* DDS Agent 可安装至 `~/.local/opt/intercept/agent`，并链接命令到 `~/.local/bin/MicroXRCEAgent`。Jazzy 的 Fast-DDS 2.14 / Fast-CDR 2.2 可复用；Agent v2.4.3 使用上游 spdlog v1.9.2，不能直接替换为本机 spdlog 1.12 / fmt 9。
+* 保持真实的 [QGroundControl 地面站](https://docs.qgroundcontrol.com/Stable_V5.1/en/qgc-user-guide/getting_started/download_and_install.html)连接。未连接地面站时 PX4 可能拒绝解锁；不要用关闭预检或强制解锁代替缺失的连接。
+* 源码只需链接一次到 `~/intercept_ws/src/Autonomous-Intercept-Drone`；不要同时链接同一组依赖包，以免出现重复包。
+
+使用独立 Python 环境构建 PX4，避免修改系统 Python。已有环境的构建命令：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/.local/opt/intercept/px4-venv/bin/activate
+export CMAKE_PREFIX_PATH="/opt/ros/jazzy${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export GZ_DISTRO=harmonic
+cmake -S ~/PX4-Autopilot -B ~/PX4-Autopilot/build/px4_sitl_default \
+  -G Ninja -DCONFIG=px4_sitl_default -DPYTHON_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build ~/PX4-Autopilot/build/px4_sitl_default \
+  --target px4 px4_gz_plugins --parallel 4
+```
+
+不要用 `DONT_RUN=1 make ... gz_x500` 作为此版本的纯编译入口：该 Gazebo 目标仍会启动仿真。退出 Python 虚拟环境后构建 ROS 包：
+
+```bash
+deactivate
+source /opt/ros/jazzy/setup.bash
+cd ~/intercept_ws
+colcon build --packages-select \
+  px4_msgs uav_common_msg uav_vehicle_controller uav_target_sim \
+  uav_png_intercept uav_keyboard_control uav_vision_png ros2_helloworld \
+  --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF
+source install/setup.bash
+```
+
+这条构建路径不包含 `uav_vision_dectect`、`uav_rl_guidance` 或 `px4_ros_com` 的上游示例。
+
+每个 ROS 终端先加载以下环境：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/intercept_ws/install/setup.bash
+export PATH="$HOME/.local/bin:$PATH"
+export ROS_DOMAIN_ID=173
+export GZ_PARTITION=intercept_jazzy
+```
+
+分别在四个终端执行：
+
+1. `~/.local/bin/qgroundcontrol`（本机用户级入口；保持地面站打开）。
+2. `bash ~/PX4-Autopilot/run_swarm.sh`。先将本仓库的世界文件放入 PX4 的 `Tools/simulation/gz/worlds/grass_world.sdf`；可将启动脚本链接到 PX4 根目录。`PX4_ROOT` 可覆盖默认源码目录，`HEADLESS=1` 可关闭 Gazebo GUI。
+3. `ros2 run uav_target_sim uav_target_sim`。
+4. `ros2 run uav_png_intercept uav_png_intercept --ros-args -p csv_path:="$HOME/intercept_ws/intercept_data.csv"`。
+
+`run_swarm.sh` 仅停止自己创建的进程组，不再全局杀死其他仿真或删除历史日志。停止控制节点会触发正常的 Offboard 丢失保护；测试验证的是起飞和通信，不是完整拦截命中。
+
+
+### 2.2 Jazzy 视觉检测与制导
+
+实测已通过默认 CUDA 模式的真实模型检测/跟踪、检测框发布、悬停推力收敛，以及 `uav_vision_png` 从起飞进入 `SEARCHING` / `INTERCEPT`。三个模型的 ONNX profiling 均记录了 CUDA 卷积运算；验证不是假检测框，也不是只检查 Provider 名称。完整拦截命中和 RL 仍未验证。
+
+视觉输入链路为 `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`。检测节点不发布飞控命令，不要同时运行 `uav_png_intercept` 或其他拦截机控制节点。
+
+使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/.local/opt/intercept/vision-env.bash
+cd ~/intercept_ws
+colcon build --symlink-install --packages-select uav_vision_dectect uav_vision_png \
+  --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+  -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT"
+source install/setup.bash
+export ROS_DOMAIN_ID=173
+```
+
+检测模型由包安装到 ROS share 目录，启动不依赖当前工作目录。`--symlink-install` 避免重复复制模型。默认模型为 `GDUT_UAV.onnx` 和 LightTrack 的 init/update；保留随附的 `.onnx.data` 文件。该 YOLO 模型输出为 `[1,25200,6]`，检测框坐标对应原始 1920×1080 图像，而不是 640×640 网络输入。
+
+保持上一节的 QGroundControl、双机仿真和目标机控制运行，再在两个已加载上述 ROS/推理环境的终端分别执行：
+
+```bash
+ros2 run uav_vision_dectect uav_vision_dectect
+```
+
+```bash
+ros2 run uav_vision_png uav_vision_png \
+  --ros-args -p csv_path:="$HOME/intercept_ws/vpng_intercept_stats.csv"
+```
+
+检测节点参数：
+
+* `use_cuda` 默认 `true`。CUDA 初始化或推理失败时退出并报告错误，不会悄悄回退 CPU；显式 CPU 诊断可传 `-p use_cuda:=false`。
+* `enable_tracking` 默认 `true`；`show_debug_window` 默认 `true`。无显示环境传 `-p show_debug_window:=false`。
+* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。
+* 保留原算法的 0.4 推理过滤、0.45 IoU 阈值和严格 `>0.8` 的目标捕获条件。发布一次实际处理图像的检测框并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
+
+视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
 
 ### 3. 运行拦截任务 (步骤序列)
 请按以下顺序在不同终端中运行各节点：

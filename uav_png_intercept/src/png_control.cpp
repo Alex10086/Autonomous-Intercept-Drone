@@ -26,6 +26,8 @@
 // ============================================================
 PngInterceptor::PngInterceptor() : Node("png_interceptor")
 {
+    csv_path_ = declare_parameter<std::string>("csv_path", "intercept_data.csv");
+
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos = rclcpp::QoS(
         rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
@@ -89,7 +91,7 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
 
     // ---------- 订阅：飞行状态 ----------
     status_sub_ = create_subscription<VehicleStatus>(
-        "/px4_1/fmu/out/vehicle_status", qos,
+        "/px4_1/fmu/out/vehicle_status_v1", qos,
         [this](const VehicleStatus::SharedPtr msg) {
             nav_state_    = msg->nav_state;
             arming_state_ = msg->arming_state;
@@ -408,8 +410,11 @@ void PngInterceptor::publish_vehicle_command(uint16_t command, float p1, float p
 
 void PngInterceptor::save_data_to_csv() {
     if (!csv_file_.is_open()) {
-        // 使用绝对路径，防止找不到文件
-        csv_file_.open("/home/verser/ros2_ws/src/uav_png_intercept/intercept_data.csv", std::ios::out);
+        csv_file_.open(csv_path_, std::ios::out);
+        if (!csv_file_.is_open()) {
+            RCLCPP_ERROR(get_logger(), "无法打开 CSV 文件: %s", csv_path_.c_str());
+            return;
+        }
         csv_file_ << "time,s_x,s_y,s_z,t_x,t_y,t_z,dist\n";
     }
 

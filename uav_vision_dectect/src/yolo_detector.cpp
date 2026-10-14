@@ -2,6 +2,9 @@
 
 #include <iostream>
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <stdexcept>
 
 YoloDetector::YoloDetector(const DetectorConfig& config)
     : config_(config)
@@ -12,16 +15,31 @@ YoloDetector::YoloDetector(const DetectorConfig& config)
     opts.SetIntraOpNumThreads(4);
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-    try {
-        OrtCUDAProviderOptions cuda_opts;
+    if (config.useCuda) {
+        OrtCUDAProviderOptions cuda_opts{};
         cuda_opts.device_id = 0;
         opts.AppendExecutionProvider_CUDA(cuda_opts);
-        std::cout << "YoloDetector: CUDA provider enabled" << std::endl;
-    } catch (const Ort::Exception& e) {
-        std::cerr << "YoloDetector: CUDA unavailable, using CPU" << std::endl;
     }
 
     session_ = Ort::Session(env_, config.modelPath.c_str(), opts);
+    if (session_.GetInputCount() != 1 || session_.GetOutputCount() < 1) {
+        throw std::runtime_error("YOLO requires one image input and a decoded output tensor");
+    }
+    const auto input_type = session_.GetInputTypeInfo(0);
+    const auto input_info = input_type.GetTensorTypeAndShapeInfo();
+    const std::vector<int64_t> expected_input{1, 3, config.inputHeight, config.inputWidth};
+    if (input_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        input_info.GetShape() != expected_input) {
+        throw std::runtime_error("YOLO requires FLOAT image input [1,3,640,640]");
+    }
+    const auto output_type = session_.GetOutputTypeInfo(0);
+    const auto output_info = output_type.GetTensorTypeAndShapeInfo();
+    const auto output_shape = output_info.GetShape();
+    if (output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        output_shape.size() != 3 || output_shape[0] != 1 ||
+        output_shape[1] <= 0 || output_shape[2] < 6) {
+        throw std::runtime_error("YOLO requires decoded FLOAT output [1,N,5+classes] (xywh,obj,class probabilities)");
+    }
 
     auto input_name = session_.GetInputNameAllocated(0, allocator_);
     input_name_ = input_name.get();
@@ -29,7 +47,7 @@ YoloDetector::YoloDetector(const DetectorConfig& config)
     auto output_name = session_.GetOutputNameAllocated(0, allocator_);
     output_name_ = output_name.get();
 
-    std::cout << "ONNX model loaded: " << config.modelPath << std::endl;
+    std::cout << "ONNX model loaded (" << (config.useCuda ? "CUDA requested" : "CPU") << "): " << config.modelPath << std::endl;
     std::cout << "  Input:  " << input_name_ << " [1, 3, " << config.inputHeight << ", " << config.inputWidth << "]" << std::endl;
     std::cout << "  Output: " << output_name_ << std::endl;
 }

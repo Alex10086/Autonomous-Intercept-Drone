@@ -16,6 +16,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <string>
 
 using namespace px4_msgs::msg;
 using namespace std::chrono_literals;
@@ -104,6 +105,7 @@ private:
 
     // -------- 数据记录 --------
     std::ofstream csv_file_;
+    std::string csv_path_;
     GeographicLib::LocalCartesian geo_converter_; // 统一的坐标转换器
     bool origin_set_ = false;
     void save_data_to_csv();
