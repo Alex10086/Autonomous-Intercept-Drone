@@ -192,7 +192,6 @@ private:
 
     // 接收时刻的单调时间；无目标消息不刷新有效观测时间。
     std::chrono::steady_clock::time_point last_visual_observation_{};
-    bool visual_observation_valid_ = false;
     double freshness_timeout_ = 0.15;   ///< 秒，超过后 COAST
     double track_lost_timeout_ = 0.6;   ///< 秒，从最后有效观测起算
 

@@ -266,7 +266,7 @@ void VisionPNG::update_visual_state()
     const double age = observation_age();
     if (age >= track_lost_timeout_) {
         state_ = VpngState::TRACK_LOST;
-    } else if (!visual_observation_valid_ || age > freshness_timeout_) {
+    } else if (age > freshness_timeout_) {
         state_ = VpngState::COAST;
     }
 }
@@ -275,16 +275,13 @@ void VisionPNG::detection_callback(const RectMsg &msg)
 {
     // Check the previous observation before a new arrival can refresh its age.
     update_visual_state();
+    // Invalid results neither replace the cached observation nor refresh its age.
+    if (msg.width <= 0 || msg.height <= 0) return;
     const double roll = roll_, pitch = pitch_, yaw = yaw_;
     detect_x_ = msg.x;
     detect_y_ = msg.y;
     detect_w_ = msg.width;
     detect_h_ = msg.height;
-    visual_observation_valid_ = detect_w_ > 0 && detect_h_ > 0;
-    if (!visual_observation_valid_) {
-        if (state_ == VpngState::INTERCEPT) state_ = VpngState::COAST;
-        return;
-    }
     last_visual_observation_ = std::chrono::steady_clock::now();
     if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE) return;
     if (state_ == VpngState::SEARCHING &&
@@ -609,7 +606,7 @@ void VisionPNG::publish_telemetry()
     case VpngState::DONE: msg.state = "DONE"; break;
     }
     msg.parameters_yaml = parameters_yaml_;
-    msg.guidance_valid = state_ == VpngState::INTERCEPT && visual_observation_valid_ &&
+    msg.guidance_valid = state_ == VpngState::INTERCEPT &&
         observation_age() <= freshness_timeout_ &&
         png_initialized_ && std::isfinite(LOS_angle_v_) && std::isfinite(LOS_angle_z_) &&
         std::isfinite(d_v_angle_v_) && std::isfinite(d_v_angle_z_);

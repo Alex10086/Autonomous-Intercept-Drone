@@ -17,7 +17,7 @@ from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg
 
 
 @pytest.fixture
-def flight(tmp_path):
+def flight(tmp_path, request):
     context = rclpy.context.Context()
     rclpy.init(args=[], context=context)
     prefix = '/freshness_' + uuid.uuid4().hex
@@ -38,7 +38,8 @@ def flight(tmp_path):
     ]
     executable = os.environ.get('VISION_PNG_EXECUTABLE') or str(
         Path(get_package_prefix('uav_vision_png')) / 'lib/uav_vision_png/uav_vision_png')
-    command = [executable, '--ros-args', '-p', 'freshness_timeout:=0.25',
+    freshness_timeout = getattr(request, 'param', 0.25)
+    command = [executable, '--ros-args', '-p', f'freshness_timeout:={freshness_timeout}',
                '-p', 'track_lost_timeout:=1.0']
     for topic in topics:
         command += ['-r', f'{topic}:={prefix}{topic}']
@@ -132,6 +133,37 @@ def test_one_observation_is_not_reprojected_as_attitude_changes(flight):
     wait(lambda: bool(messages['data']) and
          abs(messages['data'][-1].los_angle_z - first.los_z) > 0.1)
     assert messages['data'][-1].los_angle_z == pytest.approx(first.los_z - 0.5, abs=1e-5)
+
+
+@pytest.mark.parametrize('flight', [0.15], indirect=True)
+def test_brief_invalid_detection_preserves_guidance_and_history(flight):
+    messages, _, _, _, pump, wait, state, box = flight
+    box()
+    wait(lambda: state('INTERCEPT') and messages['telemetry'][-1].guidance_valid)
+    first = messages['data'][-1]
+    data_count = len(messages['data'])
+    telemetry_count = len(messages['telemetry'])
+
+    pump(0.04, lambda: box(valid=False))
+    assert len(messages['data']) == data_count
+    assert state('INTERCEPT')
+    assert messages['telemetry'][-1].guidance_valid
+    for telemetry in messages['telemetry'][telemetry_count:]:
+        assert telemetry.state == 'INTERCEPT'
+        assert telemetry.guidance_valid
+        assert telemetry.los_z == pytest.approx(first.los_angle_z, abs=1e-5)
+        assert telemetry.png_z == pytest.approx(first.d_v_angle_z, abs=1e-5)
+
+    box(x=1200)
+    wait(lambda: len(messages['data']) > data_count)
+    next_frame = messages['data'][-1]
+    delta = next_frame.los_angle_z - first.los_angle_z
+    assert abs(delta) > 0.02
+    assert next_frame.diff_los_angle_z == pytest.approx(delta, abs=1e-5)
+    assert next_frame.d_v_angle_z == pytest.approx(
+        first.d_v_angle_z + 4.0 * delta, abs=1e-5)
+    expected_yaw_rate = 0.0008 * 280.0 + 0.0002 * (280.0 - 140.0)
+    wait(lambda: abs(messages['command'][-1].yawspeed - expected_yaw_rate) < 1e-5)
 
 
 @pytest.mark.parametrize('invalid_stream', [False, True], ids=['silent-detector', 'no-target'])
