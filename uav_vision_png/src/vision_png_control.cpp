@@ -51,8 +51,8 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     this->declare_parameter("k2_yaw",             k2_yaw_);
     this->declare_parameter("k_ey",               k_ey_);
     this->declare_parameter("standby_altitude",   standby_altitude_);
-    this->declare_parameter("coast_thresh",       coast_thresh_);
-    this->declare_parameter("lost_thresh",        lost_thresh_);
+    this->declare_parameter("freshness_timeout", freshness_timeout_);
+    this->declare_parameter("track_lost_timeout", track_lost_timeout_);
     this->declare_parameter("hit_radius",         (double)hit_radius_);
 
     focal_length_      = this->get_parameter("focal_length").as_double();
@@ -67,8 +67,13 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     k2_yaw_            = this->get_parameter("k2_yaw").as_double();
     k_ey_              = this->get_parameter("k_ey").as_double();
     standby_altitude_  = this->get_parameter("standby_altitude").as_double();
-    coast_thresh_      = this->get_parameter("coast_thresh").as_int();
-    lost_thresh_       = this->get_parameter("lost_thresh").as_int();
+    freshness_timeout_ = this->get_parameter("freshness_timeout").as_double();
+    track_lost_timeout_ = this->get_parameter("track_lost_timeout").as_double();
+    if (!std::isfinite(freshness_timeout_) || freshness_timeout_ <= 0.0 ||
+        !std::isfinite(track_lost_timeout_) || track_lost_timeout_ <= freshness_timeout_) {
+        throw std::invalid_argument(
+            "Require finite 0 < freshness_timeout < track_lost_timeout (seconds)");
+    }
     hit_radius_        = (float)this->get_parameter("hit_radius").as_double();
     require_experiment_start_ = declare_parameter<bool>("require_experiment_start", false);
     takeoff_altitude_tolerance_ = declare_parameter<double>("takeoff_altitude_tolerance", 0.5);
@@ -115,32 +120,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     // 视觉检测结果（核心输入）
     detect_sub_ = create_subscription<RectMsg>(
         "/camera_detect_result", 10,
-        [this](const RectMsg::UniquePtr msg) {
-            detect_x_ = msg->x;
-            detect_y_ = msg->y;
-            detect_w_ = msg->width;
-            detect_h_ = msg->height;
-
-            if (msg->width == -1) {
-                lost_frames_++;
-            } else {
-                lost_frames_ = 0;
-                // 检测有效：若正在 SEARCHING，切换到拦截
-                if (state_ == VpngState::SEARCHING && detect_w_ > 0 && detect_h_ > 0 &&
-                    (!require_experiment_start_ || experiment_start_) &&
-                    (!precise_standby_ || takeoff_ready())) {
-                    RCLCPP_INFO(get_logger(), "→ 视觉检测到目标，进入 INTERCEPT");
-                    state_ = VpngState::INTERCEPT;
-                }
-                // 若目标重新出现（从 TRACK_LOST 恢复）
-                if (state_ == VpngState::TRACK_LOST) {
-                    RCLCPP_INFO(get_logger(), "→ 目标重新出现，恢复 INTERCEPT");
-                    png_initialized_ = false;  // 重新初始化 PNG
-                    state_ = VpngState::INTERCEPT;
-                }
-            }
-
-        });
+        [this](const RectMsg::UniquePtr msg) { detection_callback(*msg); });
 
     // 自身姿态（四元数 → 欧拉角）
     odometry_sub_ = create_subscription<VehicleOdometry>(
@@ -229,10 +209,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
         std::chrono::microseconds(5000),
         std::bind(&VisionPNG::control_loop, this));
 
-    // 20 Hz 视觉 PNG LOS 计算
-    timer_png_ = create_wall_timer(
-        std::chrono::milliseconds(25),
-        std::bind(&VisionPNG::png_calculate, this));
     // Cache startup parameters, including effective launch overrides and ROS parameters.
     std::ostringstream yaml;
     yaml << std::setprecision(17);
@@ -267,27 +243,68 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
 // ============================================================
 void VisionPNG::control_loop()
 {
-
+    update_visual_state();
     switch (state_) {
     case VpngState::TAKE_OFF:    handle_takeoff();    break;
     case VpngState::SEARCHING:   handle_searching();  break;
     case VpngState::INTERCEPT:   handle_intercept();  break;
+    case VpngState::COAST:       handle_intercept();  break;
     case VpngState::TRACK_LOST:  handle_track_lost(); break;
     case VpngState::DONE:        handle_done();       break;
     }
 }
 
+double VisionPNG::observation_age() const
+{
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_visual_observation_).count();
+}
+
+void VisionPNG::update_visual_state()
+{
+    if (state_ != VpngState::INTERCEPT && state_ != VpngState::COAST) return;
+    const double age = observation_age();
+    if (age >= track_lost_timeout_) {
+        state_ = VpngState::TRACK_LOST;
+    } else if (!visual_observation_valid_ || age > freshness_timeout_) {
+        state_ = VpngState::COAST;
+    }
+}
+
+void VisionPNG::detection_callback(const RectMsg &msg)
+{
+    // Check the previous observation before a new arrival can refresh its age.
+    update_visual_state();
+    const double roll = roll_, pitch = pitch_, yaw = yaw_;
+    detect_x_ = msg.x;
+    detect_y_ = msg.y;
+    detect_w_ = msg.width;
+    detect_h_ = msg.height;
+    visual_observation_valid_ = detect_w_ > 0 && detect_h_ > 0;
+    if (!visual_observation_valid_) {
+        if (state_ == VpngState::INTERCEPT) state_ = VpngState::COAST;
+        return;
+    }
+    last_visual_observation_ = std::chrono::steady_clock::now();
+    if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE) return;
+    if (state_ == VpngState::SEARCHING &&
+        ((require_experiment_start_ && !experiment_start_) ||
+         (precise_standby_ && !takeoff_ready()))) return;
+
+    // First acquisition and either loss recovery use the existing initialization.
+    if (state_ != VpngState::INTERCEPT) png_initialized_ = false;
+    state_ = VpngState::INTERCEPT;
+    png_calculate(roll, pitch, yaw);
+}
+
 // ============================================================
-//  20 Hz  视觉 PNG LOS 计算
+//  每个有效检测回调仅计算一次，姿态固定为接收时刻快照
 //  严格参考 los_control.cpp 中的 LOS_calculate()
 //  输入：像素坐标 detect_x_, detect_y_, detect_w_, detect_h_
 //  输出：d_v_angle_v_, d_v_angle_z_（期望速度角度）
 // ============================================================
-void VisionPNG::png_calculate()
+void VisionPNG::png_calculate(double roll, double pitch, double yaw)
 {
-    // 只有在拦截阶段且目标有效时才更新
-    if (state_ != VpngState::INTERCEPT) return;
-    if (detect_w_ == -1) return;  // 目标丢失，不更新
 
     // ---------- Step 1: 计算像素误差（相对图像中心）----------
     double cx = image_width_  / 2.0;
@@ -302,9 +319,9 @@ void VisionPNG::png_calculate()
 
     // ---------- Step 3: 相机系 → 机体系 → NED 系 ----------
     // 机体→NED 旋转矩阵（ZYX 欧拉角，与 los_control.cpp 完全一致）
-    Eigen::AngleAxisd Ryaw  (yaw_,   Eigen::Vector3d::UnitZ());
-    Eigen::AngleAxisd Rpitch(pitch_, Eigen::Vector3d::UnitY());
-    Eigen::AngleAxisd Rroll (roll_,  Eigen::Vector3d::UnitX());
+    Eigen::AngleAxisd Ryaw  (yaw,   Eigen::Vector3d::UnitZ());
+    Eigen::AngleAxisd Rpitch(pitch, Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd Rroll (roll,  Eigen::Vector3d::UnitX());
     Eigen::Matrix3d R_b2n = Ryaw.toRotationMatrix()
                           * Rpitch.toRotationMatrix()
                           * Rroll.toRotationMatrix();
@@ -312,10 +329,6 @@ void VisionPNG::png_calculate()
     // LOS 向量：相机系 → 机体系 → NED 系
     Eigen::Vector3d Nt_ned = R_b2n * R_c2b_ * Nt;
 
-    // 检测是否与上一帧完全相同（重复帧，跳过更新）
-    if (Nt_ned == last_LOS_vec_) return;
-    last_LOS_vec_ = Nt_ned;
-    LOS_vec_      = Nt_ned;
 
     // ---------- Step 4: 计算 LOS 角度 ----------
     double rxy = std::sqrt(Nt_ned(0)*Nt_ned(0) + Nt_ned(1)*Nt_ned(1));
@@ -339,7 +352,7 @@ void VisionPNG::png_calculate()
         RCLCPP_INFO(get_logger(),
             "[PNG 初始化] LOS(v=%.3f z=%.3f) |V|=%.2f",
             LOS_angle_v_, LOS_angle_z_, Vt.norm());
-        return;
+        last_ex_ = ex_;  // No yaw derivative across acquisition or loss recovery.
     }
 
     double diff_LOS_v = LOS_angle_v_ - last_LOS_angle_v_;
@@ -404,9 +417,9 @@ void VisionPNG::png_calculate()
     data.diff_los_angle_z = (float)diff_LOS_z;
     data.ex            = (float)ex_;
     data.ey            = (float)ey_;
-    data.yaw           = (float)yaw_;
-    data.pitch         = (float)pitch_;
-    data.roll          = (float)roll_;
+    data.yaw           = (float)yaw;
+    data.pitch         = (float)pitch;
+    data.roll          = (float)roll;
     data.pixel_u       = (float)(detect_x_ + detect_w_ / 2.0);
     data.pixel_v       = (float)(detect_y_ + detect_h_ / 2.0);
     data.vel_total     = (float)Vt.norm();
@@ -476,15 +489,11 @@ void VisionPNG::handle_searching()
         publish_offboard_velocity_mode();
         publish_velocity_setpoint(0.0f, 0.0f, 0.0f, 0.0f);
     }
-    if (precise_standby_ && takeoff_ready() &&
-        (!require_experiment_start_ || experiment_start_) && detect_w_ > 0 && detect_h_ > 0) {
-        state_ = VpngState::INTERCEPT;
-    }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "[SEARCHING] 等待视觉检测目标... detect_w=%d", detect_w_);
 
-    // The release may arrive after the latest detection; check both each control tick.
+    // Only a new detection callback may initialize and enter INTERCEPT.
 }
 
 // ============================================================
@@ -496,22 +505,13 @@ void VisionPNG::handle_intercept()
     arm();
     set_offboard_mode();
 
-    // ---- 目标丢失分级处理 ----
-    if (lost_frames_ > 0 && lost_frames_ < coast_thresh_) {
-        // 短暂丢失（< coast_thresh_ 帧）：惯性续飞，保持上一帧速度+偏航
-        // 同时继续旋转机头寻找目标（保持 d_yaw_ 不变）
+    if (state_ == VpngState::COAST) {
         publish_offboard_velocity_mode();
         publish_velocity_setpoint(coast_vx_, coast_vy_, coast_vz_, (float)d_yaw_);
+        evaluate_hit();
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 100,
-            "[INTERCEPT/COAST] 惯性续飞 lost=%d v=(%.1f,%.1f,%.1f)",
-            lost_frames_, coast_vx_, coast_vy_, coast_vz_);
-        return;
-    }
-
-    if (lost_frames_ >= lost_thresh_) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 500,
-            "[INTERCEPT] 目标长时间丢失 lost_frames=%d，切换 TRACK_LOST", lost_frames_);
-        state_ = VpngState::TRACK_LOST;
+            "[COAST] observation_age=%.3f v=(%.1f,%.1f,%.1f)",
+            observation_age(), coast_vx_, coast_vy_, coast_vz_);
         return;
     }
 
@@ -556,7 +556,7 @@ void VisionPNG::handle_intercept()
 
 // ============================================================
 //  状态机：TRACK_LOST
-//  目标长时间丢失（> lost_thresh_ 帧），制动减速并原地慢旋寻找目标
+//  有效视觉观测超时，制动减速并原地慢旋寻找目标
 // ============================================================
 void VisionPNG::handle_track_lost()
 {
@@ -583,8 +583,7 @@ void VisionPNG::handle_done()
     RCLCPP_INFO_ONCE(get_logger(), "★★★ 拦截完成，悬停中 ★★★");
 }
 
-// GPS hit evaluation preserves the existing INTERCEPT -> DONE safety transition.
-// Called at the same point after publishing the visual velocity command as before.
+// GPS hit evaluation is active in both INTERCEPT and COAST, never in guidance.
 void VisionPNG::evaluate_hit()
 {
     if (!target_pos_ok_) return;
@@ -605,11 +604,13 @@ void VisionPNG::publish_telemetry()
     case VpngState::TAKE_OFF: msg.state = "TAKEOFF"; break;
     case VpngState::SEARCHING: msg.state = "SEARCHING"; break;
     case VpngState::INTERCEPT: msg.state = "INTERCEPT"; break;
+    case VpngState::COAST: msg.state = "COAST"; break;
     case VpngState::TRACK_LOST: msg.state = "TRACK_LOST"; break;
     case VpngState::DONE: msg.state = "DONE"; break;
     }
     msg.parameters_yaml = parameters_yaml_;
-    msg.guidance_valid = state_ == VpngState::INTERCEPT && detect_w_ != -1 &&
+    msg.guidance_valid = state_ == VpngState::INTERCEPT && visual_observation_valid_ &&
+        observation_age() <= freshness_timeout_ &&
         png_initialized_ && std::isfinite(LOS_angle_v_) && std::isfinite(LOS_angle_z_) &&
         std::isfinite(d_v_angle_v_) && std::isfinite(d_v_angle_z_);
     const double nan = std::numeric_limits<double>::quiet_NaN();

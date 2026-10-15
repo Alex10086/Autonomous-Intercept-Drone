@@ -196,6 +196,12 @@ export GZ_PARTITION=intercept_jazzy
 
 视觉输入链路为 `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`。检测节点不发布飞控命令，不要同时运行 `uav_png_intercept` 或其他拦截机控制节点。
 
+Vision PNG 只在新的有效检测回调中，用该回调接收时的姿态快照更新一次 LOS／PNG 和 yaw-PD 历史；相同 bbox 坐标的新消息仍正常处理，不按坐标去重。已移除 40 Hz PNG 重算定时器。200 Hz 控制循环保留原有速度公式、增益和垂向补偿；新帧之间不推进视觉历史。
+
+失锁配置改为秒数：`freshness_timeout: 0.15`、`track_lost_timeout: 0.6`，要求有限且 `0 < freshness_timeout < track_lost_timeout`。收到无目标结果立即 COAST，完全没有消息也会按有效观测年龄进入 COAST／TRACK_LOST；两阈值均从最后一次有效检测的单调接收时刻起算，无目标消息不刷新计时。COAST 保持最后速度／偏航率并继续命中评价，TRACK_LOST 保留原制动搜索策略。两类恢复都重新初始化 PNG 和 yaw 差分参考，避免跨失锁差分。旧 `coast_thresh`／`lost_thresh` 帧数参数已删除，需迁移配置。
+
+此版本没有实现拍摄时刻姿态插值，也不能用接收年龄判断图像的真实推理延迟。`uav_vision_png/test/test_visual_freshness.py` 使用隔离话题启动真实节点，覆盖旧框＋新姿态、相同坐标新帧、静默／无目标超时、恢复和 COAST 命中；节点回归不代表修复后的实际拦截命中率已验证。
+
 使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
 
 ```bash

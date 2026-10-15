@@ -45,11 +45,10 @@ uav_vision_png:
     # Optional standby_yaw (radians NED); omitted/NaN preserves legacy heading.
     # Experiments override tolerances to 0.08 m / 0.2 m/s, settling to 2 s.
 
-    # ---- 目标丢失阈值 ----
-    # 惯性续飞阈值：丢失帧数低于此值时保持上一帧速度继续飞行（约 0.5s@30Hz检测）
-    coast_thresh: 30
-    # 悬停阈值：丢失帧数超过此值才真正切换 TRACK_LOST 悬停
-    lost_thresh: 90
+    # ---- 视觉观测超时（秒；从最后有效检测的接收时刻起算）----
+    # 明确无目标立即 COAST；完全不发消息也会按时间进入 COAST / TRACK_LOST。
+    freshness_timeout: 0.15
+    track_lost_timeout: 0.6
 
     # ---- GPS 命中评估（不参与视觉导引；记录由独立 recorder 负责）----
     # 命中判定半径 (m)

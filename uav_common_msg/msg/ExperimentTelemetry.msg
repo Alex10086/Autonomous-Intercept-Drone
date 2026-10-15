@@ -1,7 +1,7 @@
 # Algorithm observation only; file recording belongs to experiment_recorder.
 std_msgs/Header header
 string algorithm
-# INIT, TAKEOFF, SEARCHING, INTERCEPT, TRACK_LOST, DONE
+# INIT, TAKEOFF, SEARCHING, INTERCEPT, COAST, TRACK_LOST, DONE
 string state
 # Actual node parameters serialized as a YAML mapping.
 string parameters_yaml

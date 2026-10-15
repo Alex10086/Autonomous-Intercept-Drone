@@ -84,6 +84,7 @@ enum class VpngState : uint8_t {
     TAKE_OFF,       // 起飞到待机高度，等待悬停推力收敛
     SEARCHING,      // 已到高度，等待视觉检测到目标
     INTERCEPT,      // 视觉 PNG 导引拦截中
+    COAST,          // 观测过期／明确丢失，保持最后有效指令
     TRACK_LOST,     // 目标丢失，悬停保持
     DONE            // 拦截完成（命中目标）
 };
@@ -102,7 +103,10 @@ private:
     //  核心控制循环
     // ----------------------------------------------------------
     void control_loop();          ///< 200 Hz 姿态/发布循环
-    void png_calculate();         ///< 20  Hz 视觉 PNG LOS 计算
+    void detection_callback(const RectMsg &msg);
+    void png_calculate(double roll, double pitch, double yaw);
+    double observation_age() const;
+    void update_visual_state();
 
     // ----------------------------------------------------------
     //  状态机各阶段处理
@@ -136,7 +140,6 @@ private:
     //  定时器
     // ----------------------------------------------------------
     rclcpp::TimerBase::SharedPtr timer_control_;   ///< 200 Hz
-    rclcpp::TimerBase::SharedPtr timer_png_;       ///< 20  Hz
     rclcpp::TimerBase::SharedPtr timer_telemetry_;
     rclcpp::Publisher<uav_common_msg::msg::ExperimentTelemetry>::SharedPtr telemetry_pub_;
     std::string parameters_yaml_;
@@ -187,10 +190,11 @@ private:
     int detect_w_      = -1;  ///< bbox 宽度；-1 = 目标丢失
     int detect_h_      = 0;   ///< bbox 高度
 
-    // 连续丢失帧计数与阈值
-    int lost_frames_   = 0;
-    int lost_thresh_   = 45;   ///< 超过此值切换到 TRACK_LOST（原地搜索）
-    int coast_thresh_  = 15;   ///< 低于此值时惯性续飞（约 0.5s@30Hz）
+    // 接收时刻的单调时间；无目标消息不刷新有效观测时间。
+    std::chrono::steady_clock::time_point last_visual_observation_{};
+    bool visual_observation_valid_ = false;
+    double freshness_timeout_ = 0.15;   ///< 秒，超过后 COAST
+    double track_lost_timeout_ = 0.6;   ///< 秒，从最后有效观测起算
 
     // ---- 自身状态（导引使用）----
     double roll_  = 0.0;
@@ -218,8 +222,6 @@ private:
     double last_v_angle_v_ = 0.0;
     double last_v_angle_z_ = 0.0;
 
-    Eigen::Vector3d LOS_vec_;       ///< 当前 LOS 向量（NED）
-    Eigen::Vector3d last_LOS_vec_;  ///< 上一帧 LOS 向量（用于检测重复帧）
 
     double ex_ = 0.0;  ///< 像素误差 x（相对图像中心）
     double ey_ = 0.0;  ///< 像素误差 y

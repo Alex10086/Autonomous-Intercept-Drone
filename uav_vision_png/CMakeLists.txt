@@ -66,6 +66,11 @@ install(FILES config/params.yaml
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(visual_freshness test/test_visual_freshness.py
+    TIMEOUT 60
+    ENV "VISION_PNG_EXECUTABLE=$<TARGET_FILE:uav_vision_png>"
+  )
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
