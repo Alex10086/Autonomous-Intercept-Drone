@@ -2,6 +2,7 @@
 """ROS adapter for one explicitly labelled, durable intercept experiment."""
 import math
 from pathlib import Path
+from time import monotonic
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
@@ -23,7 +24,7 @@ from .experiment_storage import (
 DEFAULTS = {
     "out_dir": "experiment_data", "algorithm": "vision_png", "target_motion": "circle",
     "profile": "debug", "scenario": "intercept", "experiment_id": "",
-    "max_duration": 120.0, "sample_rate": 20.0, "topic_timeout": 1.0,
+    "start_timeout": 60.0, "max_duration": 120.0, "sample_rate": 20.0, "topic_timeout": 1.0,
     "video_fps": 20.0, "camera_topic": "/camera/image", "image_width": 1920,
     "image_height": 1080,
 }
@@ -86,6 +87,7 @@ class ExperimentRecorder(Node):
         self.cache = {}
         self.origin = None
         self.start_time = None
+        self.start_wait_monotonic = monotonic()
         self.intercept_start = None
         self.last_time = None
         self.samples = 0
@@ -142,7 +144,7 @@ class ExperimentRecorder(Node):
         safe_identifier(cfg["target_motion"], "target_motion")
         if cfg["experiment_id"]:
             safe_identifier(cfg["experiment_id"], "experiment_id")
-        for key in ("max_duration", "sample_rate", "topic_timeout", "video_fps"):
+        for key in ("start_timeout", "max_duration", "sample_rate", "topic_timeout", "video_fps"):
             if not math.isfinite(cfg[key]) or cfg[key] <= 0:
                 raise ValueError(f"{key} must be finite and positive")
         for key in ("image_width", "image_height"):
@@ -367,8 +369,16 @@ class ExperimentRecorder(Node):
         return (isinstance(radius, (int, float)) and not isinstance(radius, bool)
                 and math.isfinite(radius) and radius >= 0 and math.isfinite(distance) and distance <= radius)
 
+    def _check_start_timeout(self):
+        if (not self.finished and self.intercept_start is None
+                and monotonic() - self.start_wait_monotonic >= self.config["start_timeout"]):
+            self.get_logger().warning(
+                f"No eligible INTERCEPT within {self.config['start_timeout']}s; ending startup wait")
+            self.finish("start_timeout")
+        return self.finished
+
     def _maybe_start(self, now):
-        if self.intercept_start is not None or self.finished:
+        if self.intercept_start is not None or self._check_start_timeout():
             return
         telemetry = self._fresh("telemetry", now)
         if telemetry is None or telemetry.state != "INTERCEPT":
@@ -549,6 +559,10 @@ def main(args=None):
     try:
         node = ExperimentRecorder()
         while rclpy.ok() and not node.finished:
+            # ROS timers do not fire while simulation time is stopped or /clock
+            # is absent. Enforce the startup deadline from the wall-driven loop.
+            if node._check_start_timeout():
+                break
             rclpy.spin_once(node, timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass

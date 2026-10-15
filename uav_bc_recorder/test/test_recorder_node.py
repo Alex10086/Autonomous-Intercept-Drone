@@ -7,6 +7,7 @@ import rclpy
 from px4_msgs.msg import SensorGps, TrajectorySetpoint, VehicleLocalPosition
 from uav_common_msg.msg import ExperimentTelemetry, RectMsg
 
+from uav_bc_recorder import recorder_node as recorder_module
 from uav_bc_recorder.recorder_node import DEFAULTS, ExperimentRecorder
 
 
@@ -111,3 +112,43 @@ def test_detection_count_uses_one_consistent_receipt_timestamp(recorder):
     node._detect_cb(box)
     assert node.detected
     assert node.detection_count == 1
+
+
+def test_start_timeout_expires_with_frozen_ros_clock(recorder, monkeypatch):
+    node, _ = recorder
+    deadline = node.start_wait_monotonic + node.config["start_timeout"]
+    monkeypatch.setattr(recorder_module, "monotonic", lambda: deadline - 0.001)
+    assert not node._check_start_timeout()
+    monkeypatch.setattr(recorder_module, "monotonic", lambda: deadline)
+    assert node._check_start_timeout()
+    with (node.storage.path / "summary.csv").open() as stream:
+        summary = next(csv.DictReader(stream))
+    assert summary["reason"] == "start_timeout"
+    assert summary["status"] == "no_intercept" and summary["samples"] == "0"
+    with (node.storage.path / "timeseries.csv").open() as stream:
+        assert list(csv.DictReader(stream)) == []
+
+
+def test_late_prerequisites_cannot_start_after_start_timeout(recorder, monkeypatch):
+    node, clock = recorder
+    deadline = node.start_wait_monotonic + node.config["start_timeout"]
+    monkeypatch.setattr(recorder_module, "monotonic", lambda: deadline)
+    ready(node, clock)
+    assert node.finished and node.intercept_start is None
+    with (node.storage.path / "summary.csv").open() as stream:
+        assert next(csv.DictReader(stream))["reason"] == "start_timeout"
+
+
+def test_start_timeout_does_not_stop_active_interception(recorder, monkeypatch):
+    node, clock = recorder
+    ready(node, clock)
+    deadline = node.start_wait_monotonic + node.config["start_timeout"]
+    monkeypatch.setattr(recorder_module, "monotonic", lambda: deadline + 1.0)
+    assert not node._check_start_timeout()
+    node._tick()
+    assert node.samples == 1 and not node.finished
+    clock[0] += node.config["max_duration"]
+    node._tick()
+    assert node.finished
+    with (node.storage.path / "summary.csv").open() as stream:
+        assert next(csv.DictReader(stream))["reason"] == "timeout"

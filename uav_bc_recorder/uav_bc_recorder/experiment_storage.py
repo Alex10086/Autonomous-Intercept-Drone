@@ -99,6 +99,7 @@ class RunStorage:
             "topics": dict(TOPICS, camera=config["camera_topic"]),
             "provenance": {
                 "timestamp": "ROS clock seconds; max_duration measured from eligible INTERCEPT start",
+                "start_timeout": "monotonic wall seconds from node initialization; independent of ROS /clock",
                 "elapsed_s": "ROS seconds since first eligible INTERCEPT observation",
                 "freshness": "receipt ROS time; valid nonzero ROS header additionally gates telemetry. Detection receipt freshness does not guarantee source image age (camera stamp may use another clock)",
                 "positions": "WGS84 ECEF to common NED at first valid self GPS; meters; ellipsoid altitude preferred. MSL fallback is approximate; mixed altitude datums are rejected",

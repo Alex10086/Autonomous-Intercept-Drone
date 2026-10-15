@@ -248,7 +248,8 @@ ros2 run uav_vision_png uav_vision_png
 ros2 run uav_bc_recorder experiment_recorder --ros-args \
   -p out_dir:="$HOME/intercept_ws/experiment_data" \
   -p algorithm:=vision_png -p target_motion:=circle \
-  -p scenario:=intercept -p profile:=debug -p max_duration:=120.0
+  -p scenario:=intercept -p profile:=debug \
+  -p start_timeout:=60.0 -p max_duration:=120.0
 ```
 
 `target_motion` 是实验标签，必须与目标机实际的 `motion_mode` 一致，不会由记录器改变目标运动。`N_png`、`speed_cmd`、`hit_radius` 等由制导遥测带入元数据，不在记录器里另设一套默认值；完整参数保存在 `parameters` 下。Vision PNG 的角度更新目前实际使用 `kv` / `kz`，它们会与 `N_png` 一并记录，不能仅凭 `N_png` 标签推断有效增益。控制参数在节点启动时读取，改变配置应重启制导节点。
@@ -264,9 +265,9 @@ ros2 run uav_bc_recorder experiment_recorder --ros-args \
 若从仓库直接编排整套实验，可在已经加载 ROS/视觉运行库、保持 QGroundControl 连接的终端执行：
 
 ```bash
-bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png
-# 参数依次为：目标运动、输出根目录、拦截最长秒数、profile、algorithm。
-# purePNG 使用最后一个参数 pure_png；不启动检测节点。
+bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png 60.0
+# 参数依次为：目标运动、输出根目录、拦截最长秒数、profile、algorithm、启动等待秒数（可省略，默认 60.0）。
+# purePNG 将第 5 个参数设为 pure_png；不启动检测节点。
 ```
 
 脚本先启动记录器，再运行仓库的 `run_swarm.sh`、目标机、可选检测和制导；退出时先完成记录文件，再停止自己启动的进程，不会全局 kill 其他实验。
@@ -288,6 +289,7 @@ experiment_data/
 
 * CSV 默认 20 Hz，`sample_rate` 可配置；与相机回调解耦，合法零速度分量不会阻止录制。
 * 开始需要新鲜的 `INTERCEPT` 遥测、自身/目标有效 GPS 及 NED 速度；Vision PNG 额外需要有效检测框，purePNG 不需要相机或检测。`topic_timeout` 默认 1 秒。
+* `start_timeout` 默认 60 秒，必须为正的有限数；从节点初始化起按单调墙钟计时，不依赖 ROS 仿真时间。期限内未满足开始条件时收尾并退出，`meta.yaml` / `summary.csv` 的 `reason` 为 `start_timeout`，正常情况下状态为 `no_intercept`；已请求资源的收尾错误仍标记 `error`。开始录制后不再受此期限影响，继续使用 `max_duration`。
 * 一旦开始，丢目标或话题过期仍继续采样；缺失/过期数值写 `NaN`。`detected`、`lost`、`reacquired` 区分检测状态与转换事件；计数来自回调/过期转换，不是重复累计 CSV 行。
 * 真实距离达到遥测中的 `hit_radius`、算法进入 `DONE`、超过 `max_duration` 或 Ctrl+C 时完成汇总。`intercept_time` 是从满足开始条件到首次记录命中的 ROS 秒数，不是绝对时间戳。没有进入拦截也会输出 `no_intercept` 汇总；未命中的时间/距离指标不伪造为零。
 * bag/视频从记录器启动开始采集，包含起飞和捕获前阶段；`max_duration` 从满足拦截开始条件起算。视频采用固定接收时间网格，缺帧时保持上一帧，元数据记录起止 ROS 时间及补帧数；过长缺口明确报错，不无限补帧。

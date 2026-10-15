@@ -244,7 +244,8 @@ Start the recorder before the chosen guidance node; never run both interceptor c
 ros2 run uav_bc_recorder experiment_recorder --ros-args \
   -p out_dir:="$HOME/intercept_ws/experiment_data" \
   -p algorithm:=vision_png -p target_motion:=circle \
-  -p scenario:=intercept -p profile:=debug -p max_duration:=120.0
+  -p scenario:=intercept -p profile:=debug \
+  -p start_timeout:=60.0 -p max_duration:=120.0
 ```
 
 `target_motion` labels the experiment; it must match the target node's actual `motion_mode` and does not command target motion. Metadata gets actual `N_png`, `speed_cmd`, `hit_radius`, planner/controller, and the complete parameter mapping from guidance telemetry, not independent recorder defaults. Vision PNG currently uses `kv`/`kz` for its angle update; these are recorded alongside `N_png`, which alone does not identify the effective gain. Control parameters are read at startup; restart guidance when changing them.
@@ -260,9 +261,9 @@ ros2 run uav_bc_recorder experiment_recorder --ros-args \
 To orchestrate the complete simulation from the repository, load the ROS/vision environment and keep QGroundControl connected, then run:
 
 ```bash
-bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png
-# Arguments: motion, output root, interception duration, profile, algorithm.
-# Use pure_png as the last argument to omit the detector.
+bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png 60.0
+# Arguments: motion, output root, interception duration, profile, algorithm, startup wait (optional, default 60.0).
+# Set the fifth argument to pure_png to omit the detector.
 ```
 
 The script starts recording first, then the repository's `run_swarm.sh`, target, optional detector, and guidance. Shutdown finalizes recording before stopping only its owned processes.
@@ -273,6 +274,7 @@ Each startup immediately creates an independent directory beneath `out_dir`, e.g
 
 * CSV sampling defaults to 20 Hz (`sample_rate`), independently of image callbacks or zero velocity components.
 * Start requires fresh `INTERCEPT` telemetry, valid self/target GPS and NED velocities. Vision PNG also requires a valid detection; purePNG requires neither camera nor detection. `topic_timeout` defaults to one second.
+* `start_timeout` defaults to 60 seconds and must be finite and positive. It uses monotonic wall time from node initialization, independently of ROS simulation time. If interception prerequisites are not met by the deadline, finalize and exit with `reason: start_timeout` in metadata/summary and normally `status: no_intercept`; requested-resource finalization errors still produce `error`. Once recording starts, this deadline no longer applies; `max_duration` continues to bound interception.
 * Continue through detection loss and stale topics; unavailable numeric fields become `NaN`. Detection/lost/reacquisition counters use callbacks and freshness transitions, not repeated CSV rows.
 * Finalize on distance within the actual `hit_radius`, algorithm `DONE`, `max_duration`, or Ctrl+C. `intercept_time` is elapsed ROS seconds from eligible interception start to observed hit, not an absolute timestamp. A run that never intercepts still gets a `no_intercept` summary; missing metrics are not fabricated as zero.
 * Bag/video capture begins at recorder startup, including takeoff/acquisition; duration starts only after interception prerequisites are met. Video uses a fixed receipt-time grid, holding the previous frame across missing slots; metadata records its ROS start/end and duplicate-frame count. Gaps beyond `max_duration` fail explicitly instead of causing unbounded backfill.

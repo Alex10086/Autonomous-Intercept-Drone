@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unified intercept experiment: simulation -> target/detector -> guidance.
 # Recorder starts first so bag/video include takeoff and acquisition.
-# Usage: launch_bc_collection.sh [motion] [out_dir] [duration] [profile] [algorithm]
+# Usage: launch_bc_collection.sh [motion] [out_dir] [duration] [profile] [algorithm] [start_timeout]
 # Example: launch_bc_collection.sh circle experiment_data 120.0 archive vision_png
 set -euo pipefail
 
@@ -10,6 +10,7 @@ OUT_DIR="${2:-experiment_data}"
 MAX_DURATION="${3:-120.0}"
 PROFILE="${4:-debug}"
 ALGORITHM="${5:-vision_png}"
+START_TIMEOUT="${6:-60.0}"
 PX4_ROOT="${PX4_ROOT:-$HOME/PX4-Autopilot}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 case "$PROFILE" in debug|compare|archive) ;; *) echo "Invalid profile: $PROFILE" >&2; exit 2 ;; esac
@@ -51,7 +52,8 @@ printf 'Experiment: algorithm=%s motion=%s profile=%s root=%s\n' \
     "$ALGORITHM" "$MOTION" "$PROFILE" "$OUT_DIR"
 setsid ros2 run uav_bc_recorder experiment_recorder --ros-args \
     -p out_dir:="$OUT_DIR" -p target_motion:="$MOTION" -p algorithm:="$ALGORITHM" \
-    -p profile:="$PROFILE" -p scenario:=intercept -p max_duration:="$MAX_DURATION" &
+    -p profile:="$PROFILE" -p scenario:=intercept -p max_duration:="$MAX_DURATION" \
+    -p start_timeout:="$START_TIMEOUT" &
 RECORDER_PID=$!
 sleep 1
 kill -0 "$RECORDER_PID"
