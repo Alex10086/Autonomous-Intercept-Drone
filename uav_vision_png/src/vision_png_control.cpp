@@ -452,6 +452,8 @@ void VisionPNG::detection_callback(const RectMsg &msg)
     const auto received_steady = std::chrono::steady_clock::now();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     observation_ = uav_common_msg::msg::VisionObservation{};
+    observation_.estimator = pixel_estimator_ == "kf" ?
+        observation_.PIXEL_KF : observation_.PIXEL_RAW;
     observation_.header.stamp = now();
     observation_.image_stamp = msg.header.stamp;
     observation_.image_time_ros = nan;
@@ -610,8 +612,13 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
         const double estimate_time = now().seconds();
         const double horizon = estimate_time - observation_.image_time_ros;
         const double attitude_dt = estimate_time - latest_attitude_time_;
+        observation_.estimate_time_ros = estimate_time;
+        observation_.pixel_prediction_dt = horizon;
+        observation_.attitude_prediction_dt = attitude_dt;
+        observation_.estimated_u = observation_.estimated_v =
+            std::numeric_limits<double>::quiet_NaN();
         Eigen::Vector4d predicted;
-        if (state_ != VpngState::INTERCEPT) {
+        if (state_ != VpngState::INTERCEPT && state_ != VpngState::COAST) {
             pixel_filter_.reset();
             pixel_reference_valid_ = false;
         }
@@ -620,6 +627,7 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
             pixel_reference_time_ = observation_.image_time_ros;
             pixel_reference_valid_ = true;
         }
+        observation_.reference_time_ros = pixel_reference_time_;
         Eigen::Vector2d stabilized_pixel;
         if (!observation_.clock_valid || !prediction_attitude_valid_ ||
             horizon < 0.0 || horizon > pixel_prediction_horizon_ ||
@@ -650,15 +658,10 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
             observation_pub_->publish(observation_);
             return;
         }
-        observation_.estimator = observation_.PIXEL_KF;
-        observation_.estimate_time_ros = estimate_time;
-        observation_.reference_time_ros = pixel_reference_time_;
         observation_.estimated_u = current_pixel.x();
         observation_.estimated_v = current_pixel.y();
         observation_.estimated_du = current_velocity.x();
         observation_.estimated_dv = current_velocity.y();
-        observation_.pixel_prediction_dt = horizon;
-        observation_.attitude_prediction_dt = attitude_dt;
     }
     detect_x_ = observation_.x;
     detect_y_ = observation_.y;

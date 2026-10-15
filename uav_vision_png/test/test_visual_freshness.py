@@ -362,7 +362,7 @@ def test_native_clock_recovers_drifting_dds_epoch_before_slerp(flight):
 @pytest.mark.parametrize('flight', [
     {'attitude_sync': True, 'pixel_estimator': 'kf'}], indirect=True)
 def test_pixel_kf_learns_image_motion_and_predicts_control_los(flight):
-    messages, publishers, pose, _, pump, wait, _, box = flight
+    messages, publishers, pose, _, pump, wait, state, box = flight
 
     def pose_stream():
         pose.timestamp_sample = pose.timestamp = time.time_ns() // 1000
@@ -384,6 +384,17 @@ def test_pixel_kf_learns_image_motion_and_predicts_control_los(flight):
     assert event.control_los_z == pytest.approx(
         math.atan2(1397.2, event.estimated_u - 960), abs=1e-4)
     assert event.control_los_z < event.los_z - 0.003
+    previous_capture = event.image_time_ros
+    pump(0.3, pose_stream)
+    wait(lambda: state('COAST'), action=pose_stream)
+    image_ns = time.time_ns() - 60_000_000
+    center = 960 + 200 * (image_ns - origin) / 1e9
+    box(x=round(center - 40), y=510, stamp_ns=image_ns)
+    wait(lambda: messages['observations'][-1].accepted and
+         messages['observations'][-1].image_time_ros > previous_capture, action=pose_stream)
+    recovered = messages['observations'][-1]
+    assert recovered.estimated_du == pytest.approx(200, abs=60)
+    assert recovered.estimated_u > recovered.x + recovered.width / 2 + 5
 
 
 @pytest.mark.parametrize('flight', [

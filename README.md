@@ -396,6 +396,8 @@ Raw image `los_v/z` and actual `control_los_v/z` are separate, with explicit est
 
 Current `kf` removes ego rotation into a fixed virtual-camera plane before CV estimation, then reprojects to the current camera, including angular-motion pixel velocity. `reference_time_ros` identifies the anchor. The ideal stationary-world/rotating-camera replay exposed 4.724° mean / 7.550° maximum spurious LOS error in direct-camera CV; fixed-plane prediction passes rotation invariance, velocity-sign, and actual-node regressions (93 Python/node cases plus two C++ behavior tests). The first valid corrected circular flight missed at 0.944 m; a separate detector-entry-window attempt remained invalid. That flight rebuilt the filter reference 13 times over 76 first-approach observations, motivating a separate short-COAST estimator continuity check without changing PNG recovery.
 
+Short COAST now preserves the estimator velocity/reference, while acquisition, long loss, clock/pose resets and blind gaps remain explicit reset boundaries; PNG's COAST recovery initialization is unchanged. The actual-node regression first reproduced zero velocity after a short pause, then passed with the complete 93-case suite. A full flight (`p2_coast_validation/2026-10-16_01-22-49/`) retained one reference over 99 first-approach observations but still missed at 1.574 m, with negative near-range paired median gains (−0.680° vertical, −1.176° azimuth). Estimator continuity does not repair biased observations; repeat this fixed version before source-weighted P3.
+
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
 
 ```bash
