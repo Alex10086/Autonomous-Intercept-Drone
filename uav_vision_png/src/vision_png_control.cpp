@@ -44,13 +44,17 @@ Eigen::Matrix3d body_to_ned(double roll, double pitch, double yaw)
             Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
 }
 
+Eigen::Vector2d los_angles(const Eigen::Vector3d &ned)
+{
+    return {std::atan2(ned.z(), std::hypot(ned.x(), ned.y())),
+            std::atan2(ned.x(), ned.y())};
+}
+
 Eigen::Vector2d project_los(const Eigen::Matrix3d &R_b2n,
                            const Eigen::Matrix3d &R_c2b,
                            double ex, double ey, double focal)
 {
-    const Eigen::Vector3d ned = R_b2n * R_c2b * Eigen::Vector3d(ex, ey, focal);
-    return {std::atan2(ned.z(), std::hypot(ned.x(), ned.y())),
-            std::atan2(ned.x(), ned.y())};
+    return los_angles(R_b2n * R_c2b * Eigen::Vector3d(ex, ey, focal));
 }
 }
 
@@ -458,6 +462,7 @@ void VisionPNG::detection_callback(const RectMsg &msg)
     observation_.los_v = observation_.los_z = nan;
     observation_.receive_pose_los_v = observation_.receive_pose_los_z = nan;
     observation_.estimate_time_ros = nan;
+    observation_.reference_time_ros = nan;
     observation_.estimated_u = observation_.estimated_v = nan;
     observation_.estimated_du = observation_.estimated_dv = nan;
     observation_.pixel_prediction_dt = observation_.attitude_prediction_dt = nan;
@@ -537,6 +542,7 @@ void VisionPNG::detection_callback(const RectMsg &msg)
 void VisionPNG::clear_pending_observations()
 {
     pixel_filter_.reset();
+    pixel_reference_valid_ = false;
     while (pending_size_ != 0) {
         auto &event = pending_observations_[pending_begin_].data;
         event.status = event.ATTITUDE_UNAVAILABLE;
@@ -588,8 +594,10 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
     update_visual_state();
     const double pixel_u = observation_.x + observation_.width / 2.0;
     const double pixel_v = observation_.y + observation_.height / 2.0;
-    const Eigen::Vector2d measured_los = project_los(rotation, R_c2b_,
-        pixel_u - image_width_ / 2.0, pixel_v - image_height_ / 2.0, focal_length_);
+    const Eigen::Vector2d principal(image_width_ / 2.0, image_height_ / 2.0);
+    const Eigen::Vector3d measured_ray_ned = rotation * R_c2b_ *
+        Eigen::Vector3d(pixel_u - principal.x(), pixel_v - principal.y(), focal_length_);
+    const Eigen::Vector2d measured_los = los_angles(measured_ray_ned);
     observation_.los_v = measured_los.x();
     observation_.los_z = measured_los.y();
     observation_.estimated_u = pixel_u;
@@ -603,24 +611,52 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
         const double horizon = estimate_time - observation_.image_time_ros;
         const double attitude_dt = estimate_time - latest_attitude_time_;
         Eigen::Vector4d predicted;
-        if (state_ != VpngState::INTERCEPT) pixel_filter_.reset();
+        if (state_ != VpngState::INTERCEPT) {
+            pixel_filter_.reset();
+            pixel_reference_valid_ = false;
+        }
+        if (!pixel_reference_valid_) {
+            pixel_reference_c2n_ = rotation * R_c2b_;
+            pixel_reference_time_ = observation_.image_time_ros;
+            pixel_reference_valid_ = true;
+        }
+        Eigen::Vector2d stabilized_pixel;
         if (!observation_.clock_valid || !prediction_attitude_valid_ ||
             horizon < 0.0 || horizon > pixel_prediction_horizon_ ||
             !vision_time::propagate_attitude(prediction_attitude_, prediction_body_rates_,
                 attitude_dt, control_rotation) ||
-            !pixel_filter_.update(observation_.image_time_ros, Eigen::Vector2d(pixel_u, pixel_v),
+            !vision_time::project_pixel(pixel_reference_c2n_.transpose() * measured_ray_ned,
+                focal_length_, principal, stabilized_pixel) ||
+            !pixel_filter_.update(observation_.image_time_ros, stabilized_pixel,
                 pixel_measurement_variance_, pixel_acceleration_variance_) ||
             !pixel_filter_.predict(estimate_time, pixel_prediction_horizon_, predicted)) {
             observation_.status = observation_.ESTIMATOR_UNAVAILABLE;
             observation_pub_->publish(observation_);
             return;
         }
+        const Eigen::Vector3d predicted_ray_ned = pixel_reference_c2n_ *
+            Eigen::Vector3d(predicted(0) - principal.x(), predicted(1) - principal.y(), focal_length_);
+        const Eigen::Vector3d predicted_rate_ned = pixel_reference_c2n_ *
+            Eigen::Vector3d(predicted(2), predicted(3), 0.0);
+        const Eigen::Vector3d body_ray = control_rotation.transpose() * predicted_ray_ned;
+        const Eigen::Vector3d camera_ray = R_c2b_.transpose() * body_ray;
+        const Eigen::Vector3d camera_rate = R_c2b_.transpose() *
+            (control_rotation.transpose() * predicted_rate_ned -
+             prediction_body_rates_.cross(body_ray));
+        Eigen::Vector2d current_pixel, current_velocity;
+        if (!vision_time::project_pixel(camera_ray, focal_length_, principal, current_pixel) ||
+            !vision_time::project_pixel_velocity(camera_ray, camera_rate, focal_length_, current_velocity)) {
+            observation_.status = observation_.ESTIMATOR_UNAVAILABLE;
+            observation_pub_->publish(observation_);
+            return;
+        }
         observation_.estimator = observation_.PIXEL_KF;
         observation_.estimate_time_ros = estimate_time;
-        observation_.estimated_u = predicted(0);
-        observation_.estimated_v = predicted(1);
-        observation_.estimated_du = predicted(2);
-        observation_.estimated_dv = predicted(3);
+        observation_.reference_time_ros = pixel_reference_time_;
+        observation_.estimated_u = current_pixel.x();
+        observation_.estimated_v = current_pixel.y();
+        observation_.estimated_du = current_velocity.x();
+        observation_.estimated_dv = current_velocity.y();
         observation_.pixel_prediction_dt = horizon;
         observation_.attitude_prediction_dt = attitude_dt;
     }

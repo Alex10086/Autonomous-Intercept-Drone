@@ -27,7 +27,7 @@ OBSERVATION_COLUMNS = (
     "image_stamp_s image_time_ros bbox_receive_time projection_time control_time "
     "attitude_before_time attitude_after_time image_to_bbox_ms image_to_control_ms "
     "clock_valid accepted attitude_synced status source confidence x y width height "
-    "los_v los_z receive_pose_los_v receive_pose_los_z estimator estimate_time_ros "
+    "los_v los_z receive_pose_los_v receive_pose_los_z estimator estimate_time_ros reference_time_ros "
     "estimated_u estimated_v estimated_du estimated_dv pixel_prediction_dt "
     "attitude_prediction_dt control_los_v control_los_z"
 ).split()
@@ -158,7 +158,7 @@ class RunStorage:
                 "observation_attitude": "attitude_before_time/attitude_after_time bracket image_time_ros; attitude_synced distinguishes image-pose from receive-pose projection; LOS radians, azimuth atan2(North,East)",
                 "observation_status": "0 RECEIVE_POSE, 1 IMAGE_POSE, 2 CLOCK_UNAVAILABLE, 3 ATTITUDE_UNAVAILABLE, 4 INVALID_BOX, 5 NOT_GUIDING, 6 OUT_OF_ORDER, 7 ESTIMATOR_UNAVAILABLE",
                 "observation_source": "0 UNKNOWN, 1 YOLO, 2 LIGHTTRACK",
-                "observation_prediction": "estimator 0 raw / 1 pixel CV KF; los_v/z remain raw image measurement LOS, control_los_v/z are actual guidance LOS; estimate_time_ros is estimate epoch; estimated_u/v pixels and estimated_du/dv pixels per system second; pixel_prediction_dt and attitude_prediction_dt seconds; current attitude uses at most 50ms body-rate propagation, never stale-pose fallback",
+                "observation_prediction": "estimator 0 raw / 1 stabilized-pixel CV KF; los_v/z remain raw image measurement LOS, control_los_v/z are actual guidance LOS; reference_time_ros anchors a fixed virtual-camera plane; estimate_time_ros is forecast epoch; estimated_u/v and estimated_du/dv are reprojected current-camera pixels and pixels per system second including ego angular motion; pixel_prediction_dt and attitude_prediction_dt seconds; current attitude uses at most 50ms body-rate propagation, never stale-pose fallback",
                 "geometry.csv": "one row per valid GPS callback, including before INTERCEPT; self/target positions in the same GPS-origin NED as timeseries; callbacks before origin are retained until origin exists, or written with NaN positions at finish if no origin arrives; incompatible altitude datums omitted",
                 "geometry_source_time": "gazebo_dds: signed integer SensorGps.timestamp + aircraft DDS estimated_offset recovers native Gazebo/PX4 HRT microseconds, then bounded /simulation/clock_pairs interpolation gives ROS/system epoch; ros: timestamp * 1e-6 only if positive and 0 <= receipt - source <= topic_timeout; unavailable mappings are NaN; timestamp_sample is never used",
                 "geometry_receive_time": "original recorder ROS receipt epoch seconds, unchanged by clock recovery or pre-origin queuing",

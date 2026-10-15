@@ -401,3 +401,31 @@ def test_pixel_kf_rejects_excessive_forecast_without_raw_fallback(flight):
     assert messages['observations'][-1].status == VisionObservation.ESTIMATOR_UNAVAILABLE
     assert not messages['observations'][-1].accepted
     assert state('SEARCHING')
+
+
+@pytest.mark.parametrize('flight', [
+    {'attitude_sync': True, 'pixel_estimator': 'kf'}], indirect=True)
+def test_pixel_kf_removes_ego_rotation_before_forecasting_stationary_world_los(flight):
+    messages, publishers, pose, _, pump, wait, _, box = flight
+    origin = time.time_ns()
+
+    def pose_stream():
+        stamp = time.time_ns()
+        elapsed = (stamp - origin) / 1e9
+        pitch = 0.25 * math.sin(8 * elapsed)
+        pose.timestamp_sample = pose.timestamp = stamp // 1000
+        pose.q = [math.cos(pitch / 2), 0.0, math.sin(pitch / 2), 0.0]
+        pose.angular_velocity = [0.0, 2 * math.cos(8 * elapsed), 0.0]
+        publishers['pose'].publish(pose)
+
+    pump(0.2, pose_stream)
+    for _ in range(25):
+        image_ns = time.time_ns() - 60_000_000
+        pitch = 0.25 * math.sin(8 * (image_ns - origin) / 1e9)
+        center = 540 + 1397.2 * math.tan(pitch)
+        box(x=920, y=round(center - 30), stamp_ns=image_ns)
+        pump(0.04, pose_stream)
+    wait(lambda: any(event.accepted for event in messages['observations']), action=pose_stream)
+    accepted = [event for event in messages['observations'] if event.accepted]
+    assert max(abs(event.control_los_v) for event in accepted) < 0.01
+    assert all(event.reference_time_ros <= event.image_time_ros for event in accepted)

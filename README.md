@@ -394,6 +394,8 @@ Median image-to-bbox latency was approximately 37–56 ms. Paired attitude corre
 
 Raw image `los_v/z` and actual `control_los_v/z` are separate, with explicit estimate time, predicted pixels/velocities, and pixel/attitude horizons. Analysis compares raw-held and estimated LOS against the same control-time truth and preserves negative prediction gains. The first full direct-camera CV trial (`p2_kf_validation/2026-10-16_00-53-40/`) missed at 9.949 m and never reached the 5 m window; paired first-approach median gains were −0.927° vertical and −0.319° azimuth. This is a negative result, not a reason to enable KF by default. Isolate ego-rotation-induced pixel motion before source-weighted P3 fusion.
 
+Current `kf` removes ego rotation into a fixed virtual-camera plane before CV estimation, then reprojects to the current camera, including angular-motion pixel velocity. `reference_time_ros` identifies the anchor. The ideal stationary-world/rotating-camera replay exposed 4.724° mean / 7.550° maximum spurious LOS error in direct-camera CV; fixed-plane prediction passes rotation invariance, velocity-sign, and actual-node regressions (93 Python/node cases plus two C++ behavior tests). The first valid corrected circular flight missed at 0.944 m; a separate detector-entry-window attempt remained invalid. That flight rebuilt the filter reference 13 times over 76 first-approach observations, motivating a separate short-COAST estimator continuity check without changing PNG recovery.
+
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
 
 ```bash

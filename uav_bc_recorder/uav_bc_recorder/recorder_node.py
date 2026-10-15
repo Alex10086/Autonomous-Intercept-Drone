@@ -328,7 +328,7 @@ class ExperimentRecorder(Node):
             stamp.sec + stamp.nanosec * 1e-9
             if stamp.sec >= 0 and 0 <= stamp.nanosec < 1_000_000_000 else NAN)
         if not message.clock_valid:
-            for key in ("image_time_ros", "image_to_bbox_ms", "image_to_control_ms", "estimate_time_ros"):
+            for key in ("image_time_ros", "image_to_bbox_ms", "image_to_control_ms", "estimate_time_ros", "reference_time_ros"):
                 row[key] = NAN
         self.cache["observations"] = (message, self._now())
         try:

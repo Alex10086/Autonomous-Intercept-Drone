@@ -170,6 +170,9 @@ private:
     double pixel_measurement_variance_ = 16.0;
     double pixel_acceleration_variance_ = 1000000.0;
     double pixel_prediction_horizon_ = 0.3;
+    Eigen::Matrix3d pixel_reference_c2n_ = Eigen::Matrix3d::Identity();
+    double pixel_reference_time_ = std::numeric_limits<double>::quiet_NaN();
+    bool pixel_reference_valid_ = false;
     Eigen::Quaterniond prediction_attitude_ = Eigen::Quaterniond::Identity();
     Eigen::Vector3d prediction_body_rates_ = Eigen::Vector3d::Zero();
     bool prediction_attitude_valid_ = false;

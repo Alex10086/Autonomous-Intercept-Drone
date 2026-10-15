@@ -41,6 +41,8 @@ uint8 PIXEL_RAW=0
 uint8 PIXEL_KF=1
 uint8 estimator
 float64 estimate_time_ros
+# Fixed virtual-camera plane anchor used by the CV filter; NaN in raw mode.
+float64 reference_time_ros
 float64 estimated_u
 float64 estimated_v
 float64 estimated_du

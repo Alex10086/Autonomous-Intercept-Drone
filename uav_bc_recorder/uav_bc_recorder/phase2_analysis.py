@@ -136,7 +136,7 @@ OBSERVATION_FIELDS = (
     'image_to_control_ms', 'clock_valid', 'accepted', 'attitude_synced', 'status',
     'source', 'confidence', 'x', 'y', 'width', 'height', 'los_v', 'los_z',
     'receive_pose_los_v', 'receive_pose_los_z',
-    'estimator', 'estimate_time_ros', 'estimated_u', 'estimated_v', 'estimated_du', 'estimated_dv',
+    'estimator', 'estimate_time_ros', 'reference_time_ros', 'estimated_u', 'estimated_v', 'estimated_du', 'estimated_dv',
     'pixel_prediction_dt', 'attitude_prediction_dt', 'control_los_v', 'control_los_z',
 )
 
