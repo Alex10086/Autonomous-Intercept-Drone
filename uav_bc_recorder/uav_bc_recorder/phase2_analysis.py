@@ -382,6 +382,7 @@ def analyze_recording(recording, output):
     result={
         'recording':str(recording),'algorithm':meta['algorithm'],'group':requested.get('group'),
         'trial':requested.get('trial'),'vision_mode':requested.get('vision_mode'),'valid':valid,
+        'attitude_sync':requested.get('attitude_sync'),
         'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),
         'initial_self_velocity':initial.get('self_velocity_ned'),

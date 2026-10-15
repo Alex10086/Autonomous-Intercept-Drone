@@ -328,6 +328,10 @@ P0 时间诊断不改变全局 `use_sim_time`。`run_swarm.sh` 同时启动 `sim
 
 记录器另存逐回调的 `observations.csv` 和 `geometry.csv`，不把定频快照当作独立视觉样本。前者记录原始/映射后的图像时间、控制节点 bbox 接收时间、LOS 计算时间、首次使用该观测的速度指令时间、姿态样本时间、来源（0=未知、1=YOLO、2=LightTrack）及 LOS；后者记录两机各次 GPS 的源时间、接收时间与统一 NED 位置。无效映射/从未被控制使用的时刻为 `NaN`。compare bag 也保留时钟对、逐观测诊断和 odometry；原有 `timeseries.csv` / `vision_latency_ms` 口径不变。
 
+`attitude_sync=true` 为正式路径：仅缓存 NED、有限且时间域匹配的 odometry quaternion，按 `timestamp_sample` 在图像映射时刻做归一化 SLERP（最短旋转弧）。姿态历史固定容量 512，插值两侧间隔不得超过 0.1 s，禁止外推；时钟回跳/暂停、估计器 reset 会切断历史。无时钟映射、无姿态包围或重复/乱序图像均发布明确拒绝状态，不刷新有效观测年龄、不静默回退到接收姿态。`attitude_sync=false` 仅用于保留原接收姿态路径的单变量 A/B；`truth_los` 路径不受该开关影响。此修复只对齐 `LOS(t_image)`，不预测目标到当前时刻。
+
+姿态消息可能比 bbox 更晚到达。同步路径最多缓存 16 个观测，按图像顺序等待后侧姿态样本，最长等待 `min(0.1 s, freshness_timeout)`；超时或历史缺口仍拒绝。等待不会刷新 bbox 接收时间或状态机观测年龄，`image_to_control_ms` 包含这段等待；应与接收姿态基线的延迟分别比较。
+
 `meta.yaml` 记录实验标识、实际算法参数、git commit、`git_dirty`、源码位置、记录器配置、坐标/时间/单位口径、GPS 原点、资源状态及 bag 消息数。`experiment_conditions.requested` 保存 `/experiment/conditions` 的实验协议，`.target` 保存 `/target/experiment_state` 的目标运动配置与状态；两者不覆盖标准元数据。`initial_conditions` 在首次满足拦截采样条件时只记录一次实际 p/v、距离、水平距离、高度差（目标低于自身为正）、目标速度/方向、自身偏航、目标指令相位和实测圆周相位以及各源年龄，缺失值为 null。首次命中时间、撞后实际时长和是否被截断单独保存；`summary.csv` 每次实验一行，包含命中、拦截耗时、最近距离、计数、延迟及资源错误。
 
 compare 的 bag 包含 `/experiment/telemetry`、`/vpng_data`、`/camera_detect_result`、双机 GPS/local position 和自身 trajectory setpoint。archive 额外包含自身 odometry、thrust/torque setpoint 和 `/clock`，覆盖上述建议的八个 topic；原始图像不重复写入 bag，单独保存 MP4。安装的 `bag_qos.yaml` 使用兼容 PX4 BEST_EFFORT 的订阅；未发布话题不会凭空产生消息，实际消息数见元数据。
@@ -365,6 +369,8 @@ ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
 ```
 
 `truth_los` 跳过检测入口门槛并标记为 `diagnostic_truth_los`；`yolo_only` 同样是诊断模式，不改变 YOLO 置信度、不伪造框。组合前端诊断可显式追加 `--diagnostic-bypass-detector-entry`，记录为诊断模式并允许最多 0.8 s 接管延迟。正式 combined 试验仍保留 300 ms 内三次有效检测和 0.3 s 接管延迟门槛。
+
+P0 姿态对照保持 Combined 与其余协议不变，分别运行 `--attitude-sync receipt`（接收姿态基线）和 `--attitude-sync image`（默认，图像时刻 SLERP）。该选项同时写入实验协议及分析结果；不要同时改变入场距离、速度、增益或检测门槛。
 
 
 只验证入口、暂不做命中率实验时：

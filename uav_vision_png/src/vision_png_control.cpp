@@ -22,17 +22,35 @@
  */
 
 #include "uav_vision_png/vision_png_control.hpp"
+#include <algorithm>
 #include <iomanip>
 #include <cmath>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 double stamp_seconds(const builtin_interfaces::msg::Time &stamp)
 {
     return stamp.sec >= 0 && stamp.nanosec < 1000000000u ?
         stamp.sec + stamp.nanosec * 1e-9 : std::numeric_limits<double>::quiet_NaN();
+}
+
+Eigen::Matrix3d body_to_ned(double roll, double pitch, double yaw)
+{
+    return (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+            Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+            Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
+}
+
+Eigen::Vector2d project_los(const Eigen::Matrix3d &R_b2n,
+                           const Eigen::Matrix3d &R_c2b,
+                           double ex, double ey, double focal)
+{
+    const Eigen::Vector3d ned = R_b2n * R_c2b * Eigen::Vector3d(ex, ey, focal);
+    return {std::atan2(ned.z(), std::hypot(ned.x(), ned.y())),
+            std::atan2(ned.x(), ned.y())};
 }
 }
 
@@ -69,6 +87,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     if (image_time_domain_ != "gazebo" && image_time_domain_ != "ros") {
         throw std::invalid_argument("image_time_domain must be gazebo or ros");
     }
+    attitude_sync_ = declare_parameter<bool>("attitude_sync", true);
 
     focal_length_      = this->get_parameter("focal_length").as_double();
     image_width_       = this->get_parameter("image_width").as_int();
@@ -131,8 +150,13 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     clock_sub_ = create_subscription<uav_common_msg::msg::SimulationClock>(
         "/simulation/clock_pairs", rclcpp::SensorDataQoS().keep_last(100),
         [this](const uav_common_msg::msg::SimulationClock &msg) {
-            clock_history_.add(stamp_seconds(msg.sim_time),
-                stamp_seconds(msg.system_time), now().seconds());
+            if (clock_history_.add(stamp_seconds(msg.sim_time),
+                stamp_seconds(msg.system_time), now().seconds()) && attitude_sync_) {
+                attitude_history_.clear();
+                clear_pending_observations();
+                last_image_time_ = std::numeric_limits<double>::quiet_NaN();
+                png_initialized_ = false;
+            }
         });
 
     // ============================================================
@@ -149,6 +173,14 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
         "/px4_1/fmu/out/vehicle_odometry", qos,
         [this](const VehicleOdometry::SharedPtr msg) {
             latest_attitude_time_ = msg->timestamp_sample * 1e-6;
+            if (attitude_sync_ && msg->pose_frame == VehicleOdometry::POSE_FRAME_NED &&
+                attitude_history_.add(latest_attitude_time_, now().seconds(),
+                    Eigen::Quaterniond(msg->q[0], msg->q[1], msg->q[2], msg->q[3]),
+                    msg->reset_counter)) {
+                clear_pending_observations();
+                last_image_time_ = std::numeric_limits<double>::quiet_NaN();
+                png_initialized_ = false;
+            }
             double q0 = msg->q[0], q1 = msg->q[1];
             double q2 = msg->q[2], q3 = msg->q[3];
             roll_  = std::atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2));
@@ -271,6 +303,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
 void VisionPNG::control_loop()
 {
     update_truth_guidance();
+    process_pending_observations();
     update_visual_state();
     switch (state_) {
     case VpngState::TAKE_OFF:    handle_takeoff();    break;
@@ -336,7 +369,7 @@ void VisionPNG::update_truth_guidance()
     state_ = VpngState::INTERCEPT;
     last_visual_observation_ = now;
     processed_truth_generation_ = truth_generation_;
-    png_calculate(roll_, pitch_, yaw_);
+    png_calculate(R_b2n);
 }
 
 double VisionPNG::observation_age() const
@@ -365,6 +398,7 @@ void VisionPNG::detection_callback(const RectMsg &msg)
         observation_pending_ = false;
     }
     const double received = now().seconds();
+    const auto received_steady = std::chrono::steady_clock::now();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     observation_ = uav_common_msg::msg::VisionObservation{};
     observation_.header.stamp = now();
@@ -403,12 +437,6 @@ void VisionPNG::detection_callback(const RectMsg &msg)
         observation_pub_->publish(observation_);
         return;
     }
-    const double roll = roll_, pitch = pitch_, yaw = yaw_;
-    detect_x_ = msg.x;
-    detect_y_ = msg.y;
-    detect_w_ = msg.width;
-    detect_h_ = msg.height;
-    last_visual_observation_ = std::chrono::steady_clock::now();
     if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE ||
         (state_ == VpngState::SEARCHING &&
          ((require_experiment_start_ && !experiment_start_) ||
@@ -417,28 +445,123 @@ void VisionPNG::detection_callback(const RectMsg &msg)
         observation_pub_->publish(observation_);
         return;
     }
-
-    // First acquisition and either loss recovery use the existing initialization.
-    if (state_ != VpngState::INTERCEPT) png_initialized_ = false;
-    state_ = VpngState::INTERCEPT;
-    png_calculate(roll, pitch, yaw);
-    observation_.projection_time = now().seconds();
+    const Eigen::Matrix3d receive_rotation = body_to_ned(roll_, pitch_, yaw_);
     observation_.attitude_before_time = observation_.attitude_after_time =
         latest_attitude_time_;
-    observation_.los_v = observation_.receive_pose_los_v = LOS_angle_v_;
-    observation_.los_z = observation_.receive_pose_los_z = LOS_angle_z_;
+    if (attitude_sync_) {
+        const Eigen::Vector2d receive_los = project_los(receive_rotation, R_c2b_,
+            msg.x + msg.width / 2.0 - image_width_ / 2.0,
+            msg.y + msg.height / 2.0 - image_height_ / 2.0, focal_length_);
+        observation_.receive_pose_los_v = receive_los.x();
+        observation_.receive_pose_los_z = receive_los.y();
+        if (!observation_.clock_valid) {
+            observation_.status = observation_.CLOCK_UNAVAILABLE;
+            observation_pub_->publish(observation_);
+            return;
+        }
+        if (std::isfinite(last_image_time_) && image_time <= last_image_time_) {
+            observation_.status = observation_.OUT_OF_ORDER;
+            observation_pub_->publish(observation_);
+            return;
+        }
+        last_image_time_ = image_time;
+        if (pending_size_ == pending_observations_.size()) {
+            auto &oldest = pending_observations_[pending_begin_].data;
+            oldest.status = oldest.ATTITUDE_UNAVAILABLE;
+            observation_pub_->publish(oldest);
+            pending_begin_ = (pending_begin_ + 1) % pending_observations_.size();
+            --pending_size_;
+        }
+        auto &pending = pending_observations_[
+            (pending_begin_ + pending_size_) % pending_observations_.size()];
+        pending.data = std::move(observation_);
+        pending.received = received_steady;
+        ++pending_size_;
+        return;
+    }
+    apply_observation(receive_rotation, received_steady);
+}
+
+void VisionPNG::clear_pending_observations()
+{
+    while (pending_size_ != 0) {
+        auto &event = pending_observations_[pending_begin_].data;
+        event.status = event.ATTITUDE_UNAVAILABLE;
+        observation_pub_->publish(event);
+        pending_begin_ = (pending_begin_ + 1) % pending_observations_.size();
+        --pending_size_;
+    }
+}
+
+void VisionPNG::process_pending_observations()
+{
+    while (pending_size_ != 0) {
+        auto &pending = pending_observations_[pending_begin_];
+        auto &event = pending.data;
+        const double wait_age = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pending.received).count();
+        Eigen::Quaterniond attitude;
+        const bool ready = attitude_history_.interpolate(event.image_time_ros, attitude,
+            event.attitude_before_time, event.attitude_after_time);
+        const double newest = attitude_history_.newest_time();
+        const bool expired = wait_age > std::min(0.1, freshness_timeout_);
+        if (!ready && !expired &&
+            (!std::isfinite(newest) || event.image_time_ros > newest)) {
+            break;  // Await the right-hand sample, without pose extrapolation.
+        }
+        if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE) {
+            event.status = event.NOT_GUIDING;
+            observation_pub_->publish(event);
+        } else if (!ready || expired) {
+            event.status = event.ATTITUDE_UNAVAILABLE;
+            observation_pub_->publish(event);
+        } else {
+            if (observation_pending_) {
+                observation_pub_->publish(observation_);
+                observation_pending_ = false;
+            }
+            observation_ = std::move(event);
+            observation_.attitude_synced = true;
+            apply_observation(attitude.toRotationMatrix(), pending.received);
+        }
+        pending_begin_ = (pending_begin_ + 1) % pending_observations_.size();
+        --pending_size_;
+    }
+}
+
+void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
+                                std::chrono::steady_clock::time_point received)
+{
+    update_visual_state();
+    detect_x_ = observation_.x;
+    detect_y_ = observation_.y;
+    detect_w_ = observation_.width;
+    detect_h_ = observation_.height;
+    // Waiting for attitude never refreshes source observation receipt freshness.
+    last_visual_observation_ = received;
+    if (state_ != VpngState::INTERCEPT) png_initialized_ = false;
+    state_ = VpngState::INTERCEPT;
+    png_calculate(rotation);
+    observation_.projection_time = now().seconds();
+    observation_.los_v = LOS_angle_v_;
+    observation_.los_z = LOS_angle_z_;
+    if (!attitude_sync_) {
+        observation_.receive_pose_los_v = LOS_angle_v_;
+        observation_.receive_pose_los_z = LOS_angle_z_;
+    }
     observation_.accepted = true;
-    observation_.status = observation_.RECEIVE_POSE;
+    observation_.status = attitude_sync_ ?
+        observation_.IMAGE_POSE : observation_.RECEIVE_POSE;
     observation_pending_ = true;
 }
 
 // ============================================================
-//  每个有效检测回调仅计算一次，姿态固定为接收时刻快照
+//  每个有效图像仅计算一次；正式路径使用图像时刻插值姿态
 //  严格参考 los_control.cpp 中的 LOS_calculate()
 //  输入：像素坐标 detect_x_, detect_y_, detect_w_, detect_h_
 //  输出：d_v_angle_v_, d_v_angle_z_（期望速度角度）
 // ============================================================
-void VisionPNG::png_calculate(double roll, double pitch, double yaw)
+void VisionPNG::png_calculate(const Eigen::Matrix3d &R_b2n)
 {
 
     // ---------- Step 1: 计算像素误差（相对图像中心）----------
@@ -448,27 +571,10 @@ void VisionPNG::png_calculate(double roll, double pitch, double yaw)
     ex_ = (detect_x_ + detect_w_ / 2.0) - cx;
     ey_ = (detect_y_ + detect_h_ / 2.0) - cy;
 
-    // ---------- Step 2: 构造相机系 LOS 向量 ----------
-    // 与 los_control.cpp 一致：Nt = [ex, ey, focal]
-    Eigen::Vector3d Nt(ex_, ey_, focal_length_);
-
-    // ---------- Step 3: 相机系 → 机体系 → NED 系 ----------
-    // 机体→NED 旋转矩阵（ZYX 欧拉角，与 los_control.cpp 完全一致）
-    Eigen::AngleAxisd Ryaw  (yaw,   Eigen::Vector3d::UnitZ());
-    Eigen::AngleAxisd Rpitch(pitch, Eigen::Vector3d::UnitY());
-    Eigen::AngleAxisd Rroll (roll,  Eigen::Vector3d::UnitX());
-    Eigen::Matrix3d R_b2n = Ryaw.toRotationMatrix()
-                          * Rpitch.toRotationMatrix()
-                          * Rroll.toRotationMatrix();
-
-    // LOS 向量：相机系 → 机体系 → NED 系
-    Eigen::Vector3d Nt_ned = R_b2n * R_c2b_ * Nt;
-
-
-    // ---------- Step 4: 计算 LOS 角度 ----------
-    double rxy = std::sqrt(Nt_ned(0)*Nt_ned(0) + Nt_ned(1)*Nt_ned(1));
-    LOS_angle_v_ = std::atan2(Nt_ned(2), rxy);       // 仰角（NED Down 为正）
-    LOS_angle_z_ = std::atan2(Nt_ned(0), Nt_ned(1)); // 方位角（北=0，顺时针）
+    // Camera/body -> NED, with the rotation chosen at the observation epoch.
+    const Eigen::Vector2d los = project_los(R_b2n, R_c2b_, ex_, ey_, focal_length_);
+    LOS_angle_v_ = los.x();  // NED Down positive.
+    LOS_angle_z_ = los.y();  // atan2(North, East), matching existing guidance.
 
     // ---------- Step 5: PNG 角度更新 ----------
     // 仅首次进入时初始化，用 LOS 方向作为初始速度方向
@@ -552,9 +658,9 @@ void VisionPNG::png_calculate(double roll, double pitch, double yaw)
     data.diff_los_angle_z = (float)diff_LOS_z;
     data.ex            = (float)ex_;
     data.ey            = (float)ey_;
-    data.yaw           = (float)yaw;
-    data.pitch         = (float)pitch;
-    data.roll          = (float)roll;
+    data.yaw           = static_cast<float>(std::atan2(R_b2n(1, 0), R_b2n(0, 0)));
+    data.pitch         = static_cast<float>(std::asin(std::clamp(-R_b2n(2, 0), -1.0, 1.0)));
+    data.roll          = static_cast<float>(std::atan2(R_b2n(2, 1), R_b2n(2, 2)));
     data.pixel_u       = (float)(detect_x_ + detect_w_ / 2.0);
     data.pixel_v       = (float)(detect_y_ + detect_h_ / 2.0);
     data.vel_total     = (float)Vt.norm();
@@ -810,11 +916,13 @@ void VisionPNG::publish_velocity_setpoint(float vx, float vy, float vz, float ya
     msg.timestamp = get_clock()->now().nanoseconds() / 1000;
     traj_pub_->publish(msg);
     if (observation_pending_) {
-        observation_.control_time = msg.timestamp * 1e-6;
         observation_.header.stamp = now();
-        if (observation_.clock_valid) {
-            observation_.image_to_control_ms =
-                (observation_.control_time - observation_.image_time_ros) * 1000.0;
+        if (state_ == VpngState::INTERCEPT) {
+            observation_.control_time = msg.timestamp * 1e-6;
+            if (observation_.clock_valid) {
+                observation_.image_to_control_ms =
+                    (observation_.control_time - observation_.image_time_ros) * 1000.0;
+            }
         }
         observation_pub_->publish(observation_);
         observation_pending_ = false;

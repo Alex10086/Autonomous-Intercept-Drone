@@ -13,7 +13,7 @@ from px4_msgs.msg import (
     HoverThrustEstimate, SensorGps, TrajectorySetpoint,
     VehicleLocalPosition, VehicleOdometry,
 )
-from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg
+from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, VisionObservation
 
 
 @pytest.fixture
@@ -27,6 +27,7 @@ def flight(tmp_path, request):
     topics = [
         '/camera_detect_result', '/experiment/start', '/vpng_data',
         '/experiment/telemetry',
+        '/vision/observations', '/simulation/clock_pairs',
         '/px4_1/fmu/in/offboard_control_mode',
         '/px4_1/fmu/in/trajectory_setpoint', '/px4_1/fmu/in/vehicle_command',
         '/px4_1/fmu/out/vehicle_odometry',
@@ -38,20 +39,24 @@ def flight(tmp_path, request):
     ]
     executable = os.environ.get('VISION_PNG_EXECUTABLE') or str(
         Path(get_package_prefix('uav_vision_png')) / 'lib/uav_vision_png/uav_vision_png')
-    config = request.param if isinstance(getattr(request, 'param', None), dict) else {}
-    freshness_timeout = config.get('freshness_timeout', getattr(request, 'param', 0.25))
+    parameter = getattr(request, 'param', 0.25)
+    config = parameter if isinstance(parameter, dict) else {}
+    freshness_timeout = config.get('freshness_timeout', 0.25) if isinstance(parameter, dict) else parameter
     guidance_source = config.get('guidance_source', 'vision')
     command = [executable, '--ros-args', '-p', f'freshness_timeout:={freshness_timeout}',
                '-p', 'track_lost_timeout:=1.0',
-               '-p', f'guidance_source:={guidance_source}']
+               '-p', f'guidance_source:={guidance_source}',
+               '-p', 'image_time_domain:=ros',
+               '-p', f'attitude_sync:={str(config.get("attitude_sync", False)).lower()}']
     for topic in topics:
         command += ['-r', f'{topic}:={prefix}{topic}']
-    messages = {'data': [], 'telemetry': [], 'command': []}
+    messages = {'data': [], 'telemetry': [], 'command': [], 'observations': []}
     subscriptions = []
     for key, message_type, topic in [
         ('data', Data, '/vpng_data'),
         ('telemetry', ExperimentTelemetry, '/experiment/telemetry'),
         ('command', TrajectorySetpoint, '/px4_1/fmu/in/trajectory_setpoint'),
+        ('observations', VisionObservation, '/vision/observations'),
     ]:
         subscriptions.append(node.create_subscription(
             message_type, prefix + topic, messages[key].append, 100))
@@ -85,18 +90,21 @@ def flight(tmp_path, request):
 
     pose = VehicleOdometry()
     pose.q = [1.0, 0.0, 0.0, 0.0]
+    pose.pose_frame = VehicleOdometry.POSE_FRAME_NED
     local = VehicleLocalPosition()
     local.z, local.z_valid = -6.0, True
     hover = HoverThrustEstimate()
     hover.hover_thrust, hover.hover_thrust_var = 0.5, 0.001
 
     def sensors():
+        pose.timestamp_sample = pose.timestamp = time.time_ns() // 1000
         for key, message in [('pose', pose), ('local', local), ('hover', hover)]:
             publishers[key].publish(message)
 
-    def box(x=1060, y=500, valid=True):
+    def box(x=1060, y=500, valid=True, stamp_ns=None):
         message = RectMsg()
-        message.header.stamp = node.get_clock().now().to_msg()
+        stamp_ns = time.time_ns() if stamp_ns is None else stamp_ns
+        message.header.stamp.sec, message.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
         message.x, message.y = x, y
         message.width, message.height = (80, 60) if valid else (-1, -1)
         publishers['box'].publish(message)
@@ -231,3 +239,78 @@ def test_truth_los_uses_geometry_without_detection_messages(flight):
          and bool(messages['data']), timeout=4.0, action=geometry)
     assert messages['data'][-1].los_angle_z == pytest.approx(math.pi / 2.0, abs=2e-3)
     assert messages['data'][-1].ex == pytest.approx(0.0, abs=2.0)
+
+
+@pytest.mark.parametrize('flight', [{'attitude_sync': True}], indirect=True)
+def test_delayed_image_uses_shortest_arc_slerp_and_duplicate_does_not_refresh(flight):
+    messages, publishers, pose, _, pump, wait, state, box = flight
+    pump(0.15)
+    before = time.time_ns() - 100_000_000
+    for stamp, yaw in ((before, math.radians(170)), (before + 80_000_000, math.radians(-170))):
+        pose.timestamp_sample = pose.timestamp = stamp // 1000
+        pose.reset_counter = 1
+        pose.q = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
+        publishers['pose'].publish(pose)
+        pump(0.025)
+    image_stamp = before + 40_000_000
+    box(x=920, y=510, stamp_ns=image_stamp)
+    wait(lambda: messages['observations'] and messages['observations'][-1].accepted)
+    event = messages['observations'][-1]
+    assert event.attitude_synced
+    assert event.los_z == pytest.approx(-math.pi / 2, abs=1e-4)
+    assert event.receive_pose_los_z == pytest.approx(math.radians(-100), abs=1e-4)
+    assert event.los_v == pytest.approx(0.0, abs=1e-5)
+    # Replayed old images cannot keep INTERCEPT fresh, even while boxes keep arriving.
+    pump(0.35, lambda: box(x=920, y=510, stamp_ns=image_stamp))
+    wait(lambda: state('COAST'))
+    assert messages['observations'][-1].status == VisionObservation.OUT_OF_ORDER
+    assert not messages['observations'][-1].accepted
+
+
+@pytest.mark.parametrize('flight', [{'attitude_sync': True}], indirect=True)
+@pytest.mark.parametrize('outside_history', [False, True], ids=['large-gap', 'no-extrapolation'])
+def test_unmatched_attitude_never_falls_back_to_receipt_pose(flight, outside_history):
+    messages, publishers, pose, _, pump, wait, state, box = flight
+    before = time.time_ns() - 250_000_000
+    for stamp in (before, before + 200_000_000):
+        pose.timestamp_sample = pose.timestamp = stamp // 1000
+        pose.reset_counter = 1
+        publishers['pose'].publish(pose)
+        pump(0.025)
+    image_stamp = before - 10_000_000 if outside_history else before + 100_000_000
+    box(stamp_ns=image_stamp)
+    wait(lambda: bool(messages['observations']))
+    assert messages['observations'][-1].status == VisionObservation.ATTITUDE_UNAVAILABLE
+    assert not messages['observations'][-1].accepted
+    assert state('SEARCHING')
+
+
+@pytest.mark.parametrize('flight', [{'attitude_sync': True}], indirect=True)
+@pytest.mark.parametrize('future_arrives', [True, False], ids=['late-bracket', 'wait-expiry'])
+def test_late_attitude_is_bounded_without_receipt_pose_fallback(flight, future_arrives):
+    messages, publishers, pose, _, pump, wait, state, box = flight
+    before = time.time_ns() - 40_000_000
+    pose.timestamp_sample = pose.timestamp = before // 1000
+    pose.reset_counter = 1
+    publishers['pose'].publish(pose)
+    pump(0.02)
+    box(x=920, y=510, stamp_ns=before + 20_000_000)
+    pump(0.035)
+    assert state('SEARCHING')
+    assert not any(event.accepted for event in messages['observations'])
+    if future_arrives:
+        pose.timestamp_sample = pose.timestamp = (before + 40_000_000) // 1000
+        pose.q = [math.cos(0.2), 0.0, 0.0, math.sin(0.2)]
+        publishers['pose'].publish(pose)
+        wait(lambda: messages['observations'] and messages['observations'][-1].accepted)
+        event = messages['observations'][-1]
+        assert event.los_z == pytest.approx(math.pi / 2 - 0.2, abs=1e-4)
+        assert event.control_time - event.bbox_receive_time >= 0.025
+    else:
+        wait(lambda: bool(messages['observations']))
+        assert messages['observations'][-1].status == VisionObservation.ATTITUDE_UNAVAILABLE
+        assert not messages['observations'][-1].accepted
+        pose.timestamp_sample = pose.timestamp = (before + 40_000_000) // 1000
+        publishers['pose'].publish(pose)
+        pump(0.04)
+        assert state('SEARCHING')

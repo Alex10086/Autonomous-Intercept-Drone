@@ -108,7 +108,11 @@ private:
     // ----------------------------------------------------------
     void control_loop();          ///< 200 Hz 姿态/发布循环
     void detection_callback(const RectMsg &msg);
-    void png_calculate(double roll, double pitch, double yaw);
+    void process_pending_observations();
+    void clear_pending_observations();
+    void apply_observation(const Eigen::Matrix3d &rotation,
+                           std::chrono::steady_clock::time_point received);
+    void png_calculate(const Eigen::Matrix3d &R_b2n);
     void update_truth_guidance();
     double observation_age() const;
     void update_visual_state();
@@ -151,10 +155,19 @@ private:
     rclcpp::Publisher<uav_common_msg::msg::VisionObservation>::SharedPtr observation_pub_;
     rclcpp::Subscription<uav_common_msg::msg::SimulationClock>::SharedPtr clock_sub_;
     vision_time::ClockHistory clock_history_;
+    vision_time::AttitudeHistory attitude_history_;
+    bool attitude_sync_ = true;
+    double last_image_time_ = std::numeric_limits<double>::quiet_NaN();
     std::string image_time_domain_ = "gazebo";
     double latest_attitude_time_ = std::numeric_limits<double>::quiet_NaN();
     uav_common_msg::msg::VisionObservation observation_;
     bool observation_pending_ = false;
+    struct PendingObservation {
+        uav_common_msg::msg::VisionObservation data;
+        std::chrono::steady_clock::time_point received;
+    };
+    std::array<PendingObservation, 16> pending_observations_;
+    std::size_t pending_begin_ = 0, pending_size_ = 0;
     double used_dlos_v_ = 0.0;
     double used_dlos_z_ = 0.0;
 

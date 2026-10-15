@@ -195,6 +195,7 @@ def run_trial(args, session, group, index):
     protocol = {
         'protocol':'phase2_fixed_circle_v2','group':group,'trial':index,'algorithm':args.algorithm,
         'vision_mode':args.vision_mode if args.algorithm=='vision_png' else None,
+        'attitude_sync':args.attitude_sync if args.algorithm=='vision_png' else None,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
         'circle_initial_phase':0.0,'circle_angular_velocity':0.5,'circle_radius':5.0,
@@ -307,6 +308,7 @@ def run_trial(args, session, group, index):
             parameter_files = (Path(get_package_share_directory('uav_vision_png'))/'config'/'params.yaml',)
             guidance_parameters['guidance_source'] = (
                 'truth_los' if args.vision_mode=='truth_los' else 'vision')
+            guidance_parameters['attitude_sync'] = args.attitude_sync == 'image'
         else:
             guidance_parameters['N_png'] = 4.0
         owned.start('guidance',ros_command(
@@ -410,6 +412,8 @@ def main(argv=None):
     parser.add_argument('--vision-mode',choices=['combined','yolo_only','truth_los'],
                         default='combined',
                         help='Vision frontend A/B; truth_los is diagnostic-only GPS geometry')
+    parser.add_argument('--attitude-sync',choices=['image','receipt'],default='image',
+                        help='P0 single-variable A/B: image-time SLERP or receipt-pose baseline')
     parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
                         help='Diagnostic only: release without the combined-mode detector window gate')
     parser.add_argument('--duration',type=float,default=60.0)
