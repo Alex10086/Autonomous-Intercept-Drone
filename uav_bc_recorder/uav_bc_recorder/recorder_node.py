@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """ROS adapter for one explicitly labelled, durable intercept experiment."""
+import json
 import math
 from pathlib import Path
 from time import monotonic
@@ -13,6 +14,7 @@ from px4_msgs.msg import (
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from std_msgs.msg import Bool, Float64, String
 from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg
 import yaml
 
@@ -26,7 +28,7 @@ DEFAULTS = {
     "profile": "debug", "scenario": "intercept", "experiment_id": "",
     "start_timeout": 60.0, "max_duration": 120.0, "sample_rate": 20.0, "topic_timeout": 1.0,
     "video_fps": 20.0, "camera_topic": "/camera/image", "image_width": 1920,
-    "image_height": 1080,
+    "image_height": 1080, "post_hit_duration": 2.0,
 }
 
 
@@ -93,6 +95,12 @@ class ExperimentRecorder(Node):
         self.samples = 0
         self.minimum_distance = NAN
         self.hit = False
+        self.first_hit_ros_time = None
+        self.first_hit_monotonic = None
+        self.tail_start_ros_time = None
+        self.tail_start_monotonic = None
+        self.tail_reason = None
+        self.last_sample_monotonic = None
         self.detection_count = 0
         self.lost_count = 0
         self.reacquire_count = 0
@@ -147,6 +155,8 @@ class ExperimentRecorder(Node):
         for key in ("start_timeout", "max_duration", "sample_rate", "topic_timeout", "video_fps"):
             if not math.isfinite(cfg[key]) or cfg[key] <= 0:
                 raise ValueError(f"{key} must be finite and positive")
+        if not math.isfinite(cfg["post_hit_duration"]) or cfg["post_hit_duration"] < 0:
+            raise ValueError("post_hit_duration must be finite and nonnegative")
         for key in ("image_width", "image_height"):
             if not isinstance(cfg[key], int) or cfg[key] <= 0:
                 raise ValueError(f"{key} must be a positive integer")
@@ -200,9 +210,40 @@ class ExperimentRecorder(Node):
             ("torque", VehicleTorqueSetpoint, lambda message: self._cache("torque", message)),
         ):
             self.subscriptions_owned.append(self.create_subscription(message_type, TOPICS[key], callback, qos_profile_sensor_data))
+        for key, message_type, callback in (
+            ("conditions", String, self._conditions_cb),
+            ("target_state", String, self._target_state_cb),
+            ("experiment_start", Bool, lambda message: self._cache("experiment_start", message)),
+            ("target_start", Float64, lambda message: self._cache("target_start", message)),
+        ):
+            self.subscriptions_owned.append(self.create_subscription(message_type, TOPICS[key], callback, 10))
         if self.config["profile"] == "archive":
             from sensor_msgs.msg import Image
             self.subscriptions_owned.append(self.create_subscription(Image, self.config["camera_topic"], self._image_cb, qos_profile_sensor_data))
+
+    def _metadata_cb(self, key, destination, message):
+        if self.finished:
+            return
+        try:
+            # Reject nonfinite JSON rather than serializing fabricated numeric values.
+            def reject_constant(value):
+                raise ValueError(f"nonfinite JSON constant: {value}")
+            value = json.loads(message.data, parse_constant=reject_constant)
+            if not isinstance(value, dict):
+                raise ValueError("experiment metadata must be a JSON object")
+            json.dumps(value, allow_nan=False)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self.get_logger().warning(f"Ignoring invalid {TOPICS[key]} metadata: {exc}")
+            return
+        self._cache(key, message)
+        self.storage.meta["experiment_conditions"][destination] = value
+        self.storage.save_meta()
+
+    def _conditions_cb(self, message):
+        self._metadata_cb("conditions", "requested", message)
+
+    def _target_state_cb(self, message):
+        self._metadata_cb("target_state", "target", message)
 
     def _cache(self, key, message):
         if not self.finished:
@@ -262,10 +303,11 @@ class ExperimentRecorder(Node):
         now = self._now()
         if self._fresh("telemetry", now) is not None:
             self._maybe_start(now)
-            if message.state == "DONE":
-                if self.intercept_start is not None:
+            if message.state == "DONE" and self.intercept_start is not None:
+                if self.tail_start_monotonic is None:
                     self._sample(now)
-                self.finish("done")
+                    self._begin_tail(now, "done")
+                self._check_wall_time()
 
     def _gps_cb(self, key, message):
         if self.finished:
@@ -285,9 +327,12 @@ class ExperimentRecorder(Node):
         self._maybe_start(now)
         if self.intercept_start is not None:
             distance = self._distance(now)
-            if self._is_hit(distance):
+            if math.isfinite(distance):
+                self.minimum_distance = distance if not math.isfinite(self.minimum_distance) else min(self.minimum_distance, distance)
+            if not self.hit and self._is_hit(distance):
                 self._sample(now)
-                self.finish("hit")
+            if self.tail_start_monotonic is not None:
+                self._check_wall_time()
 
     def _set_detection(self, valid):
         if valid == self.detected:
@@ -377,6 +422,109 @@ class ExperimentRecorder(Node):
             self.finish("start_timeout")
         return self.finished
 
+    def _begin_tail(self, now, reason):
+        # A later measured hit takes precedence over an earlier DONE observation,
+        # and always receives a full post-hit capture interval of its own.
+        if self.tail_start_monotonic is None or (reason == "hit" and self.tail_reason != "hit"):
+            self.tail_start_ros_time = now
+            self.tail_start_monotonic = monotonic()
+            self.tail_reason = reason
+            self.storage.meta.update(
+                status="post_hit", tail_start_ros_time=now,
+                tail_start_monotonic=self.tail_start_monotonic, tail_trigger=reason,
+            )
+            self.storage.save_meta()
+
+    def _latch_hit(self, now):
+        if self.hit:
+            return
+        self.hit = True
+        self.first_hit_ros_time = now
+        self.first_hit_monotonic = monotonic()
+        self.storage.meta.update(
+            first_hit_ros_time=now, first_hit_monotonic=self.first_hit_monotonic)
+        self._begin_tail(now, "hit")
+
+    def _check_wall_time(self):
+        """Wall-driven lifecycle checks, including when ROS /clock is frozen."""
+        if self.finished or self._check_start_timeout():
+            return self.finished
+        now = self._now()
+        if now < self.last_time:
+            self._error("ROS clock moved backwards; refusing to mix experiment timelines")
+            self.finish("clock_reset")
+            return True
+        self.last_time = now
+        if self.bag is not None and not self.bag.poll():
+            self._error("requested rosbag exited unexpectedly; see rosbag.log")
+            self.finish("bag_error")
+            return True
+        if self.tail_start_monotonic is not None:
+            wall_now = monotonic()
+            if (self.last_sample_monotonic is None
+                    or wall_now - self.last_sample_monotonic >= 1.0 / self.config["sample_rate"]
+                    or wall_now - self.tail_start_monotonic >= self.config["post_hit_duration"]):
+                self._sample(now)
+            if monotonic() - self.tail_start_monotonic >= self.config["post_hit_duration"]:
+                self.finish("hit" if self.hit else "done")
+        return self.finished
+
+    def _initial_conditions(self, now):
+        own = self._position("self_gps", now)
+        target = self._position("target_gps", now)
+        own_velocity = self._local_velocity("self_local", now)
+        target_velocity = self._local_velocity("target_local", now)
+        relative = [b - a for a, b in zip(own, target)]
+        local = self._fresh("self_local", now)
+        yaw = float(getattr(local, "heading", NAN))
+        yaw_rate = None
+        odometry = self._fresh("odom", now)
+        if odometry is not None:
+            if finite(odometry.angular_velocity):
+                yaw_rate = float(odometry.angular_velocity[2])
+            if (not math.isfinite(yaw)
+                    and getattr(odometry, "pose_frame", 0) == getattr(VehicleOdometry, "POSE_FRAME_NED", 1)
+                    and finite(odometry.q)):
+                w, x, y, z = odometry.q
+                norm = sum(value * value for value in odometry.q)
+                if norm > 0:
+                    yaw = math.atan2(2 * (w * z + x * y), norm - 2 * (y * y + z * z))
+        target_metadata = self.storage.meta["experiment_conditions"]["target"]
+        fresh_target = target_metadata if self._fresh("target_state", now) is not None else {}
+        phase = fresh_target.get("phase")
+        horizontal_speed = math.hypot(*target_velocity[:2])
+        target_local = self._fresh("target_local", now)
+        target_circle_phase = None
+        target_circle_radius = None
+        if (fresh_target.get("motion_mode") == "circle" and target_local is not None
+                and target_local.xy_valid and finite((target_local.x, target_local.y))):
+            target_circle_radius = math.hypot(target_local.x, target_local.y)
+            if target_circle_radius > 0:
+                target_circle_phase = math.atan2(target_local.y, target_local.x)
+        return {
+            "ros_time": now,
+            "self_position_ned": list(own), "target_position_ned": list(target),
+            "self_velocity_ned": list(own_velocity), "target_velocity_ned": list(target_velocity),
+            "relative_position_ned": relative,
+            "distance": math.sqrt(sum(value * value for value in relative)),
+            "horizontal_distance": math.hypot(*relative[:2]),
+            "height_difference": relative[2],
+            "target_speed": math.sqrt(sum(value * value for value in target_velocity)),
+            "target_horizontal_speed": horizontal_speed,
+            "target_heading_rad": math.atan2(target_velocity[1], target_velocity[0]) if horizontal_speed > 0 else None,
+            "self_yaw_rad": yaw if math.isfinite(yaw) else None,
+            "self_body_yaw_rate_rad_s": yaw_rate,
+            "target_phase_rad": phase if isinstance(phase, (int, float)) and not isinstance(phase, bool) and math.isfinite(phase) else None,
+            "target_circle_phase_actual_rad": target_circle_phase,
+            "target_circle_radius_actual_m": target_circle_radius,
+            "target_state": fresh_target.get("state"),
+            "target_experiment_state": dict(fresh_target) if fresh_target else None,
+            "source_ages_s": {
+                key: age if math.isfinite(age := self._age(key, now)) else None
+                for key in TOPICS
+            },
+        }
+
     def _maybe_start(self, now):
         if self.intercept_start is not None or self._check_start_timeout():
             return
@@ -391,6 +539,7 @@ class ExperimentRecorder(Node):
         if self.config["algorithm"] == "vision_png" and (detection is None or detection.width <= 0 or detection.height <= 0):
             return
         self.intercept_start = now
+        self.storage.meta["initial_conditions"] = self._initial_conditions(now)
         self.storage.meta.update(status="recording", intercept_start_ros_time=now)
         self.storage.save_meta()
         self.get_logger().info("Fresh INTERCEPT prerequisites met; sampling started")
@@ -399,26 +548,19 @@ class ExperimentRecorder(Node):
         if self.finished:
             return
         try:
+            if self._check_wall_time():
+                return
             now = self._now()
-            if now < self.last_time:
-                self._error("ROS clock moved backwards; refusing to mix experiment timelines")
-                self.finish("clock_reset")
-                return
-            self.last_time = now
-            if self.bag is not None and not self.bag.poll():
-                self._error("requested rosbag exited unexpectedly; see rosbag.log")
-                self.finish("bag_error")
-                return
             detection = self._fresh("detection", now)
             if detection is None or detection.width <= 0 or detection.height <= 0:
                 self._set_detection(False)
             self._maybe_start(now)
-            if self.intercept_start is not None:
+            if self.intercept_start is not None and self.tail_start_monotonic is None:
                 self._sample(now)
-                if self.hit:
-                    self.finish("hit")
+                if self._check_wall_time():
                     return
-            if self.intercept_start is not None and now - self.intercept_start >= self.config["max_duration"]:
+            if (self.tail_start_monotonic is None and self.intercept_start is not None
+                    and now - self.intercept_start >= self.config["max_duration"]):
                 self.finish("timeout")
         except Exception as exc:
             self._error(f"recording callback failed: {exc}")
@@ -444,7 +586,8 @@ class ExperimentRecorder(Node):
         row["distance"] = self._distance(now)
         if math.isfinite(row["distance"]):
             self.minimum_distance = row["distance"] if not math.isfinite(self.minimum_distance) else min(self.minimum_distance, row["distance"])
-        self.hit = self.hit or self._is_hit(row["distance"])
+        if self._is_hit(row["distance"]):
+            self._latch_hit(now)
         row["hit"] = self.hit
         odometry = self._fresh("odom", now)
         if odometry is not None:
@@ -482,6 +625,7 @@ class ExperimentRecorder(Node):
             row.update(zip(("cmd_tx", "cmd_ty", "cmd_tz"), torque.xyz))
         self.storage.write_row(row)
         self.samples += 1
+        self.last_sample_monotonic = monotonic()
         self.pending_lost = self.pending_reacquired = False
 
     def _error(self, text):
@@ -495,6 +639,10 @@ class ExperimentRecorder(Node):
         if self.timer is not None:
             self.timer.cancel()
         now = self._now()
+        end_monotonic = monotonic()
+        tail_elapsed = (max(0.0, end_monotonic - self.tail_start_monotonic)
+                        if self.tail_start_monotonic is not None else None)
+        tail_truncated = (tail_elapsed is not None and tail_elapsed < self.config["post_hit_duration"])
         for name, resource in (("video", self.video), ("bag", self.bag)):
             if resource is not None:
                 try:
@@ -514,6 +662,15 @@ class ExperimentRecorder(Node):
         self.storage.meta.update(
             status="error" if self.errors else ("complete" if self.samples else "no_intercept"), reason=reason,
             end_ros_time=now, resources=self.resources, recording_errors=list(self.errors),
+            first_hit_ros_time=self.first_hit_ros_time,
+            first_hit_monotonic=self.first_hit_monotonic,
+            tail_start_ros_time=self.tail_start_ros_time,
+            tail_start_monotonic=self.tail_start_monotonic,
+            tail_end_ros_time=now if tail_elapsed is not None else None,
+            tail_end_monotonic=end_monotonic if tail_elapsed is not None else None,
+            tail_trigger=self.tail_reason, post_hit_duration_actual=tail_elapsed,
+            post_hit_duration_requested=self.config["post_hit_duration"],
+            tail_truncated=tail_truncated,
         )
         self.storage.meta["topic_status"] = {
             key: {"received": key in self.cache, "age_s": self._age(key, now),
@@ -524,8 +681,10 @@ class ExperimentRecorder(Node):
             self.get_logger().warning("No eligible INTERCEPT samples were recorded; inspect topic_status and telemetry state")
         summary = {
             "status": self.storage.meta["status"], "reason": reason, "hit": self.hit,
-            "intercept_time": elapsed if self.hit else NAN,
+            "intercept_time": self.first_hit_ros_time - self.intercept_start if self.hit else NAN,
             "elapsed_s": elapsed, "min_distance": self.minimum_distance, "samples": self.samples,
+            "post_hit_duration_actual": tail_elapsed if tail_elapsed is not None else NAN,
+            "tail_truncated": tail_truncated,
             "detection_count": self.detection_count, "lost_count": self.lost_count,
             "reacquire_count": self.reacquire_count,
             "latency_mean_ms": self.latency_sum / self.latency_count if self.latency_count else NAN,
@@ -559,9 +718,8 @@ def main(args=None):
     try:
         node = ExperimentRecorder()
         while rclpy.ok() and not node.finished:
-            # ROS timers do not fire while simulation time is stopped or /clock
-            # is absent. Enforce the startup deadline from the wall-driven loop.
-            if node._check_start_timeout():
+            # Wall-driven checks also finish post-hit capture with paused /clock.
+            if node._check_wall_time():
                 break
             rclpy.spin_once(node, timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):

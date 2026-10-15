@@ -8,6 +8,7 @@ experiment_recorder:
     topic_timeout: 1.0
     start_timeout: 60.0
     max_duration: 120.0
+    post_hit_duration: 2.0
     video_fps: 20.0
     camera_topic: /camera/image
     image_width: 1920

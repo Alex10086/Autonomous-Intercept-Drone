@@ -42,6 +42,7 @@ target_link_libraries(uav_png_intercept
 
 ament_target_dependencies(uav_png_intercept
   rclcpp
+  std_msgs
   sensor_msgs
   px4_msgs
   uav_common_msg

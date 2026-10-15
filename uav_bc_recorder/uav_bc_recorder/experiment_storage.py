@@ -26,7 +26,8 @@ COLUMNS = (
 SUMMARY_COLUMNS = (
     "status reason hit intercept_time elapsed_s min_distance samples detection_count "
     "lost_count reacquire_count latency_mean_ms latency_max_ms video_frames "
-    "bag_status bag_exit_code bag_errors video_status video_errors recording_errors"
+    "bag_status bag_exit_code bag_errors video_status video_errors recording_errors "
+    "post_hit_duration_actual tail_truncated"
 ).split()
 TOPICS = {
     "telemetry": "/experiment/telemetry",
@@ -40,10 +41,15 @@ TOPICS = {
     "trajectory": "/px4_1/fmu/in/trajectory_setpoint",
     "thrust": "/px4_1/fmu/in/vehicle_thrust_setpoint",
     "torque": "/px4_1/fmu/in/vehicle_torque_setpoint",
+    "conditions": "/experiment/conditions",
+    "target_state": "/target/experiment_state",
+    "experiment_start": "/experiment/start",
+    "target_start": "/experiment/target_start",
 }
 COMPARE_TOPICS = [TOPICS[key] for key in (
     "telemetry", "vpng", "detection", "self_gps", "target_gps",
-    "self_local", "target_local", "trajectory")]
+    "self_local", "target_local", "trajectory", "conditions", "target_state",
+    "experiment_start", "target_start")]
 ARCHIVE_TOPICS = COMPARE_TOPICS + [TOPICS[key] for key in ("odom", "thrust", "torque")] + ["/clock"]
 
 
@@ -96,11 +102,25 @@ class RunStorage:
             "parameters": {key: None for key in ("N_png", "speed_cmd", "hit_radius", "planner", "controller")},
             **{key: None for key in ("N_png", "speed_cmd", "hit_radius", "planner", "controller")},
             "git_commit": self._git_commit(), "recorder_config": dict(config),
+            "git_dirty": self._git_dirty(),
+            "source_path": str(Path(__file__).resolve()),
+            "experiment_conditions": {"requested": None, "target": None},
+            "initial_conditions": None,
+            "first_hit_ros_time": None, "first_hit_monotonic": None,
             "topics": dict(TOPICS, camera=config["camera_topic"]),
             "provenance": {
                 "timestamp": "ROS clock seconds; max_duration measured from eligible INTERCEPT start",
                 "start_timeout": "monotonic wall seconds from node initialization; independent of ROS /clock",
                 "elapsed_s": "ROS seconds since first eligible INTERCEPT observation",
+                "intercept_time": "ROS seconds from eligible INTERCEPT to first measured distance <= hit_radius; excludes post-hit tail",
+                "post_hit_duration": "monotonic wall seconds from first measured hit (or DONE without a hit); max_duration and DONE cannot truncate an active hit tail",
+                "min_distance": "minimum finite measured GPS separation over all recorded samples, including post-hit tail",
+                "initial_conditions": "single snapshot at first eligible INTERCEPT; positions in common GPS-origin NED, velocities in local NED; unavailable optional fields are null",
+                "height_difference": "target_down - self_down in meters; positive means target below self",
+                "target_heading_rad": "atan2(target_vE, target_vN); null when horizontal velocity is zero",
+                "self_yaw_rad": "fresh self local heading, with NED odometry quaternion fallback; radians",
+                "self_body_yaw_rate_rad_s": "fresh odometry body-FRD angular_velocity z, not Euler yaw derivative",
+                "experiment_conditions": "latest valid requested protocol and target JSON stored separately from immutable measured initial_conditions",
                 "freshness": "receipt ROS time; valid nonzero ROS header additionally gates telemetry. Detection receipt freshness does not guarantee source image age (camera stamp may use another clock)",
                 "positions": "WGS84 ECEF to common NED at first valid self GPS; meters; ellipsoid altitude preferred. MSL fallback is approximate; mixed altitude datums are rejected",
                 "velocities": "PX4 local NED, m/s; independent local positions never mixed",
@@ -139,6 +159,17 @@ class RunStorage:
             except ModuleNotFoundError:
                 return None
             return GIT_COMMIT
+
+    @staticmethod
+    def _git_dirty():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent), "status", "--porcelain",
+                 "--untracked-files=normal"],
+                capture_output=True, text=True, timeout=3, check=True)
+            return bool(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            return None
 
     def save_meta(self):
         atomic_yaml(self.path / "meta.yaml", self.meta)

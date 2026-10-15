@@ -291,7 +291,7 @@ experiment_data/
 * 开始需要新鲜的 `INTERCEPT` 遥测、自身/目标有效 GPS 及 NED 速度；Vision PNG 额外需要有效检测框，purePNG 不需要相机或检测。`topic_timeout` 默认 1 秒。
 * `start_timeout` 默认 60 秒，必须为正的有限数；从节点初始化起按单调墙钟计时，不依赖 ROS 仿真时间。期限内未满足开始条件时收尾并退出，`meta.yaml` / `summary.csv` 的 `reason` 为 `start_timeout`，正常情况下状态为 `no_intercept`；已请求资源的收尾错误仍标记 `error`。开始录制后不再受此期限影响，继续使用 `max_duration`。
 * 一旦开始，丢目标或话题过期仍继续采样；缺失/过期数值写 `NaN`。`detected`、`lost`、`reacquired` 区分检测状态与转换事件；计数来自回调/过期转换，不是重复累计 CSV 行。
-* 真实距离达到遥测中的 `hit_radius`、算法进入 `DONE`、超过 `max_duration` 或 Ctrl+C 时完成汇总。`intercept_time` 是从满足开始条件到首次记录命中的 ROS 秒数，不是绝对时间戳。没有进入拦截也会输出 `no_intercept` 汇总；未命中的时间/距离指标不伪造为零。
+* 真实距离首次达到 `hit_radius` 后继续录制 `post_hit_duration`（默认 2 秒，单调墙钟），再收尾；算法先进入 `DONE` 也保留该窗口，但没有实测命中时不伪造 `hit`。`DONE` 和 `max_duration` 不会截断已开始的撞后窗口，外部中断会标记 `tail_truncated`。`intercept_time` 始终是首次实测命中耗时，不包含撞后窗口；`min_distance` 是新鲜 GPS 回调和定频样本的观测最小值，包含撞后窗口。撞后仍按定频采样，重复命中／DONE 消息不重复插行，最终收尾补一行。未命中时仍按 `max_duration` 超时，未进入拦截时输出 `no_intercept`。
 * bag/视频从记录器启动开始采集，包含起飞和捕获前阶段；`max_duration` 从满足拦截开始条件起算。视频采用固定接收时间网格，缺帧时保持上一帧，元数据记录起止 ROS 时间及补帧数；过长缺口明确报错，不无限补帧。
 * 请求的 bag/视频无法启动或收尾、视频没有收到可编码图像等均标记 `error` 并以非零状态退出，不会悄悄降档；目录保留用于排查。
 
@@ -305,12 +305,43 @@ experiment_data/
 * bbox 对应原始图像像素；`confidence` 是 YOLO 捕获分数或 LightTrack 跟踪分数，未提供/丢失为 `NaN`，两种分数不应视为同一个校准概率。
 * 时间为记录器 ROS 时钟；检测新鲜度按接收时间计算，不等于源图像年龄保证。`vision_latency_ms` 仅在图像 stamp 非零、非未来且与接收时钟相差不超过 `topic_timeout` 时计算；Gazebo 仿真 stamp 与墙钟混用时为 `NaN`，不会相减出巨大“延迟”。需要有效延迟时应统一时间域；只有在 `/clock` 确实可用且相关节点配置一致时才启用 `use_sim_time`。
 
-`meta.yaml` 记录实验标识、实际算法参数、git commit（源码链接安装查询源码版本，普通复制安装保留构建时版本；两者均不可用时为 null）、记录器配置、坐标/时间/单位口径、GPS 原点、请求及实际资源状态和 bag 各 topic 消息数。`summary.csv` 每次实验一行，包含命中、拦截耗时、最近距离、样本数、检测/丢失/重捕获计数、延迟统计及资源错误。
+`meta.yaml` 记录实验标识、实际算法参数、git commit、`git_dirty`、源码位置、记录器配置、坐标/时间/单位口径、GPS 原点、资源状态及 bag 消息数。`experiment_conditions.requested` 保存 `/experiment/conditions` 的实验协议，`.target` 保存 `/target/experiment_state` 的目标运动配置与状态；两者不覆盖标准元数据。`initial_conditions` 在首次满足拦截采样条件时只记录一次实际 p/v、距离、水平距离、高度差（目标低于自身为正）、目标速度/方向、自身偏航、目标指令相位和实测圆周相位以及各源年龄，缺失值为 null。首次命中时间、撞后实际时长和是否被截断单独保存；`summary.csv` 每次实验一行，包含命中、拦截耗时、最近距离、计数、延迟及资源错误。
 
 compare 的 bag 包含 `/experiment/telemetry`、`/vpng_data`、`/camera_detect_result`、双机 GPS/local position 和自身 trajectory setpoint。archive 额外包含自身 odometry、thrust/torque setpoint 和 `/clock`，覆盖上述建议的八个 topic；原始图像不重复写入 bag，单独保存 MP4。安装的 `bag_qos.yaml` 使用兼容 PX4 BEST_EFFORT 的订阅；未发布话题不会凭空产生消息，实际消息数见元数据。
 
 旧 `assets/vpng_intercept_stats_*.csv` 和绘图脚本保留为历史数据格式，不直接读取新的统一表。
 
+
+### 2.4 二阶段固定条件验证
+
+重建 `uav_target_sim`、`uav_vision_png`、`uav_png_intercept`、`uav_bc_recorder` 并加载对应工作空间及视觉运行库。保持 QGroundControl 连接，不要另开仿真或控制节点。从仓库根目录运行：
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --groups near far --trials 3 --duration 60.0
+```
+
+每轮新建真实双机 SITL，并启动真实 CUDA 检测、目标控制、制导和 compare 记录；不会注入虚假检测或代发 PX4 速度指令。目标先在初始圆周点起飞稳定，双方达到位置/速度稳定条件后，再接受未来 ROS epoch 的圆周启动指令；接管使用固定运动年龄、circle 相位和外部放行条件。PNG 增益保持默认不变。
+
+默认 circle 半径 5 m、初始相位 0、角速度 +0.5 rad/s；目标启动后一整圈再到指令相位 4.4 rad 时安排接管。默认请求距离为 near 约 16.8 m、far 约 24 m，高度差约 0.3 m。指令相位与目标实际运动相位分别保存；实际距离、高度、检测或入场时序不满足协议会中止并保留无效试验，不冒充有效样本。`run_swarm.sh` 可通过 `PX4_SELF_POSE` / `PX4_TARGET_POSE` 配置仿真初始位置。
+
+结果默认保存在 `~/intercept_ws/experiment_data/phase2/时间戳/`。每轮保留 `protocol.json`、`result.json`、各进程日志及独立 recorder 目录；重复组别/次数均可由参数指定。对该会话目录运行：
+
+```bash
+ros2 run uav_bc_recorder phase2_analysis \
+  "$HOME/intercept_ws/experiment_data/phase2"
+```
+
+分析输出 `analysis/metrics.csv`、`results.json` 和各次首次最近点前 2 秒至后 3 秒的窗口 CSV。首次接近定义为入场后至少缩短 1 m、经过至少 1 秒，再出现“距离较运行最小值回升 1 m 并持续至少 0.2 秒”；不要求先缩短到某个比例，避免跳过远处的首次折返、把后续更好的接近当成首次成功。首次接近不等于首次近距离擦过，两者必须区分。窗口包含距离/水平距离/高度误差、bbox/检测、LOS/采样 LOS rate、yaw/yaw rate、速度指令和控制状态；视觉角速度跨 ±π 正确包裹，检测缺口不桥接。它们是定频采样指标，不替代同步真值或 Gazebo 接触事件。
+
+仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --algorithm pure_png --groups far --trials 2
+```
+
+Pure 对照仍运行真实检测以保持进程负载接近，并将速度上限/命中半径匹配为 5 m/s / 0.8 m；不是调参优化，也不直接拿原始 8 m/s Pure 结果与视觉结果混比。
 
 ### 3. 运行拦截任务 (步骤序列)
 请按以下顺序在不同终端中运行各节点：

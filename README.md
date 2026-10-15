@@ -276,7 +276,7 @@ Each startup immediately creates an independent directory beneath `out_dir`, e.g
 * Start requires fresh `INTERCEPT` telemetry, valid self/target GPS and NED velocities. Vision PNG also requires a valid detection; purePNG requires neither camera nor detection. `topic_timeout` defaults to one second.
 * `start_timeout` defaults to 60 seconds and must be finite and positive. It uses monotonic wall time from node initialization, independently of ROS simulation time. If interception prerequisites are not met by the deadline, finalize and exit with `reason: start_timeout` in metadata/summary and normally `status: no_intercept`; requested-resource finalization errors still produce `error`. Once recording starts, this deadline no longer applies; `max_duration` continues to bound interception.
 * Continue through detection loss and stale topics; unavailable numeric fields become `NaN`. Detection/lost/reacquisition counters use callbacks and freshness transitions, not repeated CSV rows.
-* Finalize on distance within the actual `hit_radius`, algorithm `DONE`, `max_duration`, or Ctrl+C. `intercept_time` is elapsed ROS seconds from eligible interception start to observed hit, not an absolute timestamp. A run that never intercepts still gets a `no_intercept` summary; missing metrics are not fabricated as zero.
+* A measured hit starts `post_hit_duration` (default 2 monotonic wall seconds) before finalization. Algorithm `DONE` also starts a tail without fabricating a hit. DONE and max duration do not truncate an active tail; external interruption reports `tail_truncated`. `intercept_time` remains first measured hit time, excluding the tail; minimum distance uses fresh GPS callbacks and sampled observations, including the tail. Repeated hit/DONE messages do not insert duplicate event rows; regular tail sampling and one final row remain. Misses still use `max_duration`; runs that never intercept report `no_intercept`.
 * Bag/video capture begins at recorder startup, including takeoff/acquisition; duration starts only after interception prerequisites are met. Video uses a fixed receipt-time grid, holding the previous frame across missing slots; metadata records its ROS start/end and duplicate-frame count. Gaps beyond `max_duration` fail explicitly instead of causing unbounded backfill.
 * Requested bag/video startup/finalization failures, including zero encodable images, produce error metadata and a nonzero exit rather than silently downgrading capture.
 
@@ -288,12 +288,43 @@ Positions use a common first-valid-self-GPS NED origin (meters, **z positive dow
 
 Bounding boxes use original-image pixels. Confidence is the YOLO acquisition score or LightTrack tracking score, not a common calibrated probability; unavailable/lost scores are `NaN`. Detection freshness is receipt-based and does not guarantee source-image age. `vision_latency_ms` is computed only for a nonzero, nonfuture image stamp within `topic_timeout` of the recorder clock. Mixed Gazebo simulation/wall epochs produce `NaN`, not bogus latency. For meaningful latency, configure a common time domain; enable `use_sim_time` only when `/clock` is actually available and related nodes agree.
 
-`meta.yaml` records identifiers, actual parameters, git commit (source revision for symlink installs; embedded build revision for copied installs; null only when neither is available), recorder configuration, time/frame/unit provenance, GPS origin, resource outcomes, and bag message counts. `summary.csv` has one row per run with hit/interception time, minimum distance, sample/detection/lost/reacquisition counts, latency aggregates, and resource errors.
+`meta.yaml` records identifiers, actual parameters, git revision/dirty status/source path, recorder configuration, time/frame/unit provenance, GPS origin, and resource outcomes. `experiment_conditions.requested` stores `/experiment/conditions`; `.target` stores `/target/experiment_state`, without overwriting canonical metadata. The one-time `initial_conditions` snapshot captures actual positions/velocities, distance/horizontal distance/height difference (target below self positive), target speed/direction, self yaw, commanded and measured target-circle phase, and source ages; unavailable values are null. First-hit time, actual post-hit duration, and truncation are separate. `summary.csv` has one row per run with hit/time/distance, counts, latency aggregates, and resource errors.
 
 Compare bags include `/experiment/telemetry`, `/vpng_data`, `/camera_detect_result`, both vehicles' GPS/local position, and self trajectory setpoint. Archive additionally records self odometry, thrust/torque setpoints, and `/clock`, covering the recommended eight topics. Raw images are not duplicated in bags; MP4 is separate. Installed `bag_qos.yaml` accepts PX4 BEST_EFFORT publishers. Unpublished topics do not produce messages; metadata reports actual counts.
 
 Existing `assets/vpng_intercept_stats_*.csv` and plotting scripts remain historical-format artifacts, not consumers of the new unified schema.
 
+
+### 2.4 Fixed-Condition Phase-Two Validation
+
+Rebuild target, both PNG packages, and the recorder; load the workspace and vision environment, keep QGroundControl connected, and do not start other simulation/controllers. From the repository root:
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --groups near far --trials 3 --duration 60.0
+```
+
+Each trial starts fresh real dual SITL, actual CUDA detection, target/guidance nodes, and compare recording. The supervisor never injects detections or PX4 velocity setpoints. The target first stabilizes at its initial circle point, both vehicles settle, and target motion accepts a future ROS epoch. Takeover uses a fixed motion age/phase and explicit external release, with unchanged PNG gains.
+
+Defaults: circle radius 5 m, initial phase 0, signed angular velocity +0.5 rad/s; release is scheduled one orbit plus commanded phase 4.4 rad after motion starts. Requested near/far distances are approximately 16.8/24 m, with target 0.3 m below self. Commanded versus measured phase are distinct metadata. Readiness, distance, height, detection, or release-time violations stop and preserve an invalid trial instead of silently counting it. Simulation spawn poses use `PX4_SELF_POSE` / `PX4_TARGET_POSE`.
+
+Sessions live beneath `~/intercept_ws/experiment_data/phase2/`, preserving protocol/result JSON, process logs, and independent recorder directories. Analyze sessions with:
+
+```bash
+ros2 run uav_bc_recorder phase2_analysis \
+  "$HOME/intercept_ws/experiment_data/phase2"
+```
+
+Outputs are `analysis/metrics.csv`, `results.json`, and diagnostic window CSVs from 2 seconds before to 3 seconds after the first closest approach. After at least 1 m closure and elapsed time of at least 1 second, the first approach ends when distance rises 1 m above its running minimum for at least 0.2 seconds. No percentage-of-initial-range gate may skip an early distant turnaway in favor of a later closer pass. A first approach is distinct from a first close scrape. Windows include separation/height, bbox/detection, LOS/sampled LOS rate, yaw/yaw rate, commands, and controller state. Angular rates wrap pi crossings and do not bridge detection gaps; sampled metrics are not ground truth/contact evidence.
+
+Only if the cause remains ambiguous, add matched far Pure PNG controls:
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --algorithm pure_png --groups far --trials 2
+```
+
+Pure controls retain real detection for comparable process load and match speed/hit radius to 5 m/s and 0.8 m, rather than comparing unmatched original 8 m/s Pure flights.
 
 ### 3. Running the Interception Task (Step Sequence)
 Please run each node in a separate terminal in the following order:

@@ -58,3 +58,23 @@
   durability: volatile
   history: keep_last
   depth: 100
+/experiment/conditions:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100
+/target/experiment_state:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100
+/experiment/start:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100
+/experiment/target_start:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100

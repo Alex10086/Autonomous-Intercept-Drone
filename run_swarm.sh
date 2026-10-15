@@ -11,6 +11,9 @@ set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
 PX4_ROOT="${PX4_ROOT:-$HOME/PX4-Autopilot}"
+# Reproducible experiments may override spawn poses without editing PX4 files.
+PX4_SELF_POSE="${PX4_SELF_POSE:-0,0}"
+PX4_TARGET_POSE="${PX4_TARGET_POSE:-20,0}"
 cd "$PX4_ROOT"
 
 # -------------------------------------------------------
@@ -76,7 +79,7 @@ echo ""
 echo "🚀 正在启动 Drone 1 (gz_x500_depth, Instance 1)..."
 PX4_GZ_WORLD=grass_world \
 PX4_SYS_AUTOSTART=4002 \
-PX4_GZ_MODEL_POSE="0,0" \
+PX4_GZ_MODEL_POSE="$PX4_SELF_POSE" \
 PX4_SIM_MODEL=gz_x500_depth \
 PX4_PARAM_EKF2_HGT_REF=2 \
     setsid bash -o pipefail -c './build/px4_sitl_default/bin/px4 -d -i 1 2>&1 | rotatelogs -n "$1" drone1.log "$2"' \
@@ -116,7 +119,7 @@ echo "🚀 正在启动 Drone 2 (gz_x500, Instance 2)..."
 PX4_GZ_STANDALONE=1 \
 PX4_GZ_WORLD=grass_world \
 PX4_SYS_AUTOSTART=4001 \
-PX4_GZ_MODEL_POSE="20,0" \
+PX4_GZ_MODEL_POSE="$PX4_TARGET_POSE" \
 PX4_SIM_MODEL=gz_x500 \
     setsid bash -o pipefail -c './build/px4_sitl_default/bin/px4 -d -i 2 2>&1 | rotatelogs -n "$1" drone2.log "$2"' \
     bash "$LOG_MAX_FILES" "$LOG_MAX_SIZE" &
@@ -139,8 +142,8 @@ echo "------------------------------------------------"
 echo "  日志限制        : 每个最大 ${LOG_MAX_SIZE}，保留 ${LOG_MAX_FILES} 个文件"
 echo "  相机话题        : /camera/image"
 echo "  世界地图        : grass_world"
-echo "  Drone 1 位置   : (0, 0)"
-echo "  Drone 2 位置   : (20, 0)"
+echo "  Drone 1 位置   : $PX4_SELF_POSE"
+echo "  Drone 2 位置   : $PX4_TARGET_POSE"
 echo "================================================"
 echo ""
 echo "  验证命令:"

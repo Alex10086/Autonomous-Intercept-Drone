@@ -11,22 +11,20 @@
 #include <stdint.h>
 #include <cmath>
 #include <random>
-
+#include <optional>
+#include <string>
+#include <chrono>
+ 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
-#include <px4_msgs/msg/sensor_gps.hpp>
-#include <px4_msgs/msg/vehicle_rates_setpoint.hpp>
-#include <px4_msgs/msg/vehicle_control_mode.hpp>
-#include <GeographicLib/LocalCartesian.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
 
-#include <chrono>
-#include <iostream>
-
-using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
-using namespace GeographicLib;
 
 enum class MotionMode {
     CIRCLE,         // 匀速圆周运动
@@ -40,7 +38,6 @@ public:
     UavTargetControl();
 
     void arm();
-    void disarm();
 
 private:
     rclcpp::TimerBase::SharedPtr timer_;
@@ -48,19 +45,37 @@ private:
     rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
     rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
     rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
-
-    rclcpp::Subscription<VehicleRatesSetpoint>::SharedPtr vehicle_rates_setpoint_subscription_;
-    rclcpp::Subscription<SensorGps>::SharedPtr global_position_sub_;
-
-    std::vector<double> enu_xyz = {0, 0, 0};
-    std::vector<double> init_enu_xyz = {0, 0, 0};
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr experiment_state_publisher_;
+    rclcpp::Subscription<VehicleLocalPosition>::SharedPtr local_position_subscription_;
+    rclcpp::Subscription<VehicleStatus>::SharedPtr vehicle_status_subscription_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_start_subscription_;
 
     MotionMode motion_mode_ = MotionMode::CIRCLE;
 
     // ---- 圆周运动参数 ----
-    float radius_ = 5.0f;
-    float angular_speed_ = 0.0025f;
-    float theta_ = 0.0f;
+    double radius_ = 5.0;
+    double angular_velocity_ = 0.5;
+    double initial_phase_ = 0.0;
+    double theta_ = 0.0;
+    double target_altitude_ = -5.0;
+    bool defer_motion_ = false;
+    double takeoff_position_tolerance_ = 0.1;
+    double takeoff_speed_tolerance_ = 0.2;
+    double stability_duration_ = 2.0;
+    bool stable_ = false;
+    bool motion_started_ = false;
+    std::optional<double> motion_start_ros_time_;
+    using SteadyClock = std::chrono::steady_clock;
+    std::optional<SteadyClock::time_point> stable_since_;
+    SteadyClock::time_point last_local_position_time_{};
+    SteadyClock::time_point last_status_time_{};
+    SteadyClock::time_point last_control_time_{};
+    SteadyClock::time_point last_arm_request_time_{};
+    VehicleLocalPosition local_position_{};
+    VehicleStatus vehicle_status_{};
+    bool local_position_received_ = false;
+    bool status_received_ = false;
+    bool control_published_ = false;
 
     // ---- 通用运动状态 ----
     float pos_x_ = 5.0f;
@@ -87,11 +102,18 @@ private:
     std::mt19937 rng_{std::random_device{}()};
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
 
-    std::atomic<uint64_t> timestamp_;
-    uint64_t offboard_setpoint_counter_;
+    uint64_t offboard_setpoint_counter_ = 0;
 
     void publish_offboard_control_mode();
     void publish_trajectory_setpoint(float x, float y, float z);
+    void control_tick();
+    void update_stability();
+    void publish_experiment_state();
+    void target_start_callback(const std_msgs::msg::Float64::SharedPtr msg);
+    void local_position_callback(const VehicleLocalPosition::SharedPtr msg);
+    void vehicle_status_callback(const VehicleStatus::SharedPtr msg);
+    bool local_position_valid() const;
+    bool armed_offboard() const;
     void execute_motion();
     void move_in_circle();
     void move_sinusoidal();
@@ -99,7 +121,7 @@ private:
     void apply_boundary();
 
     void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
-    void global_position_callback(const SensorGps::SharedPtr msg);
+    const char *motion_mode_name() const;
 };
 
 #endif //UAV_TARGET_SIM_H

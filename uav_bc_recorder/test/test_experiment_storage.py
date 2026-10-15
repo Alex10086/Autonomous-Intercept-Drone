@@ -93,3 +93,17 @@ def test_video_resampling_preserves_duration_and_holds_previous_frame(tmp_path):
         assert frames[5][0] > 200 and frames[5][2] < 40
     finally:
         reader.release()
+
+
+def test_new_runs_do_not_inherit_previous_experiment_conditions(tmp_path):
+    config = dict(DEFAULTS, out_dir=str(tmp_path), experiment_id="independent")
+    first = RunStorage(config)
+    first.meta["experiment_conditions"]["requested"] = {"trial": 1, "distance": 17.0}
+    first.meta["initial_conditions"] = {"distance": 17.1}
+    first.finalize({"status": "complete"})
+    second = RunStorage(config)
+    assert second.meta["experiment_conditions"] == {"requested": None, "target": None}
+    assert second.meta["initial_conditions"] is None
+    assert second.meta["first_hit_ros_time"] is None
+    assert second.meta["first_hit_monotonic"] is None
+    second.finalize({"status": "no_intercept"})

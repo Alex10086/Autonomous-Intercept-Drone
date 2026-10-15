@@ -63,6 +63,7 @@ target_link_libraries (uav_target_sim
 #添加节点的依赖
 ament_target_dependencies(uav_target_sim
         rclcpp
+        std_msgs
         sensor_msgs
         px4_msgs
 )

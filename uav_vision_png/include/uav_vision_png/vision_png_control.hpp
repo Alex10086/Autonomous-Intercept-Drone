@@ -44,6 +44,8 @@
 #include <array>
 #include <chrono>
 
+#include <limits>
+#include <std_msgs/msg/bool.hpp>
 // PX4 消息
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -106,6 +108,7 @@ private:
     //  状态机各阶段处理
     // ----------------------------------------------------------
     void handle_takeoff();
+    bool takeoff_ready();
     void handle_searching();
     void handle_intercept();
     void handle_track_lost();
@@ -152,6 +155,7 @@ private:
     //  订阅者 —— 导引用
     // ----------------------------------------------------------
     rclcpp::Subscription<RectMsg>::SharedPtr            detect_sub_;        ///< 视觉检测结果（导引核心输入）
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr experiment_start_sub_;
     rclcpp::Subscription<VehicleOdometry>::SharedPtr    odometry_sub_;      ///< 自身姿态
     rclcpp::Subscription<VehicleLocalPosition>::SharedPtr  local_pos_sub_;  ///< 自身速度/位置
     rclcpp::Subscription<VehicleStatus>::SharedPtr      status_sub_;        ///< 飞行状态
@@ -251,6 +255,15 @@ private:
 
     // 起飞参数
     double standby_altitude_  = -6.0;  ///< NED z（负值 = 上升）
+    bool require_experiment_start_ = false;
+    bool experiment_start_ = false;
+    bool precise_standby_ = false;
+    double takeoff_altitude_tolerance_ = 0.5;
+    double takeoff_speed_tolerance_ = 0.0;  // Zero disables the speed check.
+    double takeoff_settle_time_ = 0.0;
+    double standby_yaw_ = std::numeric_limits<double>::quiet_NaN();
+    double settled_since_ = -1.0;
+    bool local_position_received_ = false;
     int    takeoff_counter_   = 0;
     int    takeoff_frames_    = 500;   ///< 起飞预热帧数（5ms × 500 = 2.5s）
 

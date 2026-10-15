@@ -16,6 +16,8 @@
 
 #include <uav_common_msg/msg/experiment_telemetry.hpp>
 #include <string>
+#include <limits>
+#include <std_msgs/msg/bool.hpp>
 
 using namespace px4_msgs::msg;
 using namespace std::chrono_literals;
@@ -34,6 +36,7 @@ private:
 
     void handle_init();
     void handle_takeoff();
+    bool takeoff_ready();
     void handle_intercept();
 
     // -------- 比例导引（与 IBVS 代码相同的角度更新公式）--------
@@ -58,6 +61,7 @@ private:
     rclcpp::Subscription<SensorGps>::SharedPtr           target_gps_sub_; // px4_2 绝对位置
     rclcpp::Subscription<VehicleLocalPosition>::SharedPtr self_vel_sub_;   // px4_1 速度
     rclcpp::Subscription<VehicleStatus>::SharedPtr        status_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr experiment_start_sub_;
 
     rclcpp::TimerBase::SharedPtr timer_;
     void publish_telemetry();
@@ -103,7 +107,15 @@ private:
     // -------- 导引参数 --------
     float N_{4.0f};               // N_png
     float intercept_speed_{8.0f}; // speed_cmd, m/s
-    const float takeoff_alt_{-5.0f};    // 起飞 NED 高度（与目标一致）
+    double takeoff_alt_{-5.0};  // standby_altitude, NED
+    bool require_experiment_start_{false};
+    bool experiment_start_{false};
+    double takeoff_altitude_tolerance_{0.5};
+    double takeoff_speed_tolerance_{0.0};  // Zero disables the speed check.
+    double takeoff_settle_time_{0.0};
+    double standby_yaw_{std::numeric_limits<double>::quiet_NaN()};
+    double settled_since_{-1.0};
+    bool local_position_received_{false};
     float hit_radius_{0.5f};      // hit_radius, m
 
 };

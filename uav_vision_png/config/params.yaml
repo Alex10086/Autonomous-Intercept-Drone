@@ -37,6 +37,13 @@ uav_vision_png:
     # ---- 起飞参数 ----
     # NED z（负值 = 上升），目标待机高度 5m
     standby_altitude: -6.0
+    # Optional first-INTERCEPT release on /experiment/start (std_msgs/Bool).
+    require_experiment_start: false
+    takeoff_altitude_tolerance: 0.5  # m; strictly positive
+    takeoff_speed_tolerance: 0.0     # m/s; zero disables the speed check
+    takeoff_settle_time: 0.0         # continuous ROS seconds in tolerance
+    # Optional standby_yaw (radians NED); omitted/NaN preserves legacy heading.
+    # Experiments override tolerances to 0.08 m / 0.2 m/s, settling to 2 s.
 
     # ---- 目标丢失阈值 ----
     # 惯性续飞阈值：丢失帧数低于此值时保持上一帧速度继续飞行（约 0.5s@30Hz检测）

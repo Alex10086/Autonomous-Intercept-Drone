@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 
 // ============================================================
 //  构造函数
@@ -32,6 +33,22 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
     N_ = static_cast<float>(declare_parameter<double>("N_png", 4.0));
     intercept_speed_ = static_cast<float>(declare_parameter<double>("speed_cmd", 8.0));
     hit_radius_ = static_cast<float>(declare_parameter<double>("hit_radius", 0.5));
+    takeoff_alt_ = declare_parameter<double>("standby_altitude", -5.0);
+    require_experiment_start_ = declare_parameter<bool>("require_experiment_start", false);
+    takeoff_altitude_tolerance_ = declare_parameter<double>("takeoff_altitude_tolerance", 0.5);
+    takeoff_speed_tolerance_ = declare_parameter<double>("takeoff_speed_tolerance", 0.0);
+    takeoff_settle_time_ = declare_parameter<double>("takeoff_settle_time", 0.0);
+    standby_yaw_ = declare_parameter<double>("standby_yaw", standby_yaw_);
+    if (!std::isfinite(takeoff_alt_) ||
+        !std::isfinite(takeoff_altitude_tolerance_) || takeoff_altitude_tolerance_ <= 0.0 ||
+        !std::isfinite(takeoff_speed_tolerance_) || takeoff_speed_tolerance_ < 0.0 ||
+        !std::isfinite(takeoff_settle_time_) || takeoff_settle_time_ < 0.0 ||
+        (!std::isfinite(standby_yaw_) && !std::isnan(standby_yaw_))) {
+        throw std::invalid_argument("Invalid standby/takeoff parameters: finite altitude, positive altitude tolerance, nonnegative speed tolerance (0 disables) and settle time, finite or NaN yaw required");
+    }
+    experiment_start_sub_ = create_subscription<std_msgs::msg::Bool>(
+        "/experiment/start", rclcpp::QoS(10).reliable(),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) { experiment_start_ = msg->data; });
     telemetry_pub_ = create_publisher<uav_common_msg::msg::ExperimentTelemetry>(
         "/experiment/telemetry", 10);
 
@@ -86,6 +103,8 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
         [this](const VehicleLocalPosition::SharedPtr msg) {
             self_vel_ = {msg->vx, msg->vy, msg->vz};
             local_z_ = msg->z;
+            local_position_received_ = msg->z_valid &&
+                (takeoff_speed_tolerance_ == 0.0 || (msg->v_xy_valid && msg->v_z_valid));
         });
 
 
@@ -112,7 +131,10 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
         if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
             yaml << std::quoted(parameter.as_string());
         } else if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
-            yaml << parameter.as_double();
+            const double value = parameter.as_double();
+            if (std::isnan(value)) yaml << ".nan";
+            else if (std::isinf(value)) yaml << (value > 0.0 ? ".inf" : "-.inf");
+            else yaml << value;
         } else {
             yaml << parameter.value_to_string();
         }
@@ -263,7 +285,7 @@ void PngInterceptor::handle_init()
 {
     // 始终发送 Offboard 心跳（PX4 要求进入 Offboard 前数据流必须存在）
     publish_offboard_position_mode();
-    publish_position_setpoint(0.0f, 0.0f, takeoff_alt_, std::nanf(""));
+    publish_position_setpoint(0.0f, 0.0f, takeoff_alt_, static_cast<float>(standby_yaw_));
 
     // 从第 1 帧起就持续发 arm + SET_MODE（与 uav_ibvs_control 一致）
     set_offboard_mode();
@@ -297,6 +319,23 @@ void PngInterceptor::handle_init()
 // ============================================================
 //  TAKEOFF：位置控制爬升到目标高度
 // ============================================================
+bool PngInterceptor::takeoff_ready()
+{
+    const double now = get_clock()->now().seconds();
+    const double speed = self_vel_.norm();
+    const bool ready = local_position_received_ && self_pos_ok_ &&
+        std::isfinite(local_z_) &&
+        std::fabs(local_z_ - takeoff_alt_) < takeoff_altitude_tolerance_ &&
+        (takeoff_speed_tolerance_ == 0.0 ||
+         (std::isfinite(speed) && speed <= takeoff_speed_tolerance_));
+    if (!ready) {
+        settled_since_ = -1.0;
+        return false;
+    }
+    if (settled_since_ < 0.0 || now < settled_since_) settled_since_ = now;
+    return now - settled_since_ >= takeoff_settle_time_;
+}
+
 void PngInterceptor::handle_takeoff()
 {
     // 持续发送，保持 offboard 模式
@@ -305,8 +344,8 @@ void PngInterceptor::handle_takeoff()
     publish_offboard_position_mode();
 
     // 机头指向目标（与 INTERCEPT 阶段一致）
-    float yaw = std::nanf("");
-    if (target_pos_ok_ && self_pos_ok_) {
+    float yaw = static_cast<float>(standby_yaw_);
+    if (!std::isfinite(standby_yaw_) && target_pos_ok_ && self_pos_ok_) {
         Eigen::Vector3f R = target_pos_ - self_pos_;
         yaw = atan2f(R(1), R(0));  // yaw = atan2(East, North)
     }
@@ -316,10 +355,9 @@ void PngInterceptor::handle_takeoff()
         "[TAKEOFF] 当前高度 z=%.2f m (目标 %.2f m, 差 %.2f m)",
         local_z_, takeoff_alt_, std::fabs(local_z_ - takeoff_alt_));
 
-    // 高度到位（误差 < 0.5m）且目标数据就绪
-    if (self_pos_ok_ &&
-        std::fabs(local_z_ - takeoff_alt_) < 0.5f &&
-        target_pos_ok_)
+    // Keep position hold indefinitely until settled, target-ready and released.
+    if (takeoff_ready() && target_pos_ok_ &&
+        (!require_experiment_start_ || experiment_start_))
     {
         state_ = InterceptState::INTERCEPT;
         RCLCPP_INFO(get_logger(), "→ 高度到位，切换到 INTERCEPT");

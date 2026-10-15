@@ -39,6 +39,8 @@ setup(
     entry_points={
         "console_scripts": [
             "experiment_recorder = uav_bc_recorder.recorder_node:main",
+            "phase2_runner = uav_bc_recorder.phase2_runner:main",
+            "phase2_analysis = uav_bc_recorder.phase2_analysis:main",
         ],
     },
 )

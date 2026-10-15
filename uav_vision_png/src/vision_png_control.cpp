@@ -26,6 +26,7 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 
 // ============================================================
 //  构造函数
@@ -69,6 +70,24 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     coast_thresh_      = this->get_parameter("coast_thresh").as_int();
     lost_thresh_       = this->get_parameter("lost_thresh").as_int();
     hit_radius_        = (float)this->get_parameter("hit_radius").as_double();
+    require_experiment_start_ = declare_parameter<bool>("require_experiment_start", false);
+    takeoff_altitude_tolerance_ = declare_parameter<double>("takeoff_altitude_tolerance", 0.5);
+    takeoff_speed_tolerance_ = declare_parameter<double>("takeoff_speed_tolerance", 0.0);
+    takeoff_settle_time_ = declare_parameter<double>("takeoff_settle_time", 0.0);
+    standby_yaw_ = declare_parameter<double>("standby_yaw", standby_yaw_);
+    if (!std::isfinite(standby_altitude_) ||
+        !std::isfinite(takeoff_altitude_tolerance_) || takeoff_altitude_tolerance_ <= 0.0 ||
+        !std::isfinite(takeoff_speed_tolerance_) || takeoff_speed_tolerance_ < 0.0 ||
+        !std::isfinite(takeoff_settle_time_) || takeoff_settle_time_ < 0.0 ||
+        (!std::isfinite(standby_yaw_) && !std::isnan(standby_yaw_))) {
+        throw std::invalid_argument("Invalid standby/takeoff parameters: finite altitude, positive altitude tolerance, nonnegative speed tolerance (0 disables) and settle time, finite or NaN yaw required");
+    }
+    experiment_start_sub_ = create_subscription<std_msgs::msg::Bool>(
+        "/experiment/start", rclcpp::QoS(10).reliable(),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) { experiment_start_ = msg->data; });
+    precise_standby_ = require_experiment_start_ || takeoff_settle_time_ > 0.0 ||
+        takeoff_speed_tolerance_ > 0.0 || takeoff_altitude_tolerance_ != 0.5 ||
+        std::isfinite(standby_yaw_);
 
     // ---- 相机→机体旋转矩阵（与 los_control.cpp 保持一致）----
     // Cx → By,  Cy → Bz,  Cz → Bx
@@ -107,7 +126,9 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
             } else {
                 lost_frames_ = 0;
                 // 检测有效：若正在 SEARCHING，切换到拦截
-                if (state_ == VpngState::SEARCHING) {
+                if (state_ == VpngState::SEARCHING && detect_w_ > 0 && detect_h_ > 0 &&
+                    (!require_experiment_start_ || experiment_start_) &&
+                    (!precise_standby_ || takeoff_ready())) {
                     RCLCPP_INFO(get_logger(), "→ 视觉检测到目标，进入 INTERCEPT");
                     state_ = VpngState::INTERCEPT;
                 }
@@ -140,6 +161,8 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
             vy_ = msg->vy;
             vz_ = msg->vz;
             local_z_ = msg->z;
+            local_position_received_ = msg->z_valid &&
+                (takeoff_speed_tolerance_ == 0.0 || (msg->v_xy_valid && msg->v_z_valid));
         });
 
     // 飞行状态（判断 Offboard）
@@ -219,7 +242,10 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
         if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
             yaml << std::quoted(parameter.as_string());
         } else if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
-            yaml << parameter.as_double();
+            const double value = parameter.as_double();
+            if (std::isnan(value)) yaml << ".nan";
+            else if (std::isinf(value)) yaml << (value > 0.0 ? ".inf" : "-.inf");
+            else yaml << value;
         } else {
             yaml << parameter.value_to_string();
         }
@@ -392,6 +418,23 @@ void VisionPNG::png_calculate()
 //  状态机：TAKE_OFF
 //  位置控制爬升到 standby_altitude_，等待悬停推力收敛
 // ============================================================
+bool VisionPNG::takeoff_ready()
+{
+    const double now = get_clock()->now().seconds();
+    const double speed = std::sqrt(vx_ * vx_ + vy_ * vy_ + vz_ * vz_);
+    const bool ready = local_position_received_ && hover_thrust_ok_ &&
+        std::isfinite(local_z_) &&
+        std::abs(local_z_ - standby_altitude_) < takeoff_altitude_tolerance_ &&
+        (takeoff_speed_tolerance_ == 0.0 ||
+         (std::isfinite(speed) && speed <= takeoff_speed_tolerance_));
+    if (!ready) {
+        settled_since_ = -1.0;
+        return false;
+    }
+    if (settled_since_ < 0.0 || now < settled_since_) settled_since_ = now;
+    return now - settled_since_ >= takeoff_settle_time_;
+}
+
 void VisionPNG::handle_takeoff()
 {
     // 持续发送 arm + offboard 心跳
@@ -405,9 +448,8 @@ void VisionPNG::handle_takeoff()
         return;
     }
 
-    // 高度到位且悬停推力已收敛
-    float alt_err = std::abs(local_z_ - (float)standby_altitude_);
-    if (hover_thrust_ok_ && alt_err < 0.5f) {
+    // Require continuous altitude/speed settling before entering SEARCHING.
+    if (takeoff_ready()) {
         RCLCPP_INFO(get_logger(),
             "→ 起飞完成 z=%.2f hover_thrust=%.3f，进入 SEARCHING",
             local_z_, hover_thrust_);
@@ -426,14 +468,23 @@ void VisionPNG::handle_takeoff()
 // ============================================================
 void VisionPNG::handle_searching()
 {
-    // 悬停等待目标出现
-    publish_offboard_velocity_mode();
-    publish_velocity_setpoint(0.0f, 0.0f, 0.0f, 0.0f);
+    // Experimental waiting uses position hold, including ongoing altitude correction.
+    if (precise_standby_) {
+        publish_offboard_position_mode();
+        publish_position_setpoint(0.0f, 0.0f, static_cast<float>(standby_altitude_));
+    } else {
+        publish_offboard_velocity_mode();
+        publish_velocity_setpoint(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (precise_standby_ && takeoff_ready() &&
+        (!require_experiment_start_ || experiment_start_) && detect_w_ > 0 && detect_h_ > 0) {
+        state_ = VpngState::INTERCEPT;
+    }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "[SEARCHING] 等待视觉检测目标... detect_w=%d", detect_w_);
 
-    // 目标检测到：由 detect_sub_ 回调切换到 INTERCEPT
+    // The release may arrive after the latest detection; check both each control tick.
 }
 
 // ============================================================
@@ -608,7 +659,7 @@ void VisionPNG::publish_position_setpoint(float x, float y, float z)
 {
     TrajectorySetpoint msg{};
     msg.position  = {x, y, z};
-    msg.yaw       = (float)yaw_;
+    msg.yaw       = static_cast<float>(std::isfinite(standby_yaw_) ? standby_yaw_ : yaw_);
     msg.timestamp = get_clock()->now().nanoseconds() / 1000;
     traj_pub_->publish(msg);
 }
