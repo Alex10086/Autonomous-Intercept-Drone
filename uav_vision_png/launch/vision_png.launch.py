@@ -25,9 +25,12 @@ def generate_launch_description():
         'speed_cmd', default_value='5.0',
         description='期望冲击速度上限 (m/s)')
 
-    declare_N = DeclareLaunchArgument(
-        'N_png', default_value='4.0',
-        description='比例导引系数（导航增益）')
+    declare_kv = DeclareLaunchArgument(
+        'kv', default_value='4.0',
+        description='垂直 LOS 角增量增益')
+    declare_kz = DeclareLaunchArgument(
+        'kz', default_value='4.0',
+        description='水平 LOS 角增量增益')
 
 
     vision_png_node = Node(
@@ -40,7 +43,8 @@ def generate_launch_description():
             {
                 # 命令行参数可覆盖 yaml 中同名参数
                 'speed_cmd': LaunchConfiguration('speed_cmd'),
-                'N_png':     LaunchConfiguration('N_png'),
+                'kv':        LaunchConfiguration('kv'),
+                'kz':        LaunchConfiguration('kz'),
             }
         ],
         # 打印节点完整输出（方便调试）
@@ -49,6 +53,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         declare_speed,
-        declare_N,
+        declare_kv,
+        declare_kz,
         vision_png_node,
     ])

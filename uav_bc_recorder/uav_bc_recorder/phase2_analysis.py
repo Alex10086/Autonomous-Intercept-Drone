@@ -138,7 +138,8 @@ def analyze_recording(recording, output):
            and abs(initial.get('height_difference',math.inf)-requested.get('requested_height_difference',0.3))<=requested.get('height_tolerance',0.18))
     result={
         'recording':str(recording),'algorithm':meta['algorithm'],'group':requested.get('group'),
-        'trial':requested.get('trial'),'valid':valid,'initial_distance':initial.get('distance'),
+        'trial':requested.get('trial'),'vision_mode':requested.get('vision_mode'),'valid':valid,
+        'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),
         'initial_self_velocity':initial.get('self_velocity_ned'),
         'initial_target_velocity':initial.get('target_velocity_ned'),

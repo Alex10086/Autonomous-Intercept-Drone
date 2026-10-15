@@ -169,6 +169,9 @@ void UavTargetControl::update_stability()
         stable_since_ = now;
     }
     stable_ = std::chrono::duration<double>(now - *stable_since_).count() >= stability_duration_;
+    if (stable_) {
+        ready_latched_ = true;
+    }
 }
 
 void UavTargetControl::local_position_callback(const VehicleLocalPosition::SharedPtr msg)
@@ -200,9 +203,10 @@ void UavTargetControl::target_start_callback(const std_msgs::msg::Float64::Share
         return;  // Accepted schedules are immutable, including repeated commands.
     }
     update_stability();
-    if (!stable_ || !std::isfinite(msg->data) ||
+    if (!ready_latched_ || !std::isfinite(msg->data) ||
         msg->data <= this->get_clock()->now().seconds()) {
-        RCLCPP_WARN(this->get_logger(), "Ignoring target start: requires stable hover and future epoch");
+        RCLCPP_WARN(this->get_logger(),
+            "Ignoring target start: requires latched ready state and future epoch");
         return;
     }
     motion_start_ros_time_ = msg->data;
@@ -222,7 +226,7 @@ const char *UavTargetControl::motion_mode_name() const
 void UavTargetControl::publish_experiment_state()
 {
     const char *state = motion_started_ ? "MOVING" :
-        motion_start_ros_time_ ? "WAITING_START" : stable_ ? "READY" : "TAKEOFF";
+        motion_start_ros_time_ ? "WAITING_START" : ready_latched_ ? "READY" : "TAKEOFF";
     std::ostringstream json;
     json.imbue(std::locale::classic());
     json << std::setprecision(17);
@@ -236,6 +240,7 @@ void UavTargetControl::publish_experiment_state()
     json << "{\"timestamp\":";
     number(this->get_clock()->now().seconds());
     json << ",\"state\":\"" << state << "\",\"stable\":" << (stable_ ? "true" : "false")
+         << ",\"ready_latched\":" << (ready_latched_ ? "true" : "false")
          << ",\"motion_mode\":\"" << motion_mode_name() << "\",\"circle_radius\":";
     number(radius_);
     json << ",\"circle_angular_velocity\":";

@@ -31,6 +31,11 @@ find_package(GeographicLib REQUIRED)
 # find_package(<dependency> REQUIRED)
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(schedule_latch test/test_schedule_latch.py
+    TIMEOUT 30
+    ENV "TARGET_SIM_EXECUTABLE=$<TARGET_FILE:uav_target_sim>"
+  )
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # uncomment the line when a copyright and license is not present in all source files

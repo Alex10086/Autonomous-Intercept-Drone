@@ -38,9 +38,12 @@ def flight(tmp_path, request):
     ]
     executable = os.environ.get('VISION_PNG_EXECUTABLE') or str(
         Path(get_package_prefix('uav_vision_png')) / 'lib/uav_vision_png/uav_vision_png')
-    freshness_timeout = getattr(request, 'param', 0.25)
+    config = request.param if isinstance(getattr(request, 'param', None), dict) else {}
+    freshness_timeout = config.get('freshness_timeout', getattr(request, 'param', 0.25))
+    guidance_source = config.get('guidance_source', 'vision')
     command = [executable, '--ros-args', '-p', f'freshness_timeout:={freshness_timeout}',
-               '-p', 'track_lost_timeout:=1.0']
+               '-p', 'track_lost_timeout:=1.0',
+               '-p', f'guidance_source:={guidance_source}']
     for topic in topics:
         command += ['-r', f'{topic}:={prefix}{topic}']
     messages = {'data': [], 'telemetry': [], 'command': []}
@@ -207,3 +210,24 @@ def test_loss_coast_recovery_and_hit_evaluation(flight, invalid_stream):
     pump(0.04, lambda: publishers['target_gps'].publish(gps))
     wait(lambda: state('DONE'))
     assert tuple(messages['command'][-1].velocity) == pytest.approx((0.0, 0.0, 0.0))
+
+
+@pytest.mark.parametrize(
+    'flight', [{'freshness_timeout': 0.25, 'guidance_source': 'truth_los'}],
+    indirect=True)
+def test_truth_los_uses_geometry_without_detection_messages(flight):
+    messages, publishers, _, _, _, wait, state, _ = flight
+    own = SensorGps()
+    own.latitude_deg, own.longitude_deg, own.altitude_msl_m = 47.0, 8.0, 500.0
+    target = SensorGps()
+    target.latitude_deg = own.latitude_deg + 0.0001
+    target.longitude_deg, target.altitude_msl_m = own.longitude_deg, own.altitude_msl_m
+
+    def geometry():
+        publishers['self_gps'].publish(own)
+        publishers['target_gps'].publish(target)
+
+    wait(lambda: state('INTERCEPT') and messages['telemetry'][-1].guidance_valid
+         and bool(messages['data']), timeout=4.0, action=geometry)
+    assert messages['data'][-1].los_angle_z == pytest.approx(math.pi / 2.0, abs=2e-3)
+    assert messages['data'][-1].ex == pytest.approx(0.0, abs=2.0)

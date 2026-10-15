@@ -208,6 +208,9 @@ Loss limits are now seconds: `freshness_timeout: 0.15` and `track_lost_timeout: 
 
 Receipt-time snapshots are not capture-time attitude interpolation, and receipt age does not measure actual inference latency. `uav_vision_png/test/test_visual_freshness.py` launches the real node on isolated topics to cover stale boxes with changing attitude, new frames with equal coordinates, brief no-target gaps preserving history, silent/no-target expiry, recovery, and hits during COAST. These node regressions alone do not establish interception success rates.
 
+The combined frontend periodically reruns YOLO every five tracker frames and reinitializes LightTrack on a valid detection. LightTrack now uses its adaptive `penalty × score × lr` value in both size-update terms; the former raw flattened-argmax jump gate was removed because it rejected high-score, in-frame motion. `[VISION_DIAG]` logs distinguish YOLO no-candidate/acquisition and LightTrack out-of-image loss, with per-process counters.
+
+
 Use ONNX Runtime C++ GPU SDK 1.23.2 with Blackwell-capable CUDA 12.8 and cuDNN 9 runtime libraries. A full CUDA Toolkit, PyTorch, and TensorRT are not required. The SDK may reside at `~/.local/opt/intercept/onnxruntime`; keep CUDA/cuDNN libraries in an isolated user-local environment instead of changing system Python. See the [ONNX CUDA dependency documentation](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
 
 ```bash
@@ -264,7 +267,7 @@ ros2 run uav_bc_recorder experiment_recorder --ros-args \
   -p start_timeout:=60.0 -p max_duration:=120.0
 ```
 
-`target_motion` labels the experiment; it must match the target node's actual `motion_mode` and does not command target motion. Metadata gets actual `N_png`, `speed_cmd`, `hit_radius`, planner/controller, and the complete parameter mapping from guidance telemetry, not independent recorder defaults. Vision PNG currently uses `kv`/`kz` for its angle update; these are recorded alongside `N_png`, which alone does not identify the effective gain. Control parameters are read at startup; restart guidance when changing them.
+`target_motion` labels the experiment; it must match the target node's actual `motion_mode` and does not command target motion. Metadata gets actual `speed_cmd`, `hit_radius`, planner/controller, and the complete parameter mapping from guidance telemetry, not independent recorder defaults. Vision PNG uses `kv`/`kz` for its vertical/horizontal angle updates; the unused `N_png` parameter was removed from Vision PNG. `config/params.yaml`, launch arguments, C++ fallbacks, and the phase-two runner now use the same defaults. Control parameters are read at startup; restart guidance when changing them.
 
 Installed profiles can be loaded with subsequent `-p` overrides:
 
@@ -320,13 +323,28 @@ ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
   --groups near far --trials 3 --duration 60.0
 ```
 
-Each trial starts fresh real dual SITL, actual CUDA detection, target/guidance nodes, and compare recording. The supervisor never injects detections or PX4 velocity setpoints. The target first stabilizes at its initial circle point, both vehicles settle, and target motion accepts a future ROS epoch. Takeover uses a fixed motion age/phase and explicit external release, with unchanged PNG gains.
+Each trial starts fresh real dual SITL, actual CUDA detection, target/guidance nodes, and compare recording. The supervisor never injects detections or PX4 velocity setpoints. Once the target has satisfied continuous hover stability, READY is latched; the existing `Float64` future epoch is then accepted despite a transient threshold excursion and `motion_start_ros_time` remains the simple acceptance receipt. Takeover uses a fixed motion age/phase and explicit external release.
 
 Defaults: circle radius 5 m, initial phase 0, signed angular velocity +0.5 rad/s; release is scheduled one orbit plus commanded phase 4.4 rad after motion starts. Requested near/far distances are approximately 16.8/24 m, with target 0.3 m below self. Commanded versus measured phase are distinct metadata. Readiness, distance, height, detection, or release-time violations stop and preserve an invalid trial instead of silently counting it. Simulation spawn poses use `PX4_SELF_POSE` / `PX4_TARGET_POSE`.
 
 The `phase2_fixed_circle_v2` entry protocol captures each vehicle's disarmed ground local z before starting controllers. It waits at most 30 seconds for approximately 2 seconds with a range no greater than 0.05 m, then uses the median as `self_ground_z`/`target_ground_z`. Defaults are `self_target_z = self_ground_z - 5.3` and `target_target_z = target_ground_z - 5.0`. Controllers receive these compensated targets; the runner checks self readiness against the same `self_target_z`. `--self-altitude` now means negative NED displacement above the vehicle's own ground datum, not absolute local z. All four values and capture ranges enter protocol/recorder experiment conditions. Relative height is still accepted using GPS geometry, never by subtracting independently referenced local z values.
 
 Detector readiness requires the last valid receipt age to be `<0.15 s` and at least three valid detections within the last `<0.3 s`. Invalid messages neither refresh valid time nor clear the window; old timestamps expire naturally.
+
+Diagnostic A/B modes do not count as formal hit-rate trials:
+
+```bash
+# SITL GPS geometry LOS drives the unchanged Vision PNG law.
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --vision-mode truth_los --groups near far --trials 1
+
+# Run every frame through YOLO, without LightTrack.
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --vision-mode yolo_only --groups near far --trials 1
+```
+
+`truth_los` bypasses detector readiness and is explicitly marked `diagnostic_truth_los`. `yolo_only` is also diagnostic and bypasses the combined-mode entry window without changing YOLO confidence or fabricating boxes. `--diagnostic-bypass-detector-entry` provides the same explicit bypass for combined frontend diagnosis; it records a diagnostic mode and permits up to 0.8 s entry delay. Formal combined trials retain the three-valid-in-300-ms gate and 0.3 s entry-delay limit.
+
 
 For entry-only smoke verification, without an interception success-rate experiment:
 

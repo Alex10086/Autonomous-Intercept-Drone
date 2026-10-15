@@ -190,21 +190,6 @@ void LightTrack::init(const uint8_t *img, Bbox &box, int im_h , int im_w) {
 }
 
 
-
-static int last_cls_score_positon = 170;
-bool LightTrack::target_pos_change(void)
-{
-    bool IsChangeFlag = 0;
-    if(abs(this->cls_score_position - last_cls_score_positon ) <= 25){
-        IsChangeFlag = 0;
-        last_cls_score_positon = this->cls_score_position;
-    } else{
-        IsChangeFlag = 1;
-        last_cls_score_positon = 170;
-    }
-    return IsChangeFlag;
-}
-
 void LightTrack::update(const cv::Mat &x_crops, float scale_z) {
     // Preprocess search image
     std::vector<float> search_data = preprocess(x_crops);
@@ -306,8 +291,8 @@ void LightTrack::update(const cv::Mat &x_crops, float scale_z) {
 
     float res_xs = float(target_pos.x + diff_xs);
     float res_ys = float(target_pos.y + diff_ys);
-    float res_w = pred_w * lr + (1 - lr_) * target_sz.x;
-    float res_h = pred_h * lr + (1 - lr_) * target_sz.y;
+    float res_w = pred_w * lr_ + (1 - lr_) * target_sz.x;
+    float res_h = pred_h * lr_ + (1 - lr_) * target_sz.y;
 
     target_pos.x = int(res_xs);
     target_pos.y = int(res_ys);

@@ -28,6 +28,18 @@ def detection(valid=True):
     return message
 
 
+def test_ros_command_loads_shared_params_before_explicit_overrides():
+    command = runner.ros_command(
+        'pkg', 'node', {'kv': 4.0, 'enabled': True},
+        parameter_files=('/tmp/shared.yaml',))
+    assert command == [
+        'ros2', 'run', 'pkg', 'node', '--ros-args',
+        '--params-file', '/tmp/shared.yaml',
+        '-p', 'kv:=4.0',
+        '-p', 'enabled:=true',
+    ]
+
+
 def test_brief_invalid_retains_recent_valid_history_but_does_not_refresh_age(monitor):
     node, clock = monitor
     for timestamp in (100.0, 100.1, 100.2):

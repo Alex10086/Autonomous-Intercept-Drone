@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 #include <memory>
 #include <opencv2/core/mat.hpp>
@@ -24,8 +25,17 @@ private:
     bool enable_tracking_ = true;
     bool show_debug_window_ = true;
     bool tracking_ = false;
+    int yolo_refresh_interval_ = 5;
+    int tracker_frames_since_yolo_ = 0;
     cv::Size tracked_image_size_;
+    std::uint64_t frame_count_ = 0;
+    std::uint64_t yolo_frame_count_ = 0;
+    std::uint64_t acquisition_count_ = 0;
+    std::uint64_t tracker_frame_count_ = 0;
+    std::uint64_t tracker_loss_count_ = 0;
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg);
+    void track_frame(cv::Mat& frame, cv::Rect& result_rect, float& result_confidence,
+                     std::string& status_text, cv::Scalar& color);
     void cxy_wh_2_rect(const cv::Point& pos, const cv::Point2f& sz, cv::Rect& rect);
 };

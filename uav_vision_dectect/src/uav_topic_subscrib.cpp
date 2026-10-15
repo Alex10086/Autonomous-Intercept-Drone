@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
@@ -17,6 +18,10 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     config.useCuda = declare_parameter<bool>("use_cuda", true);
     enable_tracking_ = declare_parameter<bool>("enable_tracking", true);
     show_debug_window_ = declare_parameter<bool>("show_debug_window", true);
+    yolo_refresh_interval_ = declare_parameter<int>("yolo_refresh_interval", 5);
+    if (yolo_refresh_interval_ < 0) {
+        throw std::invalid_argument("yolo_refresh_interval must be nonnegative");
+    }
     // Apply one confidence threshold from YOLO post-processing through acquisition.
     config.confThreshold = static_cast<float>(
         declare_parameter<double>("confidence_threshold", 0.4));
@@ -27,8 +32,9 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     if (enable_tracking_) {
         siam_tracker = std::make_unique<LightTrack>(init_model.c_str(), update_model.c_str(), config.useCuda);
     }
-    RCLCPP_INFO(get_logger(), "Vision sessions initialized; confidence threshold >= %.3f",
-                config.confThreshold);
+    RCLCPP_INFO(get_logger(),
+                "Vision sessions initialized; confidence threshold >= %.3f, YOLO refresh=%d frames",
+                config.confThreshold, yolo_refresh_interval_);
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
     // Keep only the most recent camera frame while inference is busy. Sensor QoS
@@ -46,6 +52,14 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
 
 UavTopicSubscrib::~UavTopicSubscrib()
 {
+    RCLCPP_INFO(get_logger(),
+        "[VISION_DIAG] summary frames=%llu yolo_frames=%llu acquisitions=%llu "
+        "tracker_frames=%llu tracker_losses=%llu",
+        static_cast<unsigned long long>(frame_count_),
+        static_cast<unsigned long long>(yolo_frame_count_),
+        static_cast<unsigned long long>(acquisition_count_),
+        static_cast<unsigned long long>(tracker_frame_count_),
+        static_cast<unsigned long long>(tracker_loss_count_));
     if (show_debug_window_) {
         cv::destroyWindow("Result");
     }
@@ -53,6 +67,7 @@ UavTopicSubscrib::~UavTopicSubscrib()
 
 void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
+    ++frame_count_;
     cv_bridge::CvImagePtr cv_ptr;
     try {
         cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
@@ -74,8 +89,13 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     std::string status_text;
     cv::Scalar color(0, 255, 0);
     const double start = cv::getTickCount();
-    const bool need_detection = !enable_tracking_ || !tracking_;
+    const bool refresh_yolo = enable_tracking_ && tracking_ &&
+        yolo_refresh_interval_ > 0 &&
+        tracker_frames_since_yolo_ >= yolo_refresh_interval_;
+    const bool need_detection = !enable_tracking_ || !tracking_ || refresh_yolo;
+    bool acquired = false;
     if (need_detection) {
+        ++yolo_frame_count_;
         const auto results = yolo_detector_->detect(frame);
         const Detection* best = nullptr;
         for (const auto& det : results) {
@@ -83,9 +103,27 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 best = &det;
             }
         }
-        if (best) {
+        if (!best) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                "[VISION_DIAG] source=YOLO outcome=no_candidate frame=%llu "
+                "refresh=%s yolo_frames=%llu acquisitions=%llu",
+                static_cast<unsigned long long>(frame_count_),
+                refresh_yolo ? "true" : "false",
+                static_cast<unsigned long long>(yolo_frame_count_),
+                static_cast<unsigned long long>(acquisition_count_));
+        } else {
             const cv::Rect safe_rect = best->box & cv::Rect(0, 0, frame.cols, frame.rows);
             if (safe_rect.width > 0 && safe_rect.height > 0 && safe_rect.area() >= 10) {
+                ++acquisition_count_;
+                acquired = true;
+                tracker_frames_since_yolo_ = 0;
+                RCLCPP_INFO(get_logger(),
+                    "[VISION_DIAG] source=YOLO outcome=acquired frame=%llu refresh=%s "
+                    "candidates=%zu confidence=%.4f bbox=%d,%d,%d,%d acquisition=%llu",
+                    static_cast<unsigned long long>(frame_count_),
+                    refresh_yolo ? "true" : "false", results.size(), best->conf,
+                    safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
+                    static_cast<unsigned long long>(acquisition_count_));
                 if (enable_tracking_) {
                     Bbox box{static_cast<float>(safe_rect.x), static_cast<float>(safe_rect.y),
                              static_cast<float>(safe_rect.x + safe_rect.width),
@@ -101,21 +139,20 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 }
                 result_rect = safe_rect;
                 result_confidence = best->conf;
+            } else {
+                RCLCPP_WARN(get_logger(),
+                    "[VISION_DIAG] source=YOLO outcome=rejected_box frame=%llu "
+                    "confidence=%.4f raw_bbox=%d,%d,%d,%d clipped_bbox=%d,%d,%d,%d",
+                    static_cast<unsigned long long>(frame_count_), best->conf,
+                    best->box.x, best->box.y, best->box.width, best->box.height,
+                    safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height);
             }
         }
-    } else {
-        siam_tracker->track(frame.data);
-        cv::Rect rect;
-        cxy_wh_2_rect(siam_tracker->target_pos, siam_tracker->target_sz, rect);
-        const cv::Rect safe_rect = rect & cv::Rect(0, 0, frame.cols, frame.rows);
-        if (safe_rect.area() > 0 && !siam_tracker->target_pos_change()) {
-            result_rect = safe_rect;
-            result_confidence = siam_tracker->track_score;
-            status_text = "Tracking";
-        } else {
-            tracking_ = false;
-            status_text = "Track Lost";
+        if (refresh_yolo && !acquired) {
+            track_frame(frame, result_rect, result_confidence, status_text, color);
         }
+    } else {
+        track_frame(frame, result_rect, result_confidence, status_text, color);
     }
 
     // Publish only inference-backed results, using the camera capture stamp and
@@ -143,6 +180,41 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
         cv::imshow("Result", frame);
         cv::waitKey(1);
     }
+}
+
+void UavTopicSubscrib::track_frame(
+    cv::Mat& frame, cv::Rect& result_rect, float& result_confidence,
+    std::string& status_text, cv::Scalar& color)
+{
+    ++tracker_frame_count_;
+    ++tracker_frames_since_yolo_;
+    siam_tracker->track(frame.data);
+    cv::Rect rect;
+    cxy_wh_2_rect(siam_tracker->target_pos, siam_tracker->target_sz, rect);
+    const cv::Rect safe_rect = rect & cv::Rect(0, 0, frame.cols, frame.rows);
+    if (safe_rect.area() > 0) {
+        result_rect = safe_rect;
+        result_confidence = siam_tracker->track_score;
+        status_text = "Tracking";
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+            "[VISION_DIAG] source=LightTrack outcome=tracking frame=%llu "
+            "score=%.4f bbox=%d,%d,%d,%d raw_argmax=%d",
+            static_cast<unsigned long long>(frame_count_), siam_tracker->track_score,
+            safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
+            siam_tracker->cls_score_position);
+        return;
+    }
+    ++tracker_loss_count_;
+    RCLCPP_WARN(get_logger(),
+        "[VISION_DIAG] source=LightTrack outcome=lost frame=%llu "
+        "reason=bbox_outside_image score=%.4f raw_bbox=%d,%d,%d,%d "
+        "raw_argmax=%d loss=%llu",
+        static_cast<unsigned long long>(frame_count_), siam_tracker->track_score,
+        rect.x, rect.y, rect.width, rect.height, siam_tracker->cls_score_position,
+        static_cast<unsigned long long>(tracker_loss_count_));
+    tracking_ = false;
+    status_text = "Track Lost";
+    color = cv::Scalar(0, 255, 255);
 }
 
 void UavTopicSubscrib::cxy_wh_2_rect(const cv::Point& pos, const cv::Point2f& sz, cv::Rect& rect)

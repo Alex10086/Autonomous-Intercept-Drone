@@ -212,6 +212,9 @@ Vision PNG 只在新的有效检测回调中，用该回调接收时的姿态快
 
 此版本没有实现拍摄时刻姿态插值，也不能用接收年龄判断图像的真实推理延迟。`uav_vision_png/test/test_visual_freshness.py` 使用隔离话题启动真实节点，覆盖旧框＋新姿态、相同坐标新帧、短暂无目标不重置历史、静默／无目标超时、恢复和 COAST 命中；节点回归本身不证明实际拦截命中率。
 
+组合前端现在每 5 个跟踪帧重新运行一次 YOLO，并在获得有效框时重新初始化 LightTrack。LightTrack 的尺寸更新两个分量都使用 `penalty × score × lr` 自适应学习率；原来比较 18×18 raw score 展平 argmax 跳变的门限会拒绝高分且仍在画面内的正常运动，现已删除。`[VISION_DIAG]` 日志区分 YOLO 无候选／获取和 LightTrack 出画失效，并在退出时汇总计数。
+
+
 使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
 
 ```bash
@@ -268,7 +271,7 @@ ros2 run uav_bc_recorder experiment_recorder --ros-args \
   -p start_timeout:=60.0 -p max_duration:=120.0
 ```
 
-`target_motion` 是实验标签，必须与目标机实际的 `motion_mode` 一致，不会由记录器改变目标运动。`N_png`、`speed_cmd`、`hit_radius` 等由制导遥测带入元数据，不在记录器里另设一套默认值；完整参数保存在 `parameters` 下。Vision PNG 的角度更新目前实际使用 `kv` / `kz`，它们会与 `N_png` 一并记录，不能仅凭 `N_png` 标签推断有效增益。控制参数在节点启动时读取，改变配置应重启制导节点。
+`target_motion` 是实验标签，必须与目标机实际的 `motion_mode` 一致，不会由记录器改变目标运动。`speed_cmd`、`hit_radius` 等由制导遥测带入元数据，不在记录器里另设一套默认值；完整参数保存在 `parameters` 下。Vision PNG 的垂直／水平角度更新使用 `kv` / `kz`，未参与计算的 `N_png` 已从 Vision PNG 删除。`config/params.yaml`、launch 参数、C++ 回退值和 phase2 runner 现在使用同一组默认值。控制参数在节点启动时读取，改变配置应重启制导节点。
 
 也可加载安装好的分档配置，之后的 `-p` 覆盖该配置：
 
@@ -337,13 +340,28 @@ ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
   --groups near far --trials 3 --duration 60.0
 ```
 
-每轮新建真实双机 SITL，并启动真实 CUDA 检测、目标控制、制导和 compare 记录；不会注入虚假检测或代发 PX4 速度指令。目标先在初始圆周点起飞稳定，双方达到位置/速度稳定条件后，再接受未来 ROS epoch 的圆周启动指令；接管使用固定运动年龄、circle 相位和外部放行条件。PNG 增益保持默认不变。
+每轮新建真实双机 SITL，并启动真实 CUDA 检测、目标控制、制导和 compare 记录；不会注入虚假检测或代发 PX4 速度指令。目标连续满足悬停稳定条件后锁存 READY；随后仍通过原有 `Float64` 未来 epoch 启动，短暂越过稳定阈值不会撤销 READY，`motion_start_ros_time` 继续作为简单接收回执。接管仍使用固定运动年龄、circle 相位和外部放行条件。
 
 默认 circle 半径 5 m、初始相位 0、角速度 +0.5 rad/s；目标启动后一整圈再到指令相位 4.4 rad 时安排接管。默认请求距离为 near 约 16.8 m、far 约 24 m，高度差约 0.3 m。指令相位与目标实际运动相位分别保存；实际距离、高度、检测或入场时序不满足协议会中止并保留无效试验，不冒充有效样本。`run_swarm.sh` 可通过 `PX4_SELF_POSE` / `PX4_TARGET_POSE` 配置仿真初始位置。
 
 入口协议 `phase2_fixed_circle_v2` 在任何控制节点启动前，分别采集两机未解锁时的地面 local z；要求连续约 2 秒波动不超过 0.05 m，最多等待 30 秒，再取中位数作为 `self_ground_z`／`target_ground_z`。默认生成 `self_target_z = self_ground_z - 5.3`、`target_target_z = target_ground_z - 5.0`，将补偿后的值传给控制节点，并让 runner 的 self ready 检查使用同一个 `self_target_z`。`--self-altitude` 现在表示相对本机地面的负 NED 位移，不是绝对 local z。四个高度值及采样范围会进入 `protocol.json` 和 recorder 的实验条件；真实相对高度仍由 GPS geometry 验收，不相减两机 local z。
 
 检测就绪条件为最后有效检测接收年龄 `<0.15 s`，且最近 `<0.3 s` 内至少收到 3 次有效检测。invalid 不刷新有效时间、不清空窗口；旧时间戳会自然过期。
+
+以下 A/B 仅用于定位，不计入正式命中率：
+
+```bash
+# 用 SITL GPS geometry LOS 驱动不变的 Vision PNG 控制律。
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --vision-mode truth_los --groups near far --trials 1
+
+# 每帧只运行 YOLO，不进入 LightTrack。
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --vision-mode yolo_only --groups near far --trials 1
+```
+
+`truth_los` 跳过检测入口门槛并标记为 `diagnostic_truth_los`；`yolo_only` 同样是诊断模式，不改变 YOLO 置信度、不伪造框。组合前端诊断可显式追加 `--diagnostic-bypass-detector-entry`，记录为诊断模式并允许最多 0.8 s 接管延迟。正式 combined 试验仍保留 300 ms 内三次有效检测和 0.3 s 接管延迟门槛。
+
 
 只验证入口、暂不做命中率实验时：
 

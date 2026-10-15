@@ -5,7 +5,7 @@
  * 基于视觉的比例导引（Vision-based Proportional Navigation Guidance）
  *
  * ┌─────────────────────────────────────────────────────────────────────┐
- * │  导引算法（纯视觉，不读目标位置）                                      │
+ * │  Production guidance is visual; truth_los is an explicit SITL diagnostic. │
  * │    输入：/camera_detect_result  (uav_common_msg/RectMsg)             │
  * │          /px4_1/fmu/out/vehicle_odometry   (自身姿态)                │
  * │          /px4_1/fmu/out/vehicle_local_position (自身速度/位置)        │
@@ -26,17 +26,18 @@
  *        LOS_ned = R_b2n * R_c2b * LOS_cam
  *        LOS_angle_v = atan2(LOS_ned_z, sqrt(x²+y²))
  *        LOS_angle_z = atan2(LOS_ned_x, LOS_ned_y)
- *   2. 比例导引（PNG）：
+ *   2. 离散 LOS 增量导引：
  *        dσ_v = LOS_angle_v - last_LOS_angle_v
  *        dσ_z = LOS_angle_z - last_LOS_angle_z
- *        θ_v_cmd = N * dσ_v + last_θ_v
- *        θ_z_cmd = N * dσ_z + last_θ_z
+ *        θ_v_cmd = kv * dσ_v + last_θ_v
+ *        θ_z_cmd = kz * dσ_z + last_θ_z
  *   3. 期望速度：
  *        vx = cos(θ_v_cmd)*sin(θ_z_cmd) * speed   (NED North)
  *        vy = cos(θ_v_cmd)*cos(θ_z_cmd) * speed   (NED East)
  *        vz = sin(θ_v_cmd) * speed                 (NED Down)
  */
 
+#include <cstdint>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Dense>
 #include <uav_common_msg/msg/experiment_telemetry.hpp>
@@ -105,6 +106,7 @@ private:
     void control_loop();          ///< 200 Hz 姿态/发布循环
     void detection_callback(const RectMsg &msg);
     void png_calculate(double roll, double pitch, double yaw);
+    void update_truth_guidance();
     double observation_age() const;
     void update_visual_state();
 
@@ -165,10 +167,10 @@ private:
     rclcpp::Subscription<HoverThrustEstimate>::SharedPtr hover_sub_;        ///< 悬停推力估计
 
     // ----------------------------------------------------------
-    //  订阅者 —— 纯统计用（导引算法禁止使用这些数据）
+    //  GPS geometry: hit evaluation, and truth_los diagnostic mode only
     // ----------------------------------------------------------
-    rclcpp::Subscription<SensorGps>::SharedPtr self_gps_sub_;    ///< 自身 GPS（统计坐标建立）
-    rclcpp::Subscription<SensorGps>::SharedPtr target_gps_sub_;  ///< 目标 GPS（仅统计）
+    rclcpp::Subscription<SensorGps>::SharedPtr self_gps_sub_;
+    rclcpp::Subscription<SensorGps>::SharedPtr target_gps_sub_;
 
     // ===========================================================
     //  ██  导引相关成员变量  ██
@@ -194,6 +196,11 @@ private:
     std::chrono::steady_clock::time_point last_visual_observation_{};
     double freshness_timeout_ = 0.15;   ///< 秒，超过后 COAST
     double track_lost_timeout_ = 0.6;   ///< 秒，从最后有效观测起算
+    std::string guidance_source_ = "vision";
+    std::chrono::steady_clock::time_point last_self_gps_observation_{};
+    std::chrono::steady_clock::time_point last_target_gps_observation_{};
+    std::uint64_t truth_generation_ = 0;
+    std::uint64_t processed_truth_generation_ = 0;
 
     // ---- 自身状态（导引使用）----
     double roll_  = 0.0;
@@ -226,7 +233,6 @@ private:
     double ey_ = 0.0;  ///< 像素误差 y
 
     // PNG 参数
-    double N_png_    = 4.0;   ///< 比例导引系数（导航增益）
     double speed_cmd_ = 5.0; ///< 期望冲击速度（m/s）
     double d_gain_   = 2.0;   ///< 速度增量增益（与 los_control 一致）
     double kv_       = 4.0;   ///< 俯仰 PNG 增益（与 los_control kv 对应）
@@ -241,11 +247,9 @@ private:
     double d_yaw_   = 0.0;      ///< 当前偏航角速率指令（rad/s）
     double last_ex_ = 0.0;
 
-    // 垂直视场补偿增益：抵消前飞低头导致相机下倾
-    // ey<0 目标在画面上方（图像坐标 y 向下）→ vz_ey=k_ey*ey<0 → vz_cmd 减小 → UAV 上升
-    // 图像高 1080px，最大误差 540px，期望最大补偿 3 m/s
-    // k_ey = 3.0 / 540 ≈ 0.0056 m/s per pixel
-    double k_ey_    = 0.0056;   ///< ey→vz 垂直补偿增益（m/s per pixel）
+    // Vertical FOV correction keeps the target visible during forward pitch.
+    // ey<0: target above image center -> climb; ey>0: target below -> descend.
+    double k_ey_ = 0.0056;   ///< ey→vz vertical compensation (m/s per pixel)
 
     // 惯性续飞缓存（目标丢失时保持上一帧速度指令继续飞行）
     float coast_vx_ = 0.0f;  ///< 惯性续飞 vx 缓存
@@ -273,14 +277,13 @@ private:
 
 
     // ===========================================================
-    //  ██  GPS 命中评估成员变量（不参与视觉导引）██
+    //  ██  GPS geometry: evaluation and explicit diagnostic source ██
     // ===========================================================
-    // 坐标系（以 px4_1 首次 GPS 为原点）
     GeographicLib::LocalCartesian lc_stats_;
     bool lc_stats_init_ = false;
 
-    Eigen::Vector3f self_pos_stats_   = {0, 0, 0};  ///< 自身位置（NED，统计用）
-    Eigen::Vector3f target_pos_stats_ = {0, 0, 0};  ///< 目标位置（NED，统计用，导引禁用）
+    Eigen::Vector3f self_pos_stats_   = {0, 0, 0};
+    Eigen::Vector3f target_pos_stats_ = {0, 0, 0};
     bool target_pos_ok_ = false;
 
     // 命中判定半径（统计用）

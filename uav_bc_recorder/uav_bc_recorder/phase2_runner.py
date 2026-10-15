@@ -5,6 +5,7 @@ PX4 setpoints or fabricated detections. Every flight uses the actual detector.
 """
 import argparse
 from collections import deque
+from ament_index_python.packages import get_package_share_directory
 from datetime import datetime
 from functools import partial
 import json
@@ -167,8 +168,10 @@ class OwnedProcesses:
                 log.close()
 
 
-def ros_command(package, executable, parameters):
+def ros_command(package, executable, parameters, parameter_files=()):
     command = ['ros2','run',package,executable,'--ros-args']
+    for parameter_file in parameter_files:
+        command.extend(['--params-file',str(parameter_file)])
     for key,value in parameters.items():
         if isinstance(value,bool):
             value = str(value).lower()
@@ -179,27 +182,34 @@ def ros_command(package, executable, parameters):
 
 
 def run_trial(args, session, group, index):
-    trial = session / f'{args.algorithm}_{group}_{index:02d}'
+    variant = f'_{args.vision_mode}' if args.algorithm=='vision_png' and args.vision_mode!='combined' else ''
+    trial = session / f'{args.algorithm}{variant}_{group}_{index:02d}'
     trial.mkdir()
     requested_distance = 16.8 if group=='near' else 24.0
     center_e = args.near_center_e if group=='near' else args.far_center_e
     env = dict(os.environ, PX4_ROOT=str(args.px4_root), PX4_SELF_POSE='0,0',
                PX4_TARGET_POSE=f'{center_e},0', GZ_PARTITION=f'phase2_{session.name}_{group}_{index}',
                HEADLESS='1')
+    requires_detector_entry = (args.algorithm=='vision_png' and args.vision_mode=='combined'
+                               and not args.diagnostic_bypass_detector_entry)
     protocol = {
         'protocol':'phase2_fixed_circle_v2','group':group,'trial':index,'algorithm':args.algorithm,
+        'vision_mode':args.vision_mode if args.algorithm=='vision_png' else None,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
         'circle_initial_phase':0.0,'circle_angular_velocity':0.5,'circle_radius':5.0,
         'circle_release_command_phase':args.release_phase,
         'motion_age_at_release':(2*math.pi+args.release_phase)/0.5,
         'self_height_above_ground':-args.self_altitude,'target_height_above_ground':5.0,
-        'mode':'entry_smoke' if args.smoke else 'intercept',
+        'mode':'entry_smoke' if args.smoke else
+               ('intercept' if requires_detector_entry else f'diagnostic_{args.vision_mode}'),
         'self_spawn_pose':'0,0','target_spawn_pose':f'{center_e},0',
         'standby_yaw':math.pi/2,'takeoff_altitude_tolerance':0.08,
         'takeoff_speed_tolerance':0.2,'takeoff_settle_time':2.0,
-        'entry_condition':'scheduled epoch; both stable first; target moving; fresh GPS; last valid detection <150ms and >=3 valid detections in 300ms for Vision',
-        'PNG_gains':'unchanged defaults: N_png=kv=kz=4, d_gain=2, yaw=.0008/.0002, k_ey=.0056',
+        'entry_condition':'scheduled epoch; latched target ready; target moving; fresh GPS; self ready; combined mode also requires a recent valid detection window',
+        'detector_entry_gate':'recent valid window' if requires_detector_entry else
+                              'not applied in diagnostic mode',
+        'PNG_gains':'kv=kz=4, d_gain=2, yaw=.0008/.0002, k_ey=.0056',
         'speed_cmd':5.0,'hit_radius':0.8,'post_hit_duration':2.0,
     }
     write_json(trial/'protocol.json',protocol)
@@ -276,40 +286,52 @@ def run_trial(args, session, group, index):
         duration = 2.0 if args.smoke else args.duration
         recorder=owned.start('recorder',ros_command('uav_bc_recorder','experiment_recorder',{
             'out_dir':str(trial/'recording'),'algorithm':args.algorithm,'profile':'compare',
-            'target_motion':'circle','experiment_id':f'{group}_{index:02d}',
+            'target_motion':'circle','experiment_id':f'{args.vision_mode}_{group}_{index:02d}',
             'max_duration':duration,'start_timeout':180.0,'post_hit_duration':2.0}))
         owned.start('target',ros_command('uav_target_sim','uav_target_sim',{
             'motion_mode':'circle','defer_motion':True,'circle_initial_phase':0.0,
             'circle_angular_velocity':0.5,'circle_radius':5.0,'target_altitude':target_target_z,
             'takeoff_position_tolerance':0.1,'takeoff_speed_tolerance':0.2,'stability_duration':2.0}))
-        # Real inference remains enabled for both algorithms to keep process load comparable.
+        # Keep real inference running in every mode; truth_los ignores detector output.
         owned.start('detector',ros_command('uav_vision_dectect','uav_vision_dectect',{
-            'show_debug_window':False,'use_cuda':True}))
+            'show_debug_window':False,'use_cuda':True,
+            'enable_tracking':args.vision_mode!='yolo_only'}))
         package='uav_vision_png' if args.algorithm=='vision_png' else 'uav_png_intercept'
-        owned.start('guidance',ros_command(package,package,{
+        guidance_parameters = {
             'require_experiment_start':True,'standby_altitude':self_target_z,
             'standby_yaw':math.pi/2,'takeoff_altitude_tolerance':0.08,
             'takeoff_speed_tolerance':0.2,'takeoff_settle_time':2.0,
-            'speed_cmd':5.0,'N_png':4.0,'hit_radius':0.8}))
+            'speed_cmd':5.0,'hit_radius':0.8}
+        parameter_files = ()
+        if args.algorithm=='vision_png':
+            parameter_files = (Path(get_package_share_directory('uav_vision_png'))/'config'/'params.yaml',)
+            guidance_parameters['guidance_source'] = (
+                'truth_los' if args.vision_mode=='truth_los' else 'vision')
+        else:
+            guidance_parameters['N_png'] = 4.0
+        owned.start('guidance',ros_command(
+            package,package,guidance_parameters,parameter_files=parameter_files))
         wait_for(lambda: monitor.target_state.get('state')=='READY'
-                 and monitor.target_state.get('stable') is True
+                 and monitor.target_state.get('ready_latched') is True
                  and monitor.self_ready(self_target_z),100,'both stabilized')
         if args.smoke:
             # Entry smoke isolates startup prerequisites, not circle takeover range.
             def smoke_ready():
                 geometry = monitor.gps_geometry()
+                visual_entry_ready = (
+                    not requires_detector_entry or monitor.detector_ready())
                 return (monitor.self_ready(self_target_z)
                         and monitor.target_state.get('state')=='READY'
-                        and monitor.target_state.get('stable') is True
+                        and monitor.target_state.get('ready_latched') is True
                         and geometry is not None and abs(geometry['height_difference']-0.3)<=0.18
-                        and (args.algorithm!='vision_png' or monitor.detector_ready()))
+                        and visual_entry_ready)
             wait_for(smoke_ready,15,'GPS height and entry prerequisites ready')
             release_epoch=monitor.ros_now()
-            protocol.update(entry_condition='entry smoke: target holds READY; self ready; GPS height within original tolerance; detector recent-valid window ready',
+            protocol.update(entry_condition='entry smoke: target ready latched; self ready; GPS height within tolerance; combined mode requires detector recent-valid window',
                             distance_gate_applied=False,target_motion_started=False,
                             scheduled_intercept_release_ros_time=release_epoch)
         else:
-            schedule=monitor.ros_now()+1.0
+            schedule=monitor.ros_now()+2.0
             protocol['scheduled_target_start_ros_time']=schedule
             protocol['scheduled_intercept_release_ros_time']=schedule+protocol['motion_age_at_release']
             write_json(trial/'protocol.json',protocol)
@@ -334,14 +356,15 @@ def run_trial(args, session, group, index):
             raise RuntimeError(f"takeover distance outside protocol: {geometry['distance']}")
         if abs(geometry['height_difference']-0.3)>protocol['height_tolerance']:
             raise RuntimeError(f"takeover height difference outside protocol: {geometry['height_difference']}")
-        if args.algorithm=='vision_png' and not entry['detector_ready']:
+        if requires_detector_entry and not entry['detector_ready']:
             raise RuntimeError('no recent valid detection window at release; trial invalid')
         release_value=True
         wait_for(lambda: monitor.telemetry is not None and monitor.telemetry.state=='INTERCEPT',0.8,'INTERCEPT entered')
         protocol['observed_intercept_ros_time']=monitor.ros_now()
         protocol['observed_entry_delay']=protocol['observed_intercept_ros_time']-release_epoch
-        if protocol['observed_entry_delay']>0.3:
-            raise RuntimeError('controller entered INTERCEPT too late for fixed-phase protocol')
+        protocol['entry_delay_limit']=0.8 if args.diagnostic_bypass_detector_entry else 0.3
+        if protocol['observed_entry_delay']>protocol['entry_delay_limit']:
+            raise RuntimeError('controller entered INTERCEPT too late for configured protocol')
         results['valid']=True
         write_json(trial/'protocol.json',protocol)
         # Smoke observes entry for 2s only; it is not an interception outcome trial.
@@ -384,6 +407,11 @@ def main(argv=None):
     parser.add_argument('--groups',nargs='+',choices=['near','far'],default=['near','far'])
     parser.add_argument('--trials',type=int,default=3)
     parser.add_argument('--algorithm',choices=['vision_png','pure_png'],default='vision_png')
+    parser.add_argument('--vision-mode',choices=['combined','yolo_only','truth_los'],
+                        default='combined',
+                        help='Vision frontend A/B; truth_los is diagnostic-only GPS geometry')
+    parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
+                        help='Diagnostic only: release without the combined-mode detector window gate')
     parser.add_argument('--duration',type=float,default=60.0)
     parser.add_argument('--near-center-e',type=float,default=19.8)
     parser.add_argument('--far-center-e',type=float,default=27.0)
@@ -393,6 +421,10 @@ def main(argv=None):
     parser.add_argument('--smoke',action='store_true',
                         help='Check entry with target holding READY, record 2s; no circle range/phase or hit-rate experiment')
     args=parser.parse_args(argv)
+    if args.algorithm!='vision_png' and args.vision_mode!='combined':
+        parser.error('--vision-mode applies only to --algorithm vision_png')
+    if args.algorithm!='vision_png' and args.diagnostic_bypass_detector_entry:
+        parser.error('--diagnostic-bypass-detector-entry requires vision_png')
     if args.trials<1 or args.duration<=0 or not math.isfinite(args.duration):
         parser.error('trials and finite duration must be positive')
     for name in ('near_center_e','far_center_e','release_phase','self_altitude'):

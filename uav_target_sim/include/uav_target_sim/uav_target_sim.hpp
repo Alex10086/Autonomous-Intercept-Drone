@@ -63,6 +63,7 @@ private:
     double takeoff_speed_tolerance_ = 0.2;
     double stability_duration_ = 2.0;
     bool stable_ = false;
+    bool ready_latched_ = false;
     bool motion_started_ = false;
     std::optional<double> motion_start_ros_time_;
     using SteadyClock = std::chrono::steady_clock;

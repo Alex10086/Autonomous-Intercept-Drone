@@ -25,7 +25,6 @@ public:
 
     int cls_score_position = 0;
     float track_score = 0.0f;
-    bool target_pos_change(void);
 
     cv::Point target_pos = {0, 0};
     cv::Point2f target_sz = {0.f, 0.f};

@@ -4,11 +4,11 @@
  * 基于视觉的比例导引（Vision-based PNG）实现
  *
  * ┌──────────────────────────────────────────────────────────────┐
- * │  导引算法（纯视觉，严禁使用目标 GPS）                          │
+ * │  导引算法（production=视觉；truth_los=显式SITL诊断）             │
  * │    1. 从像素坐标 → 相机系 LOS 向量                           │
  * │    2. R_c2b * R_b2n 旋转到 NED 系                           │
- * │    3. PNG：d_v_angle = N * dLOS + last_v_angle              │
- * │    4. 速度指令：vx/vy/vz                                      │
+ * │    3. 速度角 += kv/kz * LOS 角增量                           │
+ * │    4. 速度指令：vx/vy/vz                                    │
  * ├──────────────────────────────────────────────────────────────┤
  * │  GPS 命中评估（不参与视觉导引计算）                             │
  * │    双方 GPS → LocalCartesian → 真实距离 → DONE 悬停           │
@@ -42,7 +42,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     this->declare_parameter("focal_length",      focal_length_);
     this->declare_parameter("image_width",        image_width_);
     this->declare_parameter("image_height",       image_height_);
-    this->declare_parameter("N_png",              N_png_);
     this->declare_parameter("speed_cmd",          speed_cmd_);
     this->declare_parameter("d_gain",             d_gain_);
     this->declare_parameter("kv",                 kv_);
@@ -54,11 +53,14 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     this->declare_parameter("freshness_timeout", freshness_timeout_);
     this->declare_parameter("track_lost_timeout", track_lost_timeout_);
     this->declare_parameter("hit_radius",         (double)hit_radius_);
+    guidance_source_ = declare_parameter<std::string>("guidance_source", "vision");
+    if (guidance_source_ != "vision" && guidance_source_ != "truth_los") {
+        throw std::invalid_argument("guidance_source must be vision or truth_los");
+    }
 
     focal_length_      = this->get_parameter("focal_length").as_double();
     image_width_       = this->get_parameter("image_width").as_int();
     image_height_      = this->get_parameter("image_height").as_int();
-    N_png_             = this->get_parameter("N_png").as_double();
     speed_cmd_         = this->get_parameter("speed_cmd").as_double();
     d_gain_            = this->get_parameter("d_gain").as_double();
     kv_                = this->get_parameter("kv").as_double();
@@ -187,6 +189,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
             lc_stats_.Forward(msg->latitude_deg, msg->longitude_deg,
                               msg->altitude_msl_m, e, n, u);
             self_pos_stats_ = {(float)n, (float)e, (float)(-u)};
+            last_self_gps_observation_ = std::chrono::steady_clock::now();
         });
 
     // 目标 GPS（px4_2，仅供统计！导引算法不得使用）
@@ -199,6 +202,8 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
                               msg->altitude_msl_m, e, n, u);
             target_pos_stats_  = {(float)n, (float)e, (float)(-u)};
             target_pos_ok_    = true;
+            last_target_gps_observation_ = std::chrono::steady_clock::now();
+            ++truth_generation_;
         });
 
     // ============================================================
@@ -233,8 +238,9 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
         std::bind(&VisionPNG::publish_telemetry, this));
 
     RCLCPP_INFO(get_logger(),
-        "VisionPNG 节点已启动 | focal=%.1f img=%dx%d N=%.1f spd=%.1f",
-        focal_length_, image_width_, image_height_, N_png_, speed_cmd_);
+        "VisionPNG 节点已启动 | source=%s focal=%.1f img=%dx%d kv=%.1f kz=%.1f spd=%.1f",
+        guidance_source_.c_str(), focal_length_, image_width_, image_height_,
+        kv_, kz_, speed_cmd_);
 }
 
 
@@ -243,6 +249,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
 // ============================================================
 void VisionPNG::control_loop()
 {
+    update_truth_guidance();
     update_visual_state();
     switch (state_) {
     case VpngState::TAKE_OFF:    handle_takeoff();    break;
@@ -252,6 +259,63 @@ void VisionPNG::control_loop()
     case VpngState::TRACK_LOST:  handle_track_lost(); break;
     case VpngState::DONE:        handle_done();       break;
     }
+}
+
+void VisionPNG::update_truth_guidance()
+{
+    if (guidance_source_ != "truth_los" ||
+        state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const bool geometry_fresh = lc_stats_init_ && target_pos_ok_ &&
+        now - last_self_gps_observation_ <=
+            std::chrono::duration<double>(freshness_timeout_) &&
+        now - last_target_gps_observation_ <=
+            std::chrono::duration<double>(freshness_timeout_);
+    if (!geometry_fresh || truth_generation_ == processed_truth_generation_) {
+        return;
+    }
+    if (state_ == VpngState::SEARCHING &&
+        ((require_experiment_start_ && !experiment_start_) ||
+         (precise_standby_ && !takeoff_ready()))) {
+        return;
+    }
+
+    const Eigen::Vector3d relative =
+        (target_pos_stats_ - self_pos_stats_).cast<double>();
+    if (!relative.allFinite() || relative.norm() < 1e-6) {
+        return;
+    }
+    Eigen::AngleAxisd Ryaw(yaw_, Eigen::Vector3d::UnitZ());
+    Eigen::AngleAxisd Rpitch(pitch_, Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd Rroll(roll_, Eigen::Vector3d::UnitX());
+    const Eigen::Matrix3d R_b2n = Ryaw.toRotationMatrix() *
+        Rpitch.toRotationMatrix() * Rroll.toRotationMatrix();
+    const Eigen::Vector3d camera =
+        R_c2b_.transpose() * R_b2n.transpose() * relative;
+    double ex;
+    double ey;
+    if (camera.z() > 1e-6) {
+        ex = focal_length_ * camera.x() / camera.z();
+        ey = focal_length_ * camera.y() / camera.z();
+    } else {
+        ex = std::copysign(static_cast<double>(image_width_), camera.x());
+        ey = std::copysign(static_cast<double>(image_height_), camera.y());
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+            "[TRUTH_LOS] target behind camera; using saturated ideal pixel");
+    }
+    detect_x_ = static_cast<int>(std::lround(image_width_ / 2.0 + ex));
+    detect_y_ = static_cast<int>(std::lround(image_height_ / 2.0 + ey));
+    detect_w_ = 0;
+    detect_h_ = 0;
+    if (state_ != VpngState::INTERCEPT) {
+        png_initialized_ = false;
+    }
+    state_ = VpngState::INTERCEPT;
+    last_visual_observation_ = now;
+    processed_truth_generation_ = truth_generation_;
+    png_calculate(roll_, pitch_, yaw_);
 }
 
 double VisionPNG::observation_age() const
@@ -273,6 +337,7 @@ void VisionPNG::update_visual_state()
 
 void VisionPNG::detection_callback(const RectMsg &msg)
 {
+    if (guidance_source_ != "vision") return;
     // Check the previous observation before a new arrival can refresh its age.
     update_visual_state();
     // Invalid results neither replace the cached observation nor refresh its age.
