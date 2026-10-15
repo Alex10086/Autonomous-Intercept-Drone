@@ -19,6 +19,10 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     enable_tracking_ = declare_parameter<bool>("enable_tracking", true);
     show_debug_window_ = declare_parameter<bool>("show_debug_window", true);
     yolo_refresh_interval_ = declare_parameter<int>("yolo_refresh_interval", 5);
+    const auto image_reliability = declare_parameter<std::string>("image_reliability", "reliable");
+    if (image_reliability != "reliable" && image_reliability != "best_effort") {
+        throw std::invalid_argument("image_reliability must be reliable or best_effort");
+    }
     if (yolo_refresh_interval_ < 0) {
         throw std::invalid_argument("yolo_refresh_interval must be nonnegative");
     }
@@ -37,10 +41,12 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
                 config.confThreshold, yolo_refresh_interval_);
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
-    // Keep only the most recent camera frame while inference is busy. Sensor QoS
-    // also accepts best-effort camera publishers.
+    // Keep one recent frame. Best-effort delivery showed large-image gaps in SITL.
+    // Reliable matches Gazebo's offer; best_effort is explicit for BE publishers.
     auto image_qos = rclcpp::SensorDataQoS();
     image_qos.keep_last(1);
+    if (image_reliability == "reliable") image_qos.reliable();
+    RCLCPP_INFO(get_logger(), "Camera QoS: reliability=%s depth=1", image_reliability.c_str());
     uav_image_sub_ = create_subscription<sensor_msgs::msg::Image>(
         "/camera/image", image_qos,
         std::bind(&UavTopicSubscrib::image_callback, this, std::placeholders::_1));

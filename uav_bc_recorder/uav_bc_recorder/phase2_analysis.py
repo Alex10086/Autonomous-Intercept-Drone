@@ -533,6 +533,7 @@ def analyze_recording(recording, output):
         'trial':requested.get('trial'),'vision_mode':requested.get('vision_mode'),'valid':valid,
         'attitude_sync':requested.get('attitude_sync'),
         'pixel_estimator':requested.get('pixel_estimator', 'raw'),
+        'image_reliability':requested.get('image_reliability', 'best_effort'),
         'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),
         'initial_self_velocity':initial.get('self_velocity_ned'),

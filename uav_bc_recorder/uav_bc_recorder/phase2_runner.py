@@ -197,6 +197,7 @@ def run_trial(args, session, group, index):
         'vision_mode':args.vision_mode if args.algorithm=='vision_png' else None,
         'attitude_sync':args.attitude_sync if args.algorithm=='vision_png' else None,
         'pixel_estimator':args.pixel_estimator if args.algorithm=='vision_png' else None,
+        'image_reliability':args.image_reliability,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
         'circle_initial_phase':0.0,'circle_angular_velocity':0.5,'circle_radius':5.0,
@@ -297,7 +298,8 @@ def run_trial(args, session, group, index):
         # Keep real inference running in every mode; truth_los ignores detector output.
         owned.start('detector',ros_command('uav_vision_dectect','uav_vision_dectect',{
             'show_debug_window':False,'use_cuda':True,
-            'enable_tracking':args.vision_mode!='yolo_only'}))
+            'enable_tracking':args.vision_mode!='yolo_only',
+            'image_reliability':args.image_reliability}))
         package='uav_vision_png' if args.algorithm=='vision_png' else 'uav_png_intercept'
         guidance_parameters = {
             'require_experiment_start':True,'standby_altitude':self_target_z,
@@ -418,6 +420,8 @@ def main(argv=None):
                         help='P0 single-variable A/B: image-time SLERP or receipt-pose baseline')
     parser.add_argument('--pixel-estimator',choices=['raw','kf'],default='raw',
                         help='P2 single-variable A/B: image LOS or current-time pixel KF')
+    parser.add_argument('--image-reliability',choices=['reliable','best_effort'],default='reliable',
+                        help='Camera subscription reliability; reliable matches the Gazebo large-image publisher')
     parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
                         help='Diagnostic only: release without the combined-mode detector window gate')
     parser.add_argument('--duration',type=float,default=60.0)

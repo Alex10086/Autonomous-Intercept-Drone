@@ -444,6 +444,24 @@ P2 对照期间发现，原 C++ 先选出 window/size-penalized 评分最高的�
 
 324 个候选位置、窗口/尺度评分优先级和并列边界的确定性回归通过。仅改前端候选关联、保持 `7b086dc` 的 image/raw 控制与全部条件不变的首轮真实 CUDA 圆周验证（`tracker_index_validation/2026-10-16_01-40-52/`）最近 2.145 m、未命中；确定性错误已修正，但该轮不能证明拦截性能提升。先以此正确前端继续对照，不用 KF 把错误索引隐藏起来。
 
+**大图像接收节拍修复**
+
+入口失效记录中，释放前 0.65 s 仅有 5 条有效框，最后两张处理图像的 stamp 相隔 297 ms，但每帧处理链路本身仅约 33 ms。随后在无推理场景同时检查 Gazebo 源流与 ROS 接收：原生源稳定窗口约 30 Hz；低开销 C++ 接收端保留 Depth 1，仅切换可靠性便得到下列结果。该现象不能简单用“YOLO 慢”或 Python `ros2 topic hz` 开销解释，也不泛化为所有 ROS 环境的 Best Effort 都有同样问题。
+
+| 测量场景 | 图像订阅可靠性 | 接收/输出频率 Hz | 最大间隔 ms | image→bbox 均值/最大 ms |
+|---|---|---:|---:|---:|
+| 无推理，C++ Image 接收 | Best Effort | 9.82 | 794.2 | — |
+| 无推理，C++ Image 接收 | Reliable | 30.18 | 54.5 | — |
+| 真实 CUDA 推理，仅读取 bbox | Best Effort | 10.77 | 366.9 | 47.5 / 52.5 |
+| 真实 CUDA 推理，仅读取 bbox，测量 1 | Reliable | 30.23 | 55.0 | 52.9 / 71.5 |
+| 真实 CUDA 推理，仅读取 bbox，测量 2 | Reliable | 30.08 | 59.1 | 53.4 / 74.0 |
+
+每帧为原始 1920×1080、6,220,800 bytes，桥接发布者实际提供 Reliable。推理吞吐探针在地面无目标场景运行，计数包含真实模型给出的 invalid 结果，**不代表检测准确率或命中率**；bbox 探针不订阅 Image，避免额外 Reliable reader 改变被测链路。没有改分辨率、像素、模型、FOV、PNG/PX4、操作系统网络缓冲或入口门槛。
+
+检测节点新增 `image_reliability=reliable|best_effort`，本项目 Gazebo 默认使用 `reliable`，History 仍为 Keep Last 1。runner 的同名选择通过 `--image-reliability` 传入并记入协议/结果。真实相机若只发布 Best Effort，须显式传 `-p image_reliability:=best_effort`，否则可靠性不兼容会收不到图像；不会静默切换或重复发布旧框。单帧延迟与接收间隔必须分开测量，不能仅检查“话题存在/有效框比例”。
+
+`camera_reliable_validation/2026-10-16_02-38-23/` 的完整固定圆周实飞中，1112 条接受观测达到 30.16 Hz，接收间隔中位/P95/最大为 32.9/48.6/75.0 ms，采样状态没有 COAST 或 TRACK_LOST。image→bbox / 控制中位为 43.9/46.4 ms，没有靠旧帧积压换取高频。**首次近接仍在 2.749 m 擦过，后续才于 36.875 s 命中**，因此接收节拍问题已解决，但不能宣称首次拦截精度基本解决。测量 JSON、测量源码快照与正式飞行引用保存在 `~/intercept_ws/experiment_data/camera_cadence_diagnostic/qos_probe.json`。
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash
