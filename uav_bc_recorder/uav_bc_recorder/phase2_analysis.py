@@ -182,6 +182,45 @@ def interpolate_position(samples, epoch, max_gap=MAX_GEOMETRY_GAP_S):
     return tuple(a + weight * (b - a) for a, b in zip(before[1:], after[1:]))
 
 
+def annotate_observations(rows):
+    """Source history and wrapped step errors; never bridge rejected frames/gaps."""
+    previous = None
+    last_epoch = last_yolo = math.nan
+    for row in rows:
+        epoch = number(row, 'image_time_ros')
+        source = number(row, 'source')
+        valid_clock = row['clock_valid'] and math.isfinite(epoch)
+        if not valid_clock or (math.isfinite(last_epoch) and epoch <= last_epoch):
+            previous = None
+            last_yolo = math.nan
+        last_epoch = epoch if valid_clock else math.nan
+        box_valid = number(row, 'width') > 0 and number(row, 'height') > 0
+        if valid_clock and box_valid and source == 1:
+            last_yolo = epoch
+        row['bbox_center_u'] = number(row, 'x') + number(row, 'width') / 2 if box_valid else math.nan
+        row['bbox_center_v'] = number(row, 'y') + number(row, 'height') / 2 if box_valid else math.nan
+        row['time_since_yolo_s'] = epoch - last_yolo if valid_clock and math.isfinite(last_yolo) else math.nan
+        row['source_name'] = {1: 'YOLO', 2: 'LightTrack'}.get(source, 'unknown')
+        row['is_yolo_refresh'] = False
+        row['dt_image_s'] = math.nan
+        for axis in ('v', 'z'):
+            row[f'los_step_{axis}_rad'] = row[f'error_step_{axis}_rad'] = math.nan
+        eligible = valid_clock and row['accepted'] and all(
+            math.isfinite(number(row, 'los_' + axis)) for axis in ('v', 'z'))
+        if eligible and previous is not None:
+            dt = epoch - number(previous, 'image_time_ros')
+            if 0 < dt <= 0.15:
+                row['dt_image_s'] = dt
+                row['is_yolo_refresh'] = source == 1 and number(previous, 'source') == 2
+                for axis in ('v', 'z'):
+                    row[f'los_step_{axis}_rad'] = wrapped(number(row, 'los_' + axis) - number(previous, 'los_' + axis))
+                    row[f'error_step_{axis}_rad'] = wrapped(
+                        number(row, f'los_error_image_{axis}_rad') -
+                        number(previous, f'los_error_image_{axis}_rad'))
+        previous = row if eligible else None
+    return rows
+
+
 def align_observations(observations, samples):
     """Produce one row per bbox, distinguishing image and first-control truth.
 
@@ -214,7 +253,7 @@ def align_observations(observations, samples):
                     row[f'receive_pose_error_image_{axis}_rad'] = wrapped(
                         number(event, 'receive_pose_los_' + axis) - angle)
         aligned.append(row)
-    return aligned
+    return annotate_observations(aligned)
 
 
 def percentile(values, fraction):
@@ -293,6 +332,84 @@ def observation_metrics(aligned, intercept_start, closest_elapsed):
     return metrics
 
 
+def source_metrics(aligned, intercept_start, closest_elapsed):
+    """Event-weighted first-approach source diagnostics, separate from hit rates."""
+    approach = [row for row in aligned if row['accepted'] and row['clock_valid']
+                and intercept_start <= number(row, 'image_time_ros') <= intercept_start + closest_elapsed
+                and all(math.isfinite(number(row, key)) for key in ('los_v', 'los_z'))]
+    output = []
+    for scope, lower, upper in (
+            ('all_first_approach', 0, math.inf), ('near', 0.8, 5),
+            ('0p8_2m', 0.8, 2), ('2_5m', 2, 5), ('5_17m', 5, 17)):
+        for source, label in ((1, 'YOLO'), (2, 'LightTrack')):
+            selected = [row for row in approach if number(row, 'source') == source
+                        and (scope == 'all_first_approach' or
+                             lower <= row['image_distance_m'] < upper or
+                             ((upper == 17 or scope == 'near') and row['image_distance_m'] == upper))]
+            result = {'scope': scope, 'source': label}
+            result.update(error_metrics(selected, 'los'))
+            result['yolo_refresh_events'] = sum(row['is_yolo_refresh'] for row in selected)
+            for label, key in (('image_to_bbox_ms', 'image_to_bbox_ms'),
+                               ('image_to_control_ms', 'image_to_control_ms'),
+                               ('time_since_yolo_s', 'time_since_yolo_s'),
+                               ('confidence', 'confidence')):
+                values = [number(row, key) for row in selected]
+                result[label + '_median'] = percentile(values, 0.5)
+                result[label + '_p95'] = percentile(values, 0.95)
+            for axis in ('v', 'z'):
+                steps = [abs(math.degrees(number(row, f'error_step_{axis}_rad'))) for row in selected]
+                result[f'error_step_abs_{axis}_deg_median'] = percentile(steps, 0.5)
+                result[f'error_step_abs_{axis}_deg_p95'] = percentile(steps, 0.95)
+            output.append(result)
+    return output
+
+
+def plot_los_timeline(aligned, path, intercept_start, closest_elapsed):
+    """Image-time LOS versus same-time GPS geometry around the first encounter."""
+    if not math.isfinite(intercept_start) or not math.isfinite(closest_elapsed):
+        return None
+    try:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    except ImportError:
+        return None
+    selected = [row for row in aligned if row['accepted'] and row['clock_valid']
+                and closest_elapsed - 2 <= number(row, 'image_time_ros') - intercept_start <= closest_elapsed + 0.5]
+    if not selected:
+        return None
+    figure = Figure(figsize=(10, 7))
+    FigureCanvasAgg(figure)
+    for index, axis in enumerate(('v', 'z'), start=1):
+        panel = figure.add_subplot(2, 1, index)
+        times, truth_angles, vision_angles = [], [], []
+        previous_time = previous_truth = math.nan
+        for row in selected:
+            elapsed = number(row, 'image_time_ros') - intercept_start
+            angle = number(row, f'truth_los_image_{axis}_rad')
+            if not 0 < elapsed - previous_time <= 0.15:
+                times.append(math.nan); truth_angles.append(math.nan); vision_angles.append(math.nan)
+                previous_truth = math.nan
+            unwrapped = previous_truth + wrapped(angle - previous_truth) if math.isfinite(previous_truth) else angle
+            times.append(elapsed)
+            truth_angles.append(math.degrees(unwrapped))
+            vision_angles.append(math.degrees(unwrapped + number(row, f'los_error_image_{axis}_rad')))
+            previous_time, previous_truth = elapsed, unwrapped
+        panel.plot(times, truth_angles, color='black', linewidth=1, label='GPS geometry (image time)')
+        for source, label, marker in ((1, 'YOLO LOS', 'o'), (2, 'LightTrack LOS', 'x')):
+            points = [row for row in selected if number(row, 'source') == source]
+            # Use the shared unwrapped angle basis; NaN separators have no event.
+            values = [value for value, time in zip(vision_angles, times) if math.isfinite(time)]
+            indices = [i for i, row in enumerate(selected) if number(row, 'source') == source]
+            panel.scatter([number(row, 'image_time_ros') - intercept_start for row in points],
+                          [values[i] for i in indices], s=12, marker=marker, label=label)
+        panel.set_xlabel('Time since INTERCEPT (s)')
+        panel.set_ylabel(f'LOS {axis} (deg)')
+        panel.legend()
+    figure.tight_layout()
+    figure.savefig(path)
+    return str(path)
+
+
 def plot_observation_errors(aligned, path, intercept_start, closest_elapsed):
     """Optional diagnostic only; analysis does not require matplotlib."""
     try:
@@ -347,6 +464,15 @@ def analyze_observations(recording, output, name, meta, closest_elapsed):
                    geometry_self_samples=len(samples['self']), geometry_target_samples=len(samples['target']))
     metrics['observations_error_plot'] = plot_observation_errors(
         aligned, output / (name + '_observations_errors.png'), start, closest_elapsed)
+    source_path = output / (name + '_source_metrics.csv')
+    sources = source_metrics(aligned, start, closest_elapsed)
+    with source_path.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(sources[0]))
+        writer.writeheader()
+        writer.writerows(sources)
+    metrics['source_metrics'] = str(source_path)
+    metrics['los_timeline_plot'] = plot_los_timeline(
+        aligned, output / (name + '_los_timeline.png'), start, closest_elapsed)
     return metrics
 
 

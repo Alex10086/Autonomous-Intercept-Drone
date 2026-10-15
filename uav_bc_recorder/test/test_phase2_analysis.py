@@ -9,7 +9,7 @@ import yaml
 from uav_bc_recorder import phase2_analysis
 from uav_bc_recorder.phase2_analysis import (
     align_observations, diagnostic_rows, first_encounter, geometry_samples,
-    interpolate_position, observation_metrics,
+    interpolate_position, observation_metrics, source_metrics,
 )
 
 
@@ -293,3 +293,42 @@ def test_empty_sidecar_writes_schema_and_null_statistics(tmp_path, monkeypatch):
         reader = csv.DictReader(stream)
         assert 'los_error_image_z_rad' in reader.fieldnames
         assert list(reader) == []
+
+
+def test_source_refresh_step_wraps_and_does_not_bridge_rejections_or_gaps():
+    events = [
+        observation(time=100, accepted=False, source=1, width=20, height=10),
+        observation(time=100.02, source=2, los_z=math.radians(179)),
+        observation(time=100.04, source=1, width=20, height=10, los_z=math.radians(-179)),
+        observation(time=100.05, accepted=False, source=0),
+        observation(time=100.08, source=2),
+        observation(time=100.3, source=1, width=20, height=10),
+    ]
+    rows = align_observations(events, constant_geometry())
+    assert rows[1]['time_since_yolo_s'] == pytest.approx(0.02)
+    assert rows[2]['is_yolo_refresh']
+    assert rows[2]['error_step_z_rad'] == pytest.approx(math.radians(2))
+    assert rows[4]['time_since_yolo_s'] == pytest.approx(0.04)
+    assert math.isnan(rows[4]['error_step_z_rad'])
+    assert not rows[5]['is_yolo_refresh']
+    assert math.isnan(rows[5]['dt_image_s'])
+
+
+def test_source_error_statistics_respect_near_boundary_and_event_weighting():
+    times = [100 + index * 0.025 for index in range(5)]
+    distances = [1, 1.5, 3, 5, 10]
+    angles = [1, 5, 2, 8, 3]
+    sources = [1, 2, 2, 1, 2]
+    samples = geometry_samples([
+        geometry_row(vehicle, time, y=distance if vehicle == 'target' else 0)
+        for time, distance in zip(times, distances) for vehicle in ('self', 'target')
+    ])
+    rows = align_observations([
+        observation(time=time, source=source, los_z=math.radians(angle))
+        for time, source, angle in zip(times, sources, angles)], samples)
+    groups = {(row['scope'], row['source']): row for row in source_metrics(rows, 100, 0.1)}
+    assert groups['near', 'YOLO']['los_events'] == 2
+    assert groups['near', 'YOLO']['los_image_abs_z_deg_median'] == pytest.approx(4.5)
+    assert groups['near', 'LightTrack']['los_image_abs_z_deg_median'] == pytest.approx(3.5)
+    assert groups['5_17m', 'YOLO']['los_events'] == 1
+    assert groups['2_5m', 'LightTrack']['los_events'] == 1

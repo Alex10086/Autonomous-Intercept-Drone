@@ -401,6 +401,27 @@ ros2 run uav_bc_recorder phase2_analysis \
 
 有 P0 sidecar 时，分析另输出 `*_observations_aligned.csv` 和可用时的误差—距离图：分别在图像映射时刻、首次控制使用时刻，对两机 GPS 源时间独立插值（最大间隔 0.15 s，禁止外推）。`los_error_image_*` 与 `los_error_control_*` 不可混为一个指标；`receive_pose_error_image_*` 是同一观测用接收姿态计算的配对基线。延迟按观测事件统计，不按 20 Hz 重复采样行加权。首次接近仅取入场至首次最近点，报告 0.8–2、2–5、5–17 m 分箱、绝对误差中位数/P95及真值覆盖率；没有覆盖时保留 `NaN`/null，不用陈旧 GPS 填补。GPS geometry 仅供分析，不进入正式视觉制导。
 
+P1 另输出 `*_source_metrics.csv`（按 YOLO/LightTrack、首次接近及距离分箱统计）与 `*_los_timeline.png`（首次最近点前 2 s 至后 0.5 s，同图像时刻的视觉/GPS LOS，并标记观测来源）。对齐 CSV 增加 bbox 中心、`time_since_yolo_s`、`is_yolo_refresh` 和包裹后的 `error_step_*_rad`；后者从视觉跳变中扣除了同时间真值变化，不跨拒绝帧或超过 0.15 s 的间隔。只有连续 LightTrack→YOLO 观测才标记 refresh，不能把间隔后的重新捕获当成 refresh。高置信度不等于低 LOS 误差，两个来源的分数也不作为共同校准概率。误差—距离图绘制绝对误差；时间曲线保留带符号 LOS，以区分跨边、滞后和重定位跳变。
+
+**P0/P1 固定圆周实测（控制器 `91fd754`）**
+
+全部保持 Combined、请求入场 16.8 m、5 m/s、命中阈值 0.8 m、circle 半径 5 m / 角速度 +0.5 rad/s、原 PNG/FOV 增益与入口门槛。下表仅含原生时钟恢复后的有效正式试验；命中是既有 GPS 距离判据，不是额外的 Gazebo 接触证明。P95 为首次接近 0.8–5 m 的同图像时刻绝对 LOS 误差。
+
+| 姿态路径 | 轮次 | 首次最近距离 m | 命中 | 图像→bbox 中位 ms | 图像→控制中位 ms | 垂直误差 P95 ° | 方位误差 P95 ° |
+|---|---:|---:|---|---:|---:|---:|---:|
+| receipt | 1 | 1.082 | 否 | 44.3 | 46.6 | 6.65 | 34.20 |
+| receipt | 2 | 4.344 | 否 | 43.3 | 45.6 | 2.51 | 4.75 |
+| receipt | 3 | 1.368 | 否 | 55.6 | 58.3 | 15.44 | 42.58 |
+| image | 1 | 1.355 | 否 | 45.3 | 48.2 | 45.83 | 22.71 |
+| image | 2 | 0.626 | 是 | 36.9 | 39.6 | 1.71 | 14.04 |
+| image | 3 | 0.752 | 是 | 54.2 | 56.5 | 45.74 | 20.12 |
+
+六轮检测有效比例均为 100%、TRACK_LOST 比例均为 0%。另有一轮 image 正式入口因缺少 recent-valid detection window 而 invalid，保留但不计作未命中；原生时钟修复的先行完整验证也是有效飞行，最近 0.982 m、未命中，不能从总记录中删除。因此正式对照是 receipt 0/3、image 2/3；连同先行验证，已观察到的有效 image 飞行是 2/4，尚不能声称重复性基本解决或统计显著提升。
+
+在这组硬件/模型条件下，实测视觉处理链路的中位延迟约 37–56 ms，而不是未经测量的 100–300 ms。image 同一观测的配对姿态修正中位收益很小且符号不一致，末端仍有几十度残差。P1 的来源 CSV/时间图显示大残差可集中在高分 LightTrack 输出、且距最后 YOLO 约 1 s 的阶段；近接 YOLO 样本很少，不足以宣称来源整体精度的统计结论。下一步继续 P2/P3，不能把 KF 当作已证实能修复 tracker 漂移的结论，也不据此重写 PNG/PX4。
+
+数据根目录为 `~/intercept_ws/experiment_data/p0_native_ab/`（receipt、image invalid、image_repeat 及统一 analysis）与 `p0_native_clock_validation/2026-10-16_00-14-52/`。此前未撤销 DDS 平滑偏移的记录仅供排查，不用于同步精度改善结论。固定制导二进制 SHA256 为 `711aea5041d9ad3907de005824edf985643dc5c0a7544b0d5a63066ed3b4b09d`，检测器为 `6e1c6c47ddd9137f7d03c94d3f61405502cf9aff7029985b92d56a608478ce6a`；本阶段只增加离线分析，未改变这两个二进制。
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash
