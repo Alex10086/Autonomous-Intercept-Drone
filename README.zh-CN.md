@@ -241,8 +241,8 @@ ros2 run uav_vision_png uav_vision_png
 
 * `use_cuda` 默认 `true`。CUDA 初始化或推理失败时退出并报告错误，不会悄悄回退 CPU；显式 CPU 诊断可传 `-p use_cuda:=false`。
 * `enable_tracking` 默认 `true`；`show_debug_window` 默认 `true`。无显示环境传 `-p show_debug_window:=false`。
-* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。
-* 保留原算法的 0.4 推理过滤、0.45 IoU 阈值和严格 `>0.8` 的目标捕获条件。发布一次实际处理图像的检测框并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
+* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。`confidence_threshold` 默认为 `0.4`；YOLO 后处理和跟踪器捕获共用该阈值，不再用第二个更严格的门槛丢弃已有有效候选框。IoU 阈值仍为 `0.45`。
+* 每张实际处理图像发布一次结果并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
 
 视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
 

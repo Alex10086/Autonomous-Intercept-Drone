@@ -237,8 +237,8 @@ Detector parameters:
 
 * `use_cuda` defaults to `true`. CUDA initialization/inference failures exit with an error rather than silently falling back to CPU; explicit CPU diagnostics use `-p use_cuda:=false`.
 * `enable_tracking` and `show_debug_window` default to `true`; use `-p show_debug_window:=false` without a display.
-* Override default installed models with `yolo_model_path`, `tracker_init_model_path`, and `tracker_update_model_path`.
-* Original thresholds remain: inference confidence 0.4, IoU 0.45, and target acquisition strictly `>0.8`. One result is published per processed image with its original timestamp. Lost targets use `-1` for all four bbox fields; stale boxes are not repeatedly stamped as fresh detections.
+* Override default installed models with `yolo_model_path`, `tracker_init_model_path`, and `tracker_update_model_path`. `confidence_threshold` defaults to `0.4`; the same threshold is used for YOLO post-processing and tracker acquisition instead of discarding otherwise valid detections at a second, stricter gate. IoU remains `0.45`.
+* One result is published per processed image with its original timestamp. Lost targets use `-1` for all four bbox fields; stale boxes are not repeatedly stamped as fresh detections.
 
 Guidance enters `SEARCHING` after reaching standby altitude and converging hover-thrust estimation, then enters `INTERCEPT` on a valid detection. `/vpng_data` exposes actual LOS and pixel errors; a running process or an existing topic alone does not prove detection or interception.
 

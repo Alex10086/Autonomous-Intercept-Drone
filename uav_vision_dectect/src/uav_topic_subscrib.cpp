@@ -17,8 +17,9 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     config.useCuda = declare_parameter<bool>("use_cuda", true);
     enable_tracking_ = declare_parameter<bool>("enable_tracking", true);
     show_debug_window_ = declare_parameter<bool>("show_debug_window", true);
-    // Preserve inference filtering at 0.4 and target acquisition strictly above 0.8.
-    config.confThreshold = 0.4f;
+    // Apply one confidence threshold from YOLO post-processing through acquisition.
+    config.confThreshold = static_cast<float>(
+        declare_parameter<double>("confidence_threshold", 0.4));
     config.iouThreshold = 0.45f;
 
     RCLCPP_INFO(get_logger(), "Loading vision models with %s execution requested", config.useCuda ? "CUDA" : "CPU");
@@ -26,7 +27,8 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     if (enable_tracking_) {
         siam_tracker = std::make_unique<LightTrack>(init_model.c_str(), update_model.c_str(), config.useCuda);
     }
-    RCLCPP_INFO(get_logger(), "Vision sessions initialized; target acquisition threshold > 0.8");
+    RCLCPP_INFO(get_logger(), "Vision sessions initialized; confidence threshold >= %.3f",
+                config.confThreshold);
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
     // Keep only the most recent camera frame while inference is busy. Sensor QoS
@@ -81,7 +83,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 best = &det;
             }
         }
-        if (best && best->conf > 0.8f) {
+        if (best) {
             const cv::Rect safe_rect = best->box & cv::Rect(0, 0, frame.cols, frame.rows);
             if (safe_rect.width > 0 && safe_rect.height > 0 && safe_rect.area() >= 10) {
                 if (enable_tracking_) {
