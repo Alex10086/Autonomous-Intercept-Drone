@@ -44,6 +44,7 @@
 #include <uav_common_msg/msg/simulation_clock.hpp>
 #include <uav_common_msg/msg/vision_observation.hpp>
 #include "uav_vision_png/time_alignment.hpp"
+#include "uav_vision_png/pixel_kalman.hpp"
 #include <string>
 #include <array>
 #include <chrono>
@@ -113,7 +114,7 @@ private:
     void clear_pending_observations();
     void apply_observation(const Eigen::Matrix3d &rotation,
                            std::chrono::steady_clock::time_point received);
-    void png_calculate(const Eigen::Matrix3d &R_b2n);
+    void png_calculate(const Eigen::Matrix3d &R_b2n, double pixel_u, double pixel_v);
     void update_truth_guidance();
     double observation_age() const;
     void update_visual_state();
@@ -164,6 +165,14 @@ private:
     double last_image_time_ = std::numeric_limits<double>::quiet_NaN();
     std::string image_time_domain_ = "gazebo";
     double latest_attitude_time_ = std::numeric_limits<double>::quiet_NaN();
+    vision_time::PixelKalman pixel_filter_;
+    std::string pixel_estimator_ = "raw";
+    double pixel_measurement_variance_ = 16.0;
+    double pixel_acceleration_variance_ = 1000000.0;
+    double pixel_prediction_horizon_ = 0.3;
+    Eigen::Quaterniond prediction_attitude_ = Eigen::Quaterniond::Identity();
+    Eigen::Vector3d prediction_body_rates_ = Eigen::Vector3d::Zero();
+    bool prediction_attitude_valid_ = false;
     uav_common_msg::msg::VisionObservation observation_;
     bool observation_pending_ = false;
     struct PendingObservation {

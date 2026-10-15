@@ -390,6 +390,10 @@ P1 also writes `*_source_metrics.csv` split by YOLO/LightTrack, first approach, 
 
 Median image-to-bbox latency was approximately 37–56 ms. Paired attitude correction alone had small, inconsistent median error gains; terminal errors of tens of degrees remained, including high-score LightTrack observations far from the last YOLO update. Sparse near-range YOLO samples do not establish a statistically reliable source ranking. Continue P2/P3 rather than claiming KF already repairs tracker drift or rewriting PNG/PX4. Detailed per-flight distances/errors, raw-data locations, and fixed executable hashes are recorded in [the Chinese experiment table](README.zh-CN.md).
 
+**P2 pixel KF / delay prediction.** `--pixel-estimator raw` retains P0; `--pixel-estimator kf --attitude-sync image` updates a fixed-size `[u,v,du,dv]` constant-velocity filter once at each capture epoch and predicts to the current guidance calculation. P2 uses identical measurement noise for both sources (4 px) and acceleration noise 1000 px/s², with a 0.3 s forecast limit. Current attitude uses at most 50 ms body-FRD gyro propagation; stale/unmatched predictions are explicitly rejected. PNG/PX4/gains/entry conditions remain unchanged and raw stays the default.
+
+Raw image `los_v/z` and actual `control_los_v/z` are separate, with explicit estimate time, predicted pixels/velocities, and pixel/attitude horizons. Analysis compares raw-held and estimated LOS against the same control-time truth and preserves negative prediction gains. The first full direct-camera CV trial (`p2_kf_validation/2026-10-16_00-53-40/`) missed at 9.949 m and never reached the 5 m window; paired first-approach median gains were −0.927° vertical and −0.319° azimuth. This is a negative result, not a reason to enable KF by default. Isolate ego-rotation-induced pixel motion before source-weighted P3 fusion.
+
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
 
 ```bash

@@ -196,6 +196,7 @@ def run_trial(args, session, group, index):
         'protocol':'phase2_fixed_circle_v2','group':group,'trial':index,'algorithm':args.algorithm,
         'vision_mode':args.vision_mode if args.algorithm=='vision_png' else None,
         'attitude_sync':args.attitude_sync if args.algorithm=='vision_png' else None,
+        'pixel_estimator':args.pixel_estimator if args.algorithm=='vision_png' else None,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
         'circle_initial_phase':0.0,'circle_angular_velocity':0.5,'circle_radius':5.0,
@@ -309,6 +310,7 @@ def run_trial(args, session, group, index):
             guidance_parameters['guidance_source'] = (
                 'truth_los' if args.vision_mode=='truth_los' else 'vision')
             guidance_parameters['attitude_sync'] = args.attitude_sync == 'image'
+            guidance_parameters['pixel_estimator'] = args.pixel_estimator
         else:
             guidance_parameters['N_png'] = 4.0
         owned.start('guidance',ros_command(
@@ -414,6 +416,8 @@ def main(argv=None):
                         help='Vision frontend A/B; truth_los is diagnostic-only GPS geometry')
     parser.add_argument('--attitude-sync',choices=['image','receipt'],default='image',
                         help='P0 single-variable A/B: image-time SLERP or receipt-pose baseline')
+    parser.add_argument('--pixel-estimator',choices=['raw','kf'],default='raw',
+                        help='P2 single-variable A/B: image LOS or current-time pixel KF')
     parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
                         help='Diagnostic only: release without the combined-mode detector window gate')
     parser.add_argument('--duration',type=float,default=60.0)
@@ -425,6 +429,8 @@ def main(argv=None):
     parser.add_argument('--smoke',action='store_true',
                         help='Check entry with target holding READY, record 2s; no circle range/phase or hit-rate experiment')
     args=parser.parse_args(argv)
+    if args.pixel_estimator != 'raw' and (args.algorithm != 'vision_png' or args.attitude_sync != 'image'):
+        parser.error('pixel KF requires vision_png and --attitude-sync image')
     if args.algorithm!='vision_png' and args.vision_mode!='combined':
         parser.error('--vision-mode applies only to --algorithm vision_png')
     if args.algorithm!='vision_png' and args.diagnostic_bypass_detector_entry:

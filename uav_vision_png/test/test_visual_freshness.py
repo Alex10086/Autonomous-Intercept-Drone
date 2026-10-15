@@ -49,6 +49,7 @@ def flight(tmp_path, request):
                '-p', f'guidance_source:={guidance_source}',
                '-p', 'image_time_domain:=ros',
                '-p', f'px4_time_domain:={config.get("px4_time_domain", "ros")}',
+               '-p', f'pixel_estimator:={config.get("pixel_estimator", "raw")}',
                '-p', f'attitude_sync:={str(config.get("attitude_sync", False)).lower()}']
     for topic in topics:
         command += ['-r', f'{topic}:={prefix}{topic}']
@@ -356,3 +357,47 @@ def test_native_clock_recovers_drifting_dds_epoch_before_slerp(flight):
     assert event.los_z == pytest.approx(math.pi / 2 - 0.2, abs=1e-4)
     assert event.attitude_before_time <= event.image_time_ros <= event.attitude_after_time
     assert event.attitude_after_time - event.attitude_before_time == pytest.approx(0.08, abs=1e-5)
+
+
+@pytest.mark.parametrize('flight', [
+    {'attitude_sync': True, 'pixel_estimator': 'kf'}], indirect=True)
+def test_pixel_kf_learns_image_motion_and_predicts_control_los(flight):
+    messages, publishers, pose, _, pump, wait, _, box = flight
+
+    def pose_stream():
+        pose.timestamp_sample = pose.timestamp = time.time_ns() // 1000
+        publishers['pose'].publish(pose)
+
+    pump(0.2, pose_stream)
+    origin = time.time_ns() - 60_000_000
+    for _ in range(20):
+        image_ns = time.time_ns() - 60_000_000
+        center = 960 + 200 * (image_ns - origin) / 1e9
+        box(x=round(center - 40), y=510, stamp_ns=image_ns)
+        pump(0.05, pose_stream)
+    wait(lambda: messages['observations'] and messages['observations'][-1].accepted,
+         action=pose_stream)
+    event = messages['observations'][-1]
+    assert event.estimator == VisionObservation.PIXEL_KF
+    assert event.estimated_du == pytest.approx(200, abs=60)
+    assert event.estimated_u > event.x + event.width / 2 + 5
+    assert event.control_los_z == pytest.approx(
+        math.atan2(1397.2, event.estimated_u - 960), abs=1e-4)
+    assert event.control_los_z < event.los_z - 0.003
+
+
+@pytest.mark.parametrize('flight', [
+    {'attitude_sync': True, 'pixel_estimator': 'kf'}], indirect=True)
+def test_pixel_kf_rejects_excessive_forecast_without_raw_fallback(flight):
+    messages, publishers, pose, _, pump, wait, state, box = flight
+
+    def pose_stream():
+        pose.timestamp_sample = pose.timestamp = time.time_ns() // 1000
+        publishers['pose'].publish(pose)
+
+    pump(0.6, pose_stream)
+    box(stamp_ns=time.time_ns() - 400_000_000)
+    wait(lambda: bool(messages['observations']), action=pose_stream)
+    assert messages['observations'][-1].status == VisionObservation.ESTIMATOR_UNAVAILABLE
+    assert not messages['observations'][-1].accepted
+    assert state('SEARCHING')

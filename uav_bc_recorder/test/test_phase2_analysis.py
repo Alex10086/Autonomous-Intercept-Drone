@@ -332,3 +332,23 @@ def test_source_error_statistics_respect_near_boundary_and_event_weighting():
     assert groups['near', 'LightTrack']['los_image_abs_z_deg_median'] == pytest.approx(3.5)
     assert groups['5_17m', 'YOLO']['los_events'] == 1
     assert groups['2_5m', 'LightTrack']['los_events'] == 1
+
+
+def test_prediction_compares_actual_control_los_without_relabeling_image_measurement():
+    samples = geometry_samples([
+        geometry_row(vehicle, time, x=(time - 100) * 3 if vehicle == 'target' else 0,
+                     y=3 if vehicle == 'target' else 0)
+        for time in (100, 100.1) for vehicle in ('self', 'target')
+    ])
+    row = align_observations([
+        observation(time=100.03, control_time=100.08, los_z=0.3,
+                    control_los_v=0, control_los_z=0.1, estimator=1)], samples)[0]
+    assert row['los_error_image_z_rad'] == pytest.approx(0.3 - math.atan2(0.09, 3))
+    assert row['raw_los_error_control_z_rad'] == pytest.approx(0.3 - math.atan2(0.24, 3))
+    assert row['los_error_control_z_rad'] == pytest.approx(0.1 - math.atan2(0.24, 3))
+    good = observation_metrics([row], 100, 0.1)
+    assert good['first_approach_prediction_z_improvement_deg_median'] == pytest.approx(math.degrees(0.2))
+    bad = align_observations([
+        observation(time=100.03, control_time=100.08, los_z=0.3,
+                    control_los_v=0, control_los_z=-0.4, estimator=1)], samples)[0]
+    assert observation_metrics([bad], 100, 0.1)['first_approach_prediction_z_improvement_deg_median'] < 0

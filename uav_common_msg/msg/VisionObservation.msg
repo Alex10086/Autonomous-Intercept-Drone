@@ -21,6 +21,7 @@ uint8 ATTITUDE_UNAVAILABLE=3
 uint8 INVALID_BOX=4
 uint8 NOT_GUIDING=5
 uint8 OUT_OF_ORDER=6
+uint8 ESTIMATOR_UNAVAILABLE=7
 uint8 status
 # Same enum as RectMsg.source: UNKNOWN=0, YOLO=1, LIGHTTRACK=2.
 uint8 source
@@ -35,3 +36,17 @@ float64 los_z
 # Counterfactual using the receipt-pose snapshot, for paired P0 diagnostics.
 float64 receive_pose_los_v
 float64 receive_pose_los_z
+# Raw image LOS above stays unchanged when prediction is enabled.
+uint8 PIXEL_RAW=0
+uint8 PIXEL_KF=1
+uint8 estimator
+float64 estimate_time_ros
+float64 estimated_u
+float64 estimated_v
+float64 estimated_du
+float64 estimated_dv
+float64 pixel_prediction_dt
+float64 attitude_prediction_dt
+# Actual LOS supplied to guidance; estimate epoch is explicit, not image epoch.
+float64 control_los_v
+float64 control_los_z

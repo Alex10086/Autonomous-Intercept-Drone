@@ -241,4 +241,23 @@ private:
     double last_received_ = 0.0;
 };
 
+// Short current-epoch attitude propagation, not a control-law change.
+inline bool propagate_attitude(const Eigen::Quaterniond &attitude,
+                               const Eigen::Vector3d &body_rates, double dt,
+                               Eigen::Matrix3d &rotation)
+{
+    const double norm_squared = attitude.squaredNorm();
+    if (!std::isfinite(dt) || dt < 0.0 || dt > 0.05 ||
+        !attitude.coeffs().allFinite() || !body_rates.allFinite() ||
+        !std::isfinite(norm_squared) || norm_squared < 1e-12) return false;
+    Eigen::Quaterniond predicted = attitude.normalized();
+    const double speed = body_rates.norm();
+    if (!std::isfinite(speed)) return false;
+    if (speed > 1e-12) {
+        predicted *= Eigen::Quaterniond(Eigen::AngleAxisd(speed * dt, body_rates / speed));
+    }
+    rotation = predicted.toRotationMatrix();
+    return rotation.allFinite();
+}
+
 }  // namespace vision_time

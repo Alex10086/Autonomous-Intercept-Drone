@@ -136,6 +136,8 @@ OBSERVATION_FIELDS = (
     'image_to_control_ms', 'clock_valid', 'accepted', 'attitude_synced', 'status',
     'source', 'confidence', 'x', 'y', 'width', 'height', 'los_v', 'los_z',
     'receive_pose_los_v', 'receive_pose_los_z',
+    'estimator', 'estimate_time_ros', 'estimated_u', 'estimated_v', 'estimated_du', 'estimated_dv',
+    'pixel_prediction_dt', 'attitude_prediction_dt', 'control_los_v', 'control_los_z',
 )
 
 
@@ -252,6 +254,13 @@ def align_observations(observations, samples):
                 if phase == 'image':
                     row[f'receive_pose_error_image_{axis}_rad'] = wrapped(
                         number(event, 'receive_pose_los_' + axis) - angle)
+                else:
+                    # Legacy records used raw image LOS for control; new records
+                    # explicitly preserve the actual predicted control LOS.
+                    control_key = 'control_los_' + axis
+                    control_los = number(event, control_key) if control_key in event else number(event, 'los_' + axis)
+                    row[f'raw_los_error_control_{axis}_rad'] = row[f'los_error_control_{axis}_rad']
+                    row[f'los_error_control_{axis}_rad'] = wrapped(control_los - angle)
         aligned.append(row)
     return annotate_observations(aligned)
 
@@ -295,6 +304,15 @@ def error_metrics(rows, prefix):
                 ('improvement_deg', [receipt - vision for vision, receipt in paired])):
             metrics[f'{key}_{label}_median'] = percentile(values, 0.5)
             metrics[f'{key}_{label}_p95'] = percentile(values, 0.95)
+        control_pairs = [(abs(math.degrees(row[f'raw_los_error_control_{axis}_rad'])),
+                          abs(math.degrees(row[f'los_error_control_{axis}_rad']))) for row in rows]
+        control_pairs = [(raw, estimated) for raw, estimated in control_pairs
+                         if math.isfinite(raw) and math.isfinite(estimated)]
+        key = f'{prefix}_prediction_{axis}'
+        metrics[key + '_count'] = len(control_pairs)
+        improvements = [raw - estimated for raw, estimated in control_pairs]
+        metrics[key + '_improvement_deg_median'] = percentile(improvements, 0.5)
+        metrics[key + '_improvement_deg_p95'] = percentile(improvements, 0.95)
     return metrics
 
 
@@ -417,22 +435,27 @@ def plot_observation_errors(aligned, path, intercept_start, closest_elapsed):
         from matplotlib.backends.backend_agg import FigureCanvasAgg
     except ImportError:
         return None
+    predicted = any(number(row, 'estimator') > 0 for row in aligned if row['accepted'])
+    fields = (('raw_los_error_control', 'Raw image held to control time'),
+              ('los_error_control', 'Predicted LOS at control time')) if predicted else (
+                  ('los_error_image', 'Image-time vision'),
+                  ('los_error_control', 'First-control-time vision'),
+                  ('receive_pose_error_image', 'Receipt-pose at image time'))
+    distance_field = 'control_distance_m' if predicted else 'image_distance_m'
     figure = Figure(figsize=(10, 7))
     FigureCanvasAgg(figure)
     for index, axis in enumerate(('v', 'z'), start=1):
         panel = figure.add_subplot(2, 1, index)
-        for field, label in (('los_error_image', 'Image-time vision'),
-                             ('los_error_control', 'First-control-time vision'),
-                             ('receive_pose_error_image', 'Receipt-pose at image time')):
-            points = [(row['image_distance_m'], abs(math.degrees(row[f'{field}_{axis}_rad'])))
+        for field, label in fields:
+            points = [(row[distance_field], abs(math.degrees(row[f'{field}_{axis}_rad'])))
                       for row in aligned if row['accepted'] and row['clock_valid']
                       and all(math.isfinite(number(row, key)) for key in ('image_time_ros', 'los_v', 'los_z'))
                       and intercept_start <= number(row, 'image_time_ros') <= intercept_start + closest_elapsed
-                      and 0.8 <= row['image_distance_m'] <= 17.0
+                      and 0.8 <= row[distance_field] <= 17.0
                       and math.isfinite(row[f'{field}_{axis}_rad'])]
             panel.scatter([point[0] for point in points], [point[1] for point in points],
                           s=8, alpha=0.6, label=label)
-        panel.set_xlabel('Image-time separation (m)')
+        panel.set_xlabel('Control-time separation (m)' if predicted else 'Image-time separation (m)')
         panel.set_ylabel(f'|{axis} residual| (deg)')
         panel.set_ylim(bottom=0)
         panel.legend()
@@ -509,6 +532,7 @@ def analyze_recording(recording, output):
         'recording':str(recording),'algorithm':meta['algorithm'],'group':requested.get('group'),
         'trial':requested.get('trial'),'vision_mode':requested.get('vision_mode'),'valid':valid,
         'attitude_sync':requested.get('attitude_sync'),
+        'pixel_estimator':requested.get('pixel_estimator', 'raw'),
         'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),
         'initial_self_velocity':initial.get('self_velocity_ned'),

@@ -92,6 +92,20 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     if (px4_time_domain_ != "gazebo_dds" && px4_time_domain_ != "ros") {
         throw std::invalid_argument("px4_time_domain must be gazebo_dds or ros");
     }
+    pixel_estimator_ = declare_parameter<std::string>("pixel_estimator", "raw");
+    const double pixel_std = declare_parameter<double>("pixel_measurement_std", 4.0);
+    const double acceleration_std = declare_parameter<double>("pixel_acceleration_std", 1000.0);
+    pixel_prediction_horizon_ = declare_parameter<double>("pixel_prediction_horizon", 0.3);
+    pixel_measurement_variance_ = pixel_std * pixel_std;
+    pixel_acceleration_variance_ = acceleration_std * acceleration_std;
+    if ((pixel_estimator_ != "raw" && pixel_estimator_ != "kf") ||
+        (pixel_estimator_ == "kf" && guidance_source_ == "vision" && !attitude_sync_) ||
+        !std::isfinite(pixel_measurement_variance_) || pixel_std <= 0.0 ||
+        !std::isfinite(pixel_acceleration_variance_) || acceleration_std <= 0.0 ||
+        !std::isfinite(pixel_prediction_horizon_) ||
+        pixel_prediction_horizon_ <= 0.0 || pixel_prediction_horizon_ > 0.5) {
+        throw std::invalid_argument("Invalid pixel estimator/noise/horizon; KF vision requires image attitude sync");
+    }
 
     focal_length_      = this->get_parameter("focal_length").as_double();
     image_width_       = this->get_parameter("image_width").as_int();
@@ -198,9 +212,17 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
             } else {
                 latest_attitude_time_ = msg->timestamp_sample * 1e-6;
             }
+            const Eigen::Quaterniond attitude(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
+            if (pixel_estimator_ == "kf") {
+                prediction_attitude_ = attitude;
+                prediction_body_rates_ = Eigen::Vector3d(msg->angular_velocity[0],
+                    msg->angular_velocity[1], msg->angular_velocity[2]);
+                prediction_attitude_valid_ = msg->pose_frame == VehicleOdometry::POSE_FRAME_NED &&
+                    std::isfinite(latest_attitude_time_);
+            }
             if (attitude_sync_ && msg->pose_frame == VehicleOdometry::POSE_FRAME_NED &&
                 attitude_history_.add(latest_attitude_time_, now().seconds(),
-                    Eigen::Quaterniond(msg->q[0], msg->q[1], msg->q[2], msg->q[3]),
+                    attitude,
                     msg->reset_counter)) {
                 clear_pending_observations();
                 last_image_time_ = std::numeric_limits<double>::quiet_NaN();
@@ -394,7 +416,7 @@ void VisionPNG::update_truth_guidance()
     state_ = VpngState::INTERCEPT;
     last_visual_observation_ = now;
     processed_truth_generation_ = truth_generation_;
-    png_calculate(R_b2n);
+    png_calculate(R_b2n, detect_x_ + detect_w_ / 2.0, detect_y_ + detect_h_ / 2.0);
 }
 
 double VisionPNG::observation_age() const
@@ -435,6 +457,11 @@ void VisionPNG::detection_callback(const RectMsg &msg)
     observation_.image_to_bbox_ms = observation_.image_to_control_ms = nan;
     observation_.los_v = observation_.los_z = nan;
     observation_.receive_pose_los_v = observation_.receive_pose_los_z = nan;
+    observation_.estimate_time_ros = nan;
+    observation_.estimated_u = observation_.estimated_v = nan;
+    observation_.estimated_du = observation_.estimated_dv = nan;
+    observation_.pixel_prediction_dt = observation_.attitude_prediction_dt = nan;
+    observation_.control_los_v = observation_.control_los_z = nan;
     observation_.source = msg.source;
     observation_.confidence = msg.confidence;
     observation_.x = msg.x;
@@ -509,6 +536,7 @@ void VisionPNG::detection_callback(const RectMsg &msg)
 
 void VisionPNG::clear_pending_observations()
 {
+    pixel_filter_.reset();
     while (pending_size_ != 0) {
         auto &event = pending_observations_[pending_begin_].data;
         event.status = event.ATTITUDE_UNAVAILABLE;
@@ -558,21 +586,59 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
                                 std::chrono::steady_clock::time_point received)
 {
     update_visual_state();
+    const double pixel_u = observation_.x + observation_.width / 2.0;
+    const double pixel_v = observation_.y + observation_.height / 2.0;
+    const Eigen::Vector2d measured_los = project_los(rotation, R_c2b_,
+        pixel_u - image_width_ / 2.0, pixel_v - image_height_ / 2.0, focal_length_);
+    observation_.los_v = measured_los.x();
+    observation_.los_z = measured_los.y();
+    observation_.estimated_u = pixel_u;
+    observation_.estimated_v = pixel_v;
+    observation_.estimate_time_ros = attitude_sync_ ? observation_.image_time_ros :
+        std::numeric_limits<double>::quiet_NaN();
+    observation_.pixel_prediction_dt = observation_.attitude_prediction_dt = 0.0;
+    Eigen::Matrix3d control_rotation = rotation;
+    if (pixel_estimator_ == "kf") {
+        const double estimate_time = now().seconds();
+        const double horizon = estimate_time - observation_.image_time_ros;
+        const double attitude_dt = estimate_time - latest_attitude_time_;
+        Eigen::Vector4d predicted;
+        if (state_ != VpngState::INTERCEPT) pixel_filter_.reset();
+        if (!observation_.clock_valid || !prediction_attitude_valid_ ||
+            horizon < 0.0 || horizon > pixel_prediction_horizon_ ||
+            !vision_time::propagate_attitude(prediction_attitude_, prediction_body_rates_,
+                attitude_dt, control_rotation) ||
+            !pixel_filter_.update(observation_.image_time_ros, Eigen::Vector2d(pixel_u, pixel_v),
+                pixel_measurement_variance_, pixel_acceleration_variance_) ||
+            !pixel_filter_.predict(estimate_time, pixel_prediction_horizon_, predicted)) {
+            observation_.status = observation_.ESTIMATOR_UNAVAILABLE;
+            observation_pub_->publish(observation_);
+            return;
+        }
+        observation_.estimator = observation_.PIXEL_KF;
+        observation_.estimate_time_ros = estimate_time;
+        observation_.estimated_u = predicted(0);
+        observation_.estimated_v = predicted(1);
+        observation_.estimated_du = predicted(2);
+        observation_.estimated_dv = predicted(3);
+        observation_.pixel_prediction_dt = horizon;
+        observation_.attitude_prediction_dt = attitude_dt;
+    }
     detect_x_ = observation_.x;
     detect_y_ = observation_.y;
     detect_w_ = observation_.width;
     detect_h_ = observation_.height;
-    // Waiting for attitude never refreshes source observation receipt freshness.
+    // Measurement receipt, never estimator execution, determines freshness.
     last_visual_observation_ = received;
     if (state_ != VpngState::INTERCEPT) png_initialized_ = false;
     state_ = VpngState::INTERCEPT;
-    png_calculate(rotation);
+    png_calculate(control_rotation, observation_.estimated_u, observation_.estimated_v);
     observation_.projection_time = now().seconds();
-    observation_.los_v = LOS_angle_v_;
-    observation_.los_z = LOS_angle_z_;
+    observation_.control_los_v = LOS_angle_v_;
+    observation_.control_los_z = LOS_angle_z_;
     if (!attitude_sync_) {
-        observation_.receive_pose_los_v = LOS_angle_v_;
-        observation_.receive_pose_los_z = LOS_angle_z_;
+        observation_.receive_pose_los_v = measured_los.x();
+        observation_.receive_pose_los_z = measured_los.y();
     }
     observation_.accepted = true;
     observation_.status = attitude_sync_ ?
@@ -586,15 +652,14 @@ void VisionPNG::apply_observation(const Eigen::Matrix3d &rotation,
 //  输入：像素坐标 detect_x_, detect_y_, detect_w_, detect_h_
 //  输出：d_v_angle_v_, d_v_angle_z_（期望速度角度）
 // ============================================================
-void VisionPNG::png_calculate(const Eigen::Matrix3d &R_b2n)
+void VisionPNG::png_calculate(const Eigen::Matrix3d &R_b2n, double pixel_u, double pixel_v)
 {
 
     // ---------- Step 1: 计算像素误差（相对图像中心）----------
     double cx = image_width_  / 2.0;
     double cy = image_height_ / 2.0;
-    // bbox 中心
-    ex_ = (detect_x_ + detect_w_ / 2.0) - cx;
-    ey_ = (detect_y_ + detect_h_ / 2.0) - cy;
+    ex_ = pixel_u - cx;
+    ey_ = pixel_v - cy;
 
     // Camera/body -> NED, with the rotation chosen at the observation epoch.
     const Eigen::Vector2d los = project_los(R_b2n, R_c2b_, ex_, ey_, focal_length_);
@@ -686,8 +751,8 @@ void VisionPNG::png_calculate(const Eigen::Matrix3d &R_b2n)
     data.yaw           = static_cast<float>(std::atan2(R_b2n(1, 0), R_b2n(0, 0)));
     data.pitch         = static_cast<float>(std::asin(std::clamp(-R_b2n(2, 0), -1.0, 1.0)));
     data.roll          = static_cast<float>(std::atan2(R_b2n(2, 1), R_b2n(2, 2)));
-    data.pixel_u       = (float)(detect_x_ + detect_w_ / 2.0);
-    data.pixel_v       = (float)(detect_y_ + detect_h_ / 2.0);
+    data.pixel_u       = static_cast<float>(pixel_u);
+    data.pixel_v       = static_cast<float>(pixel_v);
     data.vel_total     = (float)Vt.norm();
     data_pub_->publish(data);
 

@@ -34,6 +34,11 @@ uav_vision_png:
     px4_time_domain: "gazebo_dds"
     # Image-epoch quaternion SLERP. false is the explicit receipt-pose A/B control.
     attitude_sync: true
+    # P2 single-variable A/B. Raw remains default until flight evidence supports KF.
+    pixel_estimator: "raw"
+    pixel_measurement_std: 4.0       # pixels; same for YOLO/LightTrack in P2
+    pixel_acceleration_std: 1000.0   # pixels/s^2
+    pixel_prediction_horizon: 0.3    # seconds; reject longer forecasts
 
 
     # ---- 起飞参数 ----

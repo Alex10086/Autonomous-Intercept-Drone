@@ -422,6 +422,14 @@ P1 另输出 `*_source_metrics.csv`（按 YOLO/LightTrack、首次接近及距�
 
 数据根目录为 `~/intercept_ws/experiment_data/p0_native_ab/`（receipt、image invalid、image_repeat 及统一 analysis）与 `p0_native_clock_validation/2026-10-16_00-14-52/`。此前未撤销 DDS 平滑偏移的记录仅供排查，不用于同步精度改善结论。固定制导二进制 SHA256 为 `711aea5041d9ad3907de005824edf985643dc5c0a7544b0d5a63066ed3b4b09d`，检测器为 `6e1c6c47ddd9137f7d03c94d3f61405502cf9aff7029985b92d56a608478ce6a`；本阶段只增加离线分析，未改变这两个二进制。
 
+**P2 像素 KF / 延迟预测**
+
+`--pixel-estimator raw` 保留 P0 路径；`--pixel-estimator kf --attitude-sync image` 启用 `[u,v,du,dv]` 常速度 KF，每张图像只在其映射后的拍摄时刻更新一次，再预测到本次控制计算时刻。P2 两种观测来源使用相同噪声：`pixel_measurement_std=4 px`、`pixel_acceleration_std=1000 px/s²`；预测最长 `pixel_prediction_horizon=0.3 s`，失锁/时钟重置切断历史。控制时刻姿态由最新有效 odometry quaternion 与 body-FRD 角速度传播，最长 50 ms；不匹配、过期或预测失败时显式拒绝，不回退成未经声明的 raw 控制。没有改变 PNG/FOV 增益、Yaw PD 的 dt 口径、PX4 控制接口或目标条件，默认仍为 raw。
+
+`los_v/z` 始终保留原始图像 LOS；新增 `control_los_v/z` 是实际进入制导的 LOS，`estimate_time_ros`、`estimated_u/v`、`estimated_du/dv`、`pixel_prediction_dt`、`attitude_prediction_dt` 使预测时刻/来源可追溯。分析在相同控制真值上比较“保持原图像 LOS”与“预测 LOS”，`*_prediction_*_improvement_deg_*` 正值才表示预测改善，不把不同时间的误差当作同一指标。预测模式的误差—距离图也使用同一控制时刻的成对残差。
+
+直接在旋转相机像素上使用 CV 的首轮完整试验（`p2_kf_validation/2026-10-16_00-53-40/`）未命中，首次最近距离 9.949 m，没有进入 5 m 近接窗口；全首次接近的成对预测收益中位数为垂直 −0.927°、方位 −0.319°，是负向结果，不能填补成末端成功。该轮图像→bbox / 控制中位延迟分别 66.4 / 68.7 ms。接下来先隔离自身旋转引入的像素运动，再继续评估；不把坏的预测路径设为默认，也不靠 P3 噪声加权掩盖 P2 的模型问题。
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash
