@@ -124,6 +124,14 @@ Verified combination: Jazzy, Gazebo Harmonic 8.11.0, PX4 v1.16.0, and Micro-XRCE
 Version and configuration requirements:
 
 * Pin PX4 to `v1.16.0` (`6ea3539157ca358c70a515878b77077af7d4611d`), with the default source directory `~/PX4-Autopilot`.
+* Before building this version, apply `patches/px4-v1.16.0-imu-first-sample.patch`: the first IMU sample must seed the integrator, not integrate the elapsed time since boot. On a clean, unpatched PX4 checkout:
+
+  ```bash
+  git -C ~/PX4-Autopilot apply \
+    ~/intercept_ws/src/Autonomous-Intercept-Drone/patches/px4-v1.16.0-imu-first-sample.patch
+  ```
+
+  Rebuild PX4 using the commands below; rebuilding ROS packages alone does not update the flight controller. Do not apply the patch twice.
 * Use `px4_msgs` from `release/1.16` at `392e831c1f659429ca83902e66820d7094591410`; all 226 message definitions match this firmware. Restore submodules with `git submodule update --init px4_msgs px4_ros_com`.
 * The firmware publishes `/px4_N/fmu/out/vehicle_status_v1`, not the old unversioned status topic.
 * `uav_vision_png` also needs the following entry in the firmware's `src/modules/uxrce_dds_client/dds_topics.yaml` under `publications`, followed by a firmware rebuild:
@@ -135,6 +143,8 @@ Version and configuration requirements:
 
 * The DDS Agent may be installed to `~/.local/opt/intercept/agent`, with its command linked into `~/.local/bin/MicroXRCEAgent`. Reuse Jazzy's Fast-DDS 2.14 / Fast-CDR 2.2, but use upstream spdlog v1.9.2 for Agent v2.4.3 rather than the host's incompatible spdlog 1.12 / fmt 9.
 * Keep a real [QGroundControl ground station](https://docs.qgroundcontrol.com/Stable_V5.1/en/qgc-user-guide/getting_started/download_and_install.html) connected. PX4 may reject arming without it; do not replace the missing connection by disabling preflight checks or forcing arming.
+* `run_swarm.sh` sets the same height configuration for both vehicles: `EKF2_HGT_REF=0` (barometer), `EKF2_GPS_CTRL=5` (GNSS horizontal position and 3D velocity, without GNSS altitude fusion), `EKF2_GPS_DELAY=0` (matching Gazebo's current-time samples), and `EKF2_BARO_NOISE=0.3 m`. Both models have barometers and no downward range sensor. Measured barometric altitude noise relative to ground truth is approximately 0.15 m standard deviation, rather than the estimator's previous 3.5 m setting. These are project-specific SITL settings, not hardware recommendations; simulated sensor noise and safety checks remain enabled.
+* For stationary height acceptance, wait for both ground-height and vertical-velocity estimates to converge before recording each vehicle's own ground local z. Neither `z_valid` nor subtracting independent local z values proves physical relative height; validate named-model Gazebo world z instead. Formal Vision PNG comparisons remain paused until the visual chain also passes validation.
 * Link the repository once at `~/intercept_ws/src/Autonomous-Intercept-Drone`. Do not separately link the same dependency packages.
 
 Build PX4 with an isolated Python environment instead of modifying system Python. For the prepared environment:
@@ -313,6 +323,23 @@ ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
 Each trial starts fresh real dual SITL, actual CUDA detection, target/guidance nodes, and compare recording. The supervisor never injects detections or PX4 velocity setpoints. The target first stabilizes at its initial circle point, both vehicles settle, and target motion accepts a future ROS epoch. Takeover uses a fixed motion age/phase and explicit external release, with unchanged PNG gains.
 
 Defaults: circle radius 5 m, initial phase 0, signed angular velocity +0.5 rad/s; release is scheduled one orbit plus commanded phase 4.4 rad after motion starts. Requested near/far distances are approximately 16.8/24 m, with target 0.3 m below self. Commanded versus measured phase are distinct metadata. Readiness, distance, height, detection, or release-time violations stop and preserve an invalid trial instead of silently counting it. Simulation spawn poses use `PX4_SELF_POSE` / `PX4_TARGET_POSE`.
+
+The `phase2_fixed_circle_v2` entry protocol captures each vehicle's disarmed ground local z before starting controllers. It waits at most 30 seconds for approximately 2 seconds with a range no greater than 0.05 m, then uses the median as `self_ground_z`/`target_ground_z`. Defaults are `self_target_z = self_ground_z - 5.3` and `target_target_z = target_ground_z - 5.0`. Controllers receive these compensated targets; the runner checks self readiness against the same `self_target_z`. `--self-altitude` now means negative NED displacement above the vehicle's own ground datum, not absolute local z. All four values and capture ranges enter protocol/recorder experiment conditions. Relative height is still accepted using GPS geometry, never by subtracting independently referenced local z values.
+
+Detector readiness requires the last valid receipt age to be `<0.15 s` and at least three valid detections within the last `<0.3 s`. Invalid messages neither refresh valid time nor clear the window; old timestamps expire naturally.
+
+For entry-only smoke verification, without an interception success-rate experiment:
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --out-root "$HOME/intercept_ws/experiment_data/phase2_entry_smoke" \
+  --groups near --trials 3 --smoke
+```
+
+Smoke holds the target at READY, waits for self readiness, GPS height within the original `0.3±0.18 m` tolerance, and detector-window readiness, then releases and records only 2 seconds after entry. Metadata marks `mode: entry_smoke`; these runs are not formal circle phase/range or hit-rate trials. Normal phase/range/height gates are unchanged. Failed attempts are retained and stop the batch, with no automatic retries.
+
+Height-reference caveat: the former Drone1-only `EKF2_HGT_REF=2` selected a range sensor that these models do not provide. Both vehicles now use the barometric configuration and PX4 IMU initialization patch described in section 2.1. Ground-datum compensation does not guarantee absence of subsequent estimator drift, so GPS height acceptance remains required; the stricter stationary validation also checks Gazebo ground truth.
+
 
 Sessions live beneath `~/intercept_ws/experiment_data/phase2/`, preserving protocol/result JSON, process logs, and independent recorder directories. Analyze sessions with:
 

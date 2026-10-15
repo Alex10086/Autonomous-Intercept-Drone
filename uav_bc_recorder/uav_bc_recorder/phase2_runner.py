@@ -4,6 +4,7 @@ This is an experiment supervisor, not a guidance controller. It never publishes
 PX4 setpoints or fabricated detections. Every flight uses the actual detector.
 """
 import argparse
+from collections import deque
 from datetime import datetime
 from functools import partial
 import json
@@ -11,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import statistics
 import signal
 import subprocess
 import time
@@ -37,8 +39,7 @@ class TrialMonitor(Node):
         self.latest = {}
         self.target_state = {}
         self.telemetry = None
-        self.valid_detections = 0
-        self.last_detection_time = None
+        self.valid_detection_times = deque()
         self._owned_subscriptions = []
         for ident in (1, 2):
             for suffix, cls in [('vehicle_gps_position', SensorGps),
@@ -74,12 +75,9 @@ class TrialMonitor(Node):
     def _detect(self, message):
         now = time.monotonic()
         if message.width > 0 and message.height > 0:
-            self.valid_detections = (self.valid_detections + 1
-                if self.last_detection_time is not None and now-self.last_detection_time < 0.2 else 1)
-            self.last_detection_time = now
-        else:
-            self.valid_detections = 0
-            self.last_detection_time = None
+            self.valid_detection_times.append(now)
+        while self.valid_detection_times and now-self.valid_detection_times[0] >= 0.3:
+            self.valid_detection_times.popleft()
         self._receive('detection', message)
 
     def fresh(self, key, timeout=0.5):
@@ -108,8 +106,20 @@ class TrialMonitor(Node):
                 and telemetry.state in ('TAKEOFF','SEARCHING'))
 
     def detector_ready(self):
-        return (self.valid_detections >= 3 and self.last_detection_time is not None
-                and time.monotonic()-self.last_detection_time < 0.15)
+        now = time.monotonic()
+        while self.valid_detection_times and now-self.valid_detection_times[0] >= 0.3:
+            self.valid_detection_times.popleft()
+        return (len(self.valid_detection_times) >= 3
+                and now-self.valid_detection_times[-1] < 0.15)
+
+    def ground_z(self, ident):
+        local = self.fresh(f'{ident}:vehicle_local_position')
+        status = self.fresh(f'{ident}:vehicle_status_v1', 2.0)
+        if (local is None or status is None or not local.z_valid
+                or not math.isfinite(local.z)
+                or status.arming_state != VehicleStatus.ARMING_STATE_DISARMED):
+            return None
+        return float(local.z)
 
     def ros_now(self):
         return self.get_clock().now().nanoseconds*1e-9
@@ -177,17 +187,18 @@ def run_trial(args, session, group, index):
                PX4_TARGET_POSE=f'{center_e},0', GZ_PARTITION=f'phase2_{session.name}_{group}_{index}',
                HEADLESS='1')
     protocol = {
-        'protocol':'phase2_fixed_circle_v1','group':group,'trial':index,'algorithm':args.algorithm,
+        'protocol':'phase2_fixed_circle_v2','group':group,'trial':index,'algorithm':args.algorithm,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
         'circle_initial_phase':0.0,'circle_angular_velocity':0.5,'circle_radius':5.0,
         'circle_release_command_phase':args.release_phase,
         'motion_age_at_release':(2*math.pi+args.release_phase)/0.5,
-        'target_altitude_ned':-5.0,'self_altitude_ned':args.self_altitude,
+        'self_height_above_ground':-args.self_altitude,'target_height_above_ground':5.0,
+        'mode':'entry_smoke' if args.smoke else 'intercept',
         'self_spawn_pose':'0,0','target_spawn_pose':f'{center_e},0',
         'standby_yaw':math.pi/2,'takeoff_altitude_tolerance':0.08,
         'takeoff_speed_tolerance':0.2,'takeoff_settle_time':2.0,
-        'entry_condition':'scheduled epoch; both stable first; target moving; fresh GPS; 3 valid detections for Vision',
+        'entry_condition':'scheduled epoch; both stable first; target moving; fresh GPS; last valid detection <150ms and >=3 valid detections in 300ms for Vision',
         'PNG_gains':'unchanged defaults: N_png=kv=kz=4, d_gain=2, yaw=.0008/.0002, k_ey=.0056',
         'speed_cmd':5.0,'hit_radius':0.8,'post_hit_duration':2.0,
     }
@@ -226,52 +237,105 @@ def run_trial(args, session, group, index):
         wait_for(lambda: all(monitor.fresh(f'{i}:vehicle_gps_position') is not None
                              and monitor.fresh(f'{i}:vehicle_status_v1',2.0) is not None for i in (1,2)),
                  100,'dual PX4 ready')
+        # Capture each aircraft's own local datum before either controller can arm.
+        wait_for(lambda: all(monitor.ground_z(i) is not None for i in (1,2)),
+                 15,'disarmed ground positions ready')
+        ground_samples = {1:deque(),2:deque()}
+        ground_deadline = time.monotonic()+30.0
+        while True:
+            step()
+            now = time.monotonic()
+            for ident, samples in ground_samples.items():
+                z = monitor.ground_z(ident)
+                if z is None:
+                    raise RuntimeError('ground position became invalid or aircraft armed during datum capture')
+                samples.append((now,z))
+                while len(samples)>1 and samples[1][0]<=now-2.0:
+                    samples.popleft()
+            if all(now-samples[0][0]>=2.0
+                   and max(z for _,z in samples)-min(z for _,z in samples)<=0.05
+                   for samples in ground_samples.values()):
+                break
+            if now>=ground_deadline:
+                raise RuntimeError('timeout waiting for stable ground local z (2s range <=0.05m)')
+        ground_samples = {i:[z for _,z in samples] for i,samples in ground_samples.items()}
+        self_ground_z = statistics.median(ground_samples[1])
+        target_ground_z = statistics.median(ground_samples[2])
+        self_target_z = self_ground_z+args.self_altitude
+        target_target_z = target_ground_z-5.0
+        protocol.update(
+            self_ground_z=self_ground_z,target_ground_z=target_ground_z,
+            self_target_z=self_target_z,target_target_z=target_target_z,
+            self_altitude_ned=self_target_z,target_altitude_ned=target_target_z,
+            ground_capture={'method':'median disarmed local z after 2s range <=0.05m',
+                            'ros_time':monitor.ros_now(),
+                            'ranges':{str(i):[min(z),max(z)] for i,z in ground_samples.items()}})
+        write_json(trial/'protocol.json',protocol)
+        print(f'{trial.name}: ground z self={self_ground_z:.3f} target={target_ground_z:.3f}; '
+              f'target z self={self_target_z:.3f} target={target_target_z:.3f}',flush=True)
+        duration = 2.0 if args.smoke else args.duration
         recorder=owned.start('recorder',ros_command('uav_bc_recorder','experiment_recorder',{
             'out_dir':str(trial/'recording'),'algorithm':args.algorithm,'profile':'compare',
             'target_motion':'circle','experiment_id':f'{group}_{index:02d}',
-            'max_duration':args.duration,'start_timeout':180.0,'post_hit_duration':2.0}))
+            'max_duration':duration,'start_timeout':180.0,'post_hit_duration':2.0}))
         owned.start('target',ros_command('uav_target_sim','uav_target_sim',{
             'motion_mode':'circle','defer_motion':True,'circle_initial_phase':0.0,
-            'circle_angular_velocity':0.5,'circle_radius':5.0,'target_altitude':-5.0,
+            'circle_angular_velocity':0.5,'circle_radius':5.0,'target_altitude':target_target_z,
             'takeoff_position_tolerance':0.1,'takeoff_speed_tolerance':0.2,'stability_duration':2.0}))
         # Real inference remains enabled for both algorithms to keep process load comparable.
         owned.start('detector',ros_command('uav_vision_dectect','uav_vision_dectect',{
             'show_debug_window':False,'use_cuda':True}))
         package='uav_vision_png' if args.algorithm=='vision_png' else 'uav_png_intercept'
         owned.start('guidance',ros_command(package,package,{
-            'require_experiment_start':True,'standby_altitude':args.self_altitude,
+            'require_experiment_start':True,'standby_altitude':self_target_z,
             'standby_yaw':math.pi/2,'takeoff_altitude_tolerance':0.08,
             'takeoff_speed_tolerance':0.2,'takeoff_settle_time':2.0,
             'speed_cmd':5.0,'N_png':4.0,'hit_radius':0.8}))
         wait_for(lambda: monitor.target_state.get('state')=='READY'
                  and monitor.target_state.get('stable') is True
-                 and monitor.self_ready(args.self_altitude),100,'both stabilized')
-        schedule=monitor.ros_now()+1.0
-        protocol['scheduled_target_start_ros_time']=schedule
-        protocol['scheduled_intercept_release_ros_time']=schedule+protocol['motion_age_at_release']
-        write_json(trial/'protocol.json',protocol)
-        wait_for(lambda: monitor.target_state.get('motion_start_ros_time')==schedule,3,'circle schedule accepted')
-        release_epoch=protocol['scheduled_intercept_release_ros_time']
-        wait_for(lambda: monitor.ros_now()>=release_epoch,protocol['motion_age_at_release']+3,'release epoch reached')
+                 and monitor.self_ready(self_target_z),100,'both stabilized')
+        if args.smoke:
+            # Entry smoke isolates startup prerequisites, not circle takeover range.
+            def smoke_ready():
+                geometry = monitor.gps_geometry()
+                return (monitor.self_ready(self_target_z)
+                        and monitor.target_state.get('state')=='READY'
+                        and monitor.target_state.get('stable') is True
+                        and geometry is not None and abs(geometry['height_difference']-0.3)<=0.18
+                        and (args.algorithm!='vision_png' or monitor.detector_ready()))
+            wait_for(smoke_ready,15,'GPS height and entry prerequisites ready')
+            release_epoch=monitor.ros_now()
+            protocol.update(entry_condition='entry smoke: target holds READY; self ready; GPS height within original tolerance; detector recent-valid window ready',
+                            distance_gate_applied=False,target_motion_started=False,
+                            scheduled_intercept_release_ros_time=release_epoch)
+        else:
+            schedule=monitor.ros_now()+1.0
+            protocol['scheduled_target_start_ros_time']=schedule
+            protocol['scheduled_intercept_release_ros_time']=schedule+protocol['motion_age_at_release']
+            write_json(trial/'protocol.json',protocol)
+            wait_for(lambda: monitor.target_state.get('motion_start_ros_time')==schedule,3,'circle schedule accepted')
+            release_epoch=protocol['scheduled_intercept_release_ros_time']
+            wait_for(lambda: monitor.ros_now()>=release_epoch,protocol['motion_age_at_release']+3,'release epoch reached')
         geometry=monitor.gps_geometry()
         if geometry is None:
             raise RuntimeError('invalid GPS geometry at scheduled release')
         entry={**geometry,'ros_time':monitor.ros_now(), 'target_state':monitor.target_state,
-               'detector_ready':monitor.detector_ready(),'self_ready':monitor.self_ready(args.self_altitude)}
+               'detector_ready':monitor.detector_ready(),'self_ready':monitor.self_ready(self_target_z)}
         protocol['actual_release']=entry
         target_local = monitor.fresh('2:vehicle_local_position')
         if target_local is not None:
             entry['actual_target_phase_rad'] = math.atan2(target_local.y, target_local.x)
             entry['actual_target_radius_m'] = math.hypot(target_local.x, target_local.y)
         write_json(trial/'protocol.json',protocol)
-        if not entry['self_ready'] or monitor.target_state.get('state')!='MOVING':
-            raise RuntimeError('scheduled takeover readiness violated')
-        if abs(geometry['distance']-requested_distance)>protocol['distance_tolerance']:
+        expected_target_state='READY' if args.smoke else 'MOVING'
+        if not entry['self_ready'] or monitor.target_state.get('state')!=expected_target_state:
+            raise RuntimeError('takeover readiness violated')
+        if not args.smoke and abs(geometry['distance']-requested_distance)>protocol['distance_tolerance']:
             raise RuntimeError(f"takeover distance outside protocol: {geometry['distance']}")
         if abs(geometry['height_difference']-0.3)>protocol['height_tolerance']:
             raise RuntimeError(f"takeover height difference outside protocol: {geometry['height_difference']}")
         if args.algorithm=='vision_png' and not entry['detector_ready']:
-            raise RuntimeError('no stable valid detection at fixed release phase; trial invalid')
+            raise RuntimeError('no recent valid detection window at release; trial invalid')
         release_value=True
         wait_for(lambda: monitor.telemetry is not None and monitor.telemetry.state=='INTERCEPT',0.8,'INTERCEPT entered')
         protocol['observed_intercept_ros_time']=monitor.ros_now()
@@ -280,8 +344,9 @@ def run_trial(args, session, group, index):
             raise RuntimeError('controller entered INTERCEPT too late for fixed-phase protocol')
         results['valid']=True
         write_json(trial/'protocol.json',protocol)
-        # Finish includes the configured post-hit tail; never stop producers at first hit.
-        deadline=time.monotonic()+args.duration+15
+        # Smoke observes entry for 2s only; it is not an interception outcome trial.
+        # Normal trials include the configured post-hit tail before finalization.
+        deadline=time.monotonic()+duration+15
         while recorder.poll() is None:
             if time.monotonic()>deadline:
                 raise RuntimeError('recorder did not finish within duration plus tail/finalization allowance')
@@ -323,13 +388,18 @@ def main(argv=None):
     parser.add_argument('--near-center-e',type=float,default=19.8)
     parser.add_argument('--far-center-e',type=float,default=27.0)
     parser.add_argument('--release-phase',type=float,default=4.4)
-    parser.add_argument('--self-altitude',type=float,default=-5.3)
+    parser.add_argument('--self-altitude',type=float,default=-5.3,
+                        help='NED displacement above own measured ground datum (must be negative)')
+    parser.add_argument('--smoke',action='store_true',
+                        help='Check entry with target holding READY, record 2s; no circle range/phase or hit-rate experiment')
     args=parser.parse_args(argv)
     if args.trials<1 or args.duration<=0 or not math.isfinite(args.duration):
         parser.error('trials and finite duration must be positive')
     for name in ('near_center_e','far_center_e','release_phase','self_altitude'):
         if not math.isfinite(getattr(args,name)):
             parser.error(f'{name} must be finite')
+    if args.self_altitude>=0:
+        parser.error('self_altitude must be a negative displacement above ground')
     session=args.out_root/datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     session.mkdir(parents=True)
     print(f'PHASE2_SESSION={session}',flush=True)

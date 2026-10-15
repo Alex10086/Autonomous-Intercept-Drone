@@ -14,6 +14,13 @@ PX4_ROOT="${PX4_ROOT:-$HOME/PX4-Autopilot}"
 # Reproducible experiments may override spawn poses without editing PX4 files.
 PX4_SELF_POSE="${PX4_SELF_POSE:-0,0}"
 PX4_TARGET_POSE="${PX4_TARGET_POSE:-20,0}"
+# Both models have barometers but no downward range sensor. Keep one height datum.
+# Gazebo GNSS is stamped at receipt; retain horizontal/3D-velocity aiding, not altitude.
+# 0.3 m conservatively covers the measured ~0.15 m barometric altitude noise.
+export PX4_PARAM_EKF2_HGT_REF=0
+export PX4_PARAM_EKF2_GPS_CTRL=5
+export PX4_PARAM_EKF2_GPS_DELAY=0
+export PX4_PARAM_EKF2_BARO_NOISE=0.3
 cd "$PX4_ROOT"
 
 # -------------------------------------------------------
@@ -81,7 +88,6 @@ PX4_GZ_WORLD=grass_world \
 PX4_SYS_AUTOSTART=4002 \
 PX4_GZ_MODEL_POSE="$PX4_SELF_POSE" \
 PX4_SIM_MODEL=gz_x500_depth \
-PX4_PARAM_EKF2_HGT_REF=2 \
     setsid bash -o pipefail -c './build/px4_sitl_default/bin/px4 -d -i 1 2>&1 | rotatelogs -n "$1" drone1.log "$2"' \
     bash "$LOG_MAX_FILES" "$LOG_MAX_SIZE" &
 PID1=$!

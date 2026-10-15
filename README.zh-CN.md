@@ -128,6 +128,14 @@ source install/setup.bash
 版本与配置要求：
 
 * PX4 固件固定为 `v1.16.0`（`6ea3539157ca358c70a515878b77077af7d4611d`），源码目录默认为 `~/PX4-Autopilot`。
+* 构建此版本前，应用仓库中的 `patches/px4-v1.16.0-imu-first-sample.patch`：IMU 首包只初始化积分器，不能把开机以来的时间当成采样间隔。对尚未应用补丁的干净 PX4 源码执行：
+
+  ```bash
+  git -C ~/PX4-Autopilot apply \
+    ~/intercept_ws/src/Autonomous-Intercept-Drone/patches/px4-v1.16.0-imu-first-sample.patch
+  ```
+
+  然后按下方命令重新构建 PX4；只重新编译 ROS 包不会更新飞控。已经应用过的源码不要重复应用。
 * `px4_msgs` 使用 `release/1.16` 的 `392e831c1f659429ca83902e66820d7094591410`，其 226 个消息定义与上述固件一致。执行 `git submodule update --init px4_msgs px4_ros_com` 补齐子模块。
 * 该固件的飞行状态话题为 `/px4_N/fmu/out/vehicle_status_v1`，不是无版本后缀的旧话题。
 * `uav_vision_png` 需要额外发布悬停推力估计。在 PX4 的 `src/modules/uxrce_dds_client/dds_topics.yaml` 的 `publications` 中添加以下条目后重新编译：
@@ -139,6 +147,8 @@ source install/setup.bash
 
 * DDS Agent 可安装至 `~/.local/opt/intercept/agent`，并链接命令到 `~/.local/bin/MicroXRCEAgent`。Jazzy 的 Fast-DDS 2.14 / Fast-CDR 2.2 可复用；Agent v2.4.3 使用上游 spdlog v1.9.2，不能直接替换为本机 spdlog 1.12 / fmt 9。
 * 保持真实的 [QGroundControl 地面站](https://docs.qgroundcontrol.com/Stable_V5.1/en/qgc-user-guide/getting_started/download_and_install.html)连接。未连接地面站时 PX4 可能拒绝解锁；不要用关闭预检或强制解锁代替缺失的连接。
+* `run_swarm.sh` 为两机统一设置 `EKF2_HGT_REF=0`（气压）、`EKF2_GPS_CTRL=5`（GNSS 水平位置和三维速度，不融合 GNSS 高度）、`EKF2_GPS_DELAY=0`（匹配 Gazebo 的当前时刻采样）及 `EKF2_BARO_NOISE=0.3 m`。两种模型均有气压计，没有向下测距仪；气压高度相对真值的实测噪声标准差约为 0.15 m，不能沿用 3.5 m 的测量噪声配置。此设置只针对本项目的 SITL 环境，不是实机推荐参数；未移除仿真传感器噪声，也未禁用安全预检。
+* 静止高度验收须先等待两机地面高度及垂向速度估计收敛，再分别采集各自的地面 local z。`z_valid` 或两机 local z 相减都不能证明真实高差；验收使用按模型名提取的 Gazebo world z。视觉链路尚未通过验证时，不恢复正式 Vision PNG 对比。
 * 源码只需链接一次到 `~/intercept_ws/src/Autonomous-Intercept-Drone`；不要同时链接同一组依赖包，以免出现重复包。
 
 使用独立 Python 环境构建 PX4，避免修改系统 Python。已有环境的构建命令：
@@ -330,6 +340,23 @@ ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
 每轮新建真实双机 SITL，并启动真实 CUDA 检测、目标控制、制导和 compare 记录；不会注入虚假检测或代发 PX4 速度指令。目标先在初始圆周点起飞稳定，双方达到位置/速度稳定条件后，再接受未来 ROS epoch 的圆周启动指令；接管使用固定运动年龄、circle 相位和外部放行条件。PNG 增益保持默认不变。
 
 默认 circle 半径 5 m、初始相位 0、角速度 +0.5 rad/s；目标启动后一整圈再到指令相位 4.4 rad 时安排接管。默认请求距离为 near 约 16.8 m、far 约 24 m，高度差约 0.3 m。指令相位与目标实际运动相位分别保存；实际距离、高度、检测或入场时序不满足协议会中止并保留无效试验，不冒充有效样本。`run_swarm.sh` 可通过 `PX4_SELF_POSE` / `PX4_TARGET_POSE` 配置仿真初始位置。
+
+入口协议 `phase2_fixed_circle_v2` 在任何控制节点启动前，分别采集两机未解锁时的地面 local z；要求连续约 2 秒波动不超过 0.05 m，最多等待 30 秒，再取中位数作为 `self_ground_z`／`target_ground_z`。默认生成 `self_target_z = self_ground_z - 5.3`、`target_target_z = target_ground_z - 5.0`，将补偿后的值传给控制节点，并让 runner 的 self ready 检查使用同一个 `self_target_z`。`--self-altitude` 现在表示相对本机地面的负 NED 位移，不是绝对 local z。四个高度值及采样范围会进入 `protocol.json` 和 recorder 的实验条件；真实相对高度仍由 GPS geometry 验收，不相减两机 local z。
+
+检测就绪条件为最后有效检测接收年龄 `<0.15 s`，且最近 `<0.3 s` 内至少收到 3 次有效检测。invalid 不刷新有效时间、不清空窗口；旧时间戳会自然过期。
+
+只验证入口、暂不做命中率实验时：
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --out-root "$HOME/intercept_ws/experiment_data/phase2_entry_smoke" \
+  --groups near --trials 3 --smoke
+```
+
+`--smoke` 让目标保持起飞后的 READY 位置，等待 self ready、GPS 高差在原有 `0.3±0.18 m` 范围内及检测窗口就绪，然后放行，仅记录接管后的 2 秒。元数据标记 `mode: entry_smoke`，不执行正式 circle 相位／距离对照，不计入命中率。正式模式的相位、距离及高度门槛不变；失败尝试保留并中止本批次，不自动补跑。
+
+高度参考说明：此前仅 Drone1 设置的 `EKF2_HGT_REF=2` 选择了模型未提供的测距传感器；现已改为两机统一的气压高度配置，并配合 2.1 节的 PX4 IMU 初始化补丁。地面基准补偿仍不能保证估计器后续不会漂移，GPS 高差门槛保持不变；更严格的静止高度验收还需核对 Gazebo 真值。
+
 
 结果默认保存在 `~/intercept_ws/experiment_data/phase2/时间戳/`。每轮保留 `protocol.json`、`result.json`、各进程日志及独立 recorder 目录；重复组别/次数均可由参数指定。对该会话目录运行：
 
