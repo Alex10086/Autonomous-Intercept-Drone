@@ -1,0 +1,60 @@
+/experiment/telemetry:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/vpng_data:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/camera_detect_result:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/out/vehicle_odometry:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/out/vehicle_local_position:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/out/vehicle_gps_position:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_2/fmu/out/vehicle_local_position:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_2/fmu/out/vehicle_gps_position:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/in/trajectory_setpoint:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/in/vehicle_thrust_setpoint:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/px4_1/fmu/in/vehicle_torque_setpoint:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/clock:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100

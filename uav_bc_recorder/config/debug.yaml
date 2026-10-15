@@ -1,0 +1,9 @@
+experiment_recorder:
+  ros__parameters:
+    profile: debug
+    scenario: intercept
+    algorithm: vision_png
+    out_dir: experiment_data
+    sample_rate: 20.0
+    topic_timeout: 1.0
+    max_duration: 120.0

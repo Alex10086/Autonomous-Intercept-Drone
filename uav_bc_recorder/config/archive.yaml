@@ -1,0 +1,13 @@
+experiment_recorder:
+  ros__parameters:
+    profile: archive
+    scenario: intercept
+    algorithm: vision_png
+    out_dir: experiment_data
+    sample_rate: 20.0
+    topic_timeout: 1.0
+    max_duration: 120.0
+    video_fps: 20.0
+    camera_topic: /camera/image
+    image_width: 1920
+    image_height: 1080

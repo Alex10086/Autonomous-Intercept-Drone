@@ -22,6 +22,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
+find_package(uav_common_msg REQUIRED)
 find_package(GeographicLib REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -43,6 +44,7 @@ ament_target_dependencies(uav_png_intercept
   rclcpp
   sensor_msgs
   px4_msgs
+  uav_common_msg
 )
 
 install(TARGETS

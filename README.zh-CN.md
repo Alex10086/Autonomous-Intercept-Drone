@@ -163,7 +163,7 @@ source /opt/ros/jazzy/setup.bash
 cd ~/intercept_ws
 colcon build --packages-select \
   px4_msgs uav_common_msg uav_vehicle_controller uav_target_sim \
-  uav_png_intercept uav_keyboard_control uav_vision_png ros2_helloworld \
+  uav_png_intercept uav_keyboard_control uav_vision_png uav_bc_recorder ros2_helloworld \
   --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF
 source install/setup.bash
 ```
@@ -185,7 +185,7 @@ export GZ_PARTITION=intercept_jazzy
 1. `~/.local/bin/qgroundcontrol`（本机用户级入口；保持地面站打开）。
 2. `bash ~/PX4-Autopilot/run_swarm.sh`。先将本仓库的世界文件放入 PX4 的 `Tools/simulation/gz/worlds/grass_world.sdf`；可将启动脚本链接到 PX4 根目录。`PX4_ROOT` 可覆盖默认源码目录，`HEADLESS=1` 可关闭 Gazebo GUI。
 3. `ros2 run uav_target_sim uav_target_sim`。
-4. `ros2 run uav_png_intercept uav_png_intercept --ros-args -p csv_path:="$HOME/intercept_ws/intercept_data.csv"`。
+4. `ros2 run uav_png_intercept uav_png_intercept`。需要记录时，先启动下一节的 `experiment_recorder`，设置 `algorithm:=pure_png`。
 
 `run_swarm.sh` 仅停止自己创建的进程组，不再全局杀死其他仿真或删除历史日志。停止控制节点会触发正常的 Offboard 丢失保护；测试验证的是起飞和通信，不是完整拦截命中。
 
@@ -218,8 +218,7 @@ ros2 run uav_vision_dectect uav_vision_dectect
 ```
 
 ```bash
-ros2 run uav_vision_png uav_vision_png \
-  --ros-args -p csv_path:="$HOME/intercept_ws/vpng_intercept_stats.csv"
+ros2 run uav_vision_png uav_vision_png
 ```
 
 检测节点参数：
@@ -230,6 +229,86 @@ ros2 run uav_vision_png uav_vision_png \
 * 保留原算法的 0.4 推理过滤、0.45 IoU 阈值和严格 `>0.8` 的目标捕获条件。发布一次实际处理图像的检测框并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
 
 视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
+
+### 2.3 统一实验记录
+
+`uav_bc_recorder` 包现在提供 `experiment_recorder`，替代原来的同名 BC 可执行程序。purePNG 和 Vision PNG 不再直接创建 CSV，也不再接受 `csv_path`。两者发布 `/experiment/telemetry`（`uav_common_msg/ExperimentTelemetry`），Vision PNG 继续发布 `/vpng_data`；记录器只订阅，不参与制导或发控制指令。当前支持 `algorithm:=pure_png|vision_png` 和 `scenario:=intercept`，不支持的场景会明确报错。
+
+更新消息后，重新构建 `uav_common_msg`、两个 PNG 包、`uav_vision_dectect` 和 `uav_bc_recorder`，并在每个终端重新加载工作空间。其他使用 `RectMsg` 的节点也应重新构建：该消息新增 `confidence`，不能混用旧版消息二进制。记录器依赖 `python3-yaml`、`python3-numpy`、`python3-opencv`、`ros-jazzy-ros2bag`、`ros-jazzy-rosbag2-transport` 和 `ros-jazzy-rosbag2-storage-default-plugins`；运行回归测试另需 `python3-pytest`。
+
+| `profile` | 记录内容 | 适用场景 |
+| --- | --- | --- |
+| `debug`（默认） | CSV + meta/summary，不订阅原始图像 | 开发调试 |
+| `compare` | 上述内容 + 关键 topic rosbag，不订阅原始图像 | 阶段性对比 |
+| `archive` | 上述内容 + 扩展 rosbag + `camera.mp4` | 正式结果与留档 |
+
+先启动记录器，再启动对应制导节点；不要同时运行两个拦截控制器。示例：
+
+```bash
+ros2 run uav_bc_recorder experiment_recorder --ros-args \
+  -p out_dir:="$HOME/intercept_ws/experiment_data" \
+  -p algorithm:=vision_png -p target_motion:=circle \
+  -p scenario:=intercept -p profile:=debug -p max_duration:=120.0
+```
+
+`target_motion` 是实验标签，必须与目标机实际的 `motion_mode` 一致，不会由记录器改变目标运动。`N_png`、`speed_cmd`、`hit_radius` 等由制导遥测带入元数据，不在记录器里另设一套默认值；完整参数保存在 `parameters` 下。Vision PNG 的角度更新目前实际使用 `kv` / `kz`，它们会与 `N_png` 一并记录，不能仅凭 `N_png` 标签推断有效增益。控制参数在节点启动时读取，改变配置应重启制导节点。
+
+也可加载安装好的分档配置，之后的 `-p` 覆盖该配置：
+
+```bash
+ros2 run uav_bc_recorder experiment_recorder --ros-args \
+  --params-file "$(ros2 pkg prefix --share uav_bc_recorder)/config/archive.yaml" \
+  -p algorithm:=vision_png -p target_motion:=circle
+```
+
+若从仓库直接编排整套实验，可在已经加载 ROS/视觉运行库、保持 QGroundControl 连接的终端执行：
+
+```bash
+bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png
+# 参数依次为：目标运动、输出根目录、拦截最长秒数、profile、algorithm。
+# purePNG 使用最后一个参数 pure_png；不启动检测节点。
+```
+
+脚本先启动记录器，再运行仓库的 `run_swarm.sh`、目标机、可选检测和制导；退出时先完成记录文件，再停止自己启动的进程，不会全局 kill 其他实验。
+
+每次启动都立即在 `out_dir` 下原子创建独立目录，不覆盖历史数据；同秒启动自动递增编号。可用字符串参数 `experiment_id` 指定标识，目录仍带防碰撞后缀。
+
+```text
+experiment_data/
+└── 2026-10-15_14-30-00_vision_png_circle_001/
+    ├── meta.yaml
+    ├── timeseries.csv
+    ├── summary.csv
+    ├── camera.mp4       # 仅 archive
+    ├── rosbag/          # compare / archive
+    └── rosbag.log       # compare / archive 的录制进程日志
+```
+
+**触发与结束**
+
+* CSV 默认 20 Hz，`sample_rate` 可配置；与相机回调解耦，合法零速度分量不会阻止录制。
+* 开始需要新鲜的 `INTERCEPT` 遥测、自身/目标有效 GPS 及 NED 速度；Vision PNG 额外需要有效检测框，purePNG 不需要相机或检测。`topic_timeout` 默认 1 秒。
+* 一旦开始，丢目标或话题过期仍继续采样；缺失/过期数值写 `NaN`。`detected`、`lost`、`reacquired` 区分检测状态与转换事件；计数来自回调/过期转换，不是重复累计 CSV 行。
+* 真实距离达到遥测中的 `hit_radius`、算法进入 `DONE`、超过 `max_duration` 或 Ctrl+C 时完成汇总。`intercept_time` 是从满足开始条件到首次记录命中的 ROS 秒数，不是绝对时间戳。没有进入拦截也会输出 `no_intercept` 汇总；未命中的时间/距离指标不伪造为零。
+* bag/视频从记录器启动开始采集，包含起飞和捕获前阶段；`max_duration` 从满足拦截开始条件起算。视频采用固定接收时间网格，缺帧时保持上一帧，元数据记录起止 ROS 时间及补帧数；过长缺口明确报错，不无限补帧。
+* 请求的 bag/视频无法启动或收尾、视频没有收到可编码图像等均标记 `error` 并以非零状态退出，不会悄悄降档；目录保留用于排查。
+
+**字段与数据口径**
+
+`timeseries.csv` 包含状态 p/v、wxyz 四元数及机体系角速度、目标真值 p/v 和距离、bbox/置信度/像素误差、LOS/dLOS/PNG 期望角、参考速度、推力/力矩、求解器诊断、算法状态、视觉延迟和事件；每路数据另有 `*_age_s`。目前没有 OMMPC 发布者，其求解器字段为 `NaN`/空状态；没有收到的推力/力矩也保持 `NaN`，不会从速度指令推算。
+
+* 自身和目标位置统一为首个有效自身 GPS 原点的 NED，单位 m，**z 向下为正**；不直接相减两架飞机各自原点的 local position。优先使用椭球高，MSL 回退会明确标注为近似，拒绝混合高程基准。
+* 速度为 PX4 local NED（m/s），角速度为 body FRD（rad/s）。`los_*`、`png_*` 单位 rad，方位角沿用算法的 `atan2(North, East)`；`dlos_*` 是算法使用的包裹后角增量（rad/update），不是角速度。
+* `cmd_thrust=-thrust.xyz[2]`，`cmd_tx/ty/tz` 来自 PX4 body-FRD 归一化 torque setpoint，不是 N 或 N·m。需要这些话题时，须确保 PX4 的 DDS 配置实际发布它们。
+* bbox 对应原始图像像素；`confidence` 是 YOLO 捕获分数或 LightTrack 跟踪分数，未提供/丢失为 `NaN`，两种分数不应视为同一个校准概率。
+* 时间为记录器 ROS 时钟；检测新鲜度按接收时间计算，不等于源图像年龄保证。`vision_latency_ms` 仅在图像 stamp 非零、非未来且与接收时钟相差不超过 `topic_timeout` 时计算；Gazebo 仿真 stamp 与墙钟混用时为 `NaN`，不会相减出巨大“延迟”。需要有效延迟时应统一时间域；只有在 `/clock` 确实可用且相关节点配置一致时才启用 `use_sim_time`。
+
+`meta.yaml` 记录实验标识、实际算法参数、git commit（源码链接安装查询源码版本，普通复制安装保留构建时版本；两者均不可用时为 null）、记录器配置、坐标/时间/单位口径、GPS 原点、请求及实际资源状态和 bag 各 topic 消息数。`summary.csv` 每次实验一行，包含命中、拦截耗时、最近距离、样本数、检测/丢失/重捕获计数、延迟统计及资源错误。
+
+compare 的 bag 包含 `/experiment/telemetry`、`/vpng_data`、`/camera_detect_result`、双机 GPS/local position 和自身 trajectory setpoint。archive 额外包含自身 odometry、thrust/torque setpoint 和 `/clock`，覆盖上述建议的八个 topic；原始图像不重复写入 bag，单独保存 MP4。安装的 `bag_qos.yaml` 使用兼容 PX4 BEST_EFFORT 的订阅；未发布话题不会凭空产生消息，实际消息数见元数据。
+
+旧 `assets/vpng_intercept_stats_*.csv` 和绘图脚本保留为历史数据格式，不直接读取新的统一表。
+
 
 ### 3. 运行拦截任务 (步骤序列)
 请按以下顺序在不同终端中运行各节点：

@@ -14,8 +14,7 @@
 #include <chrono>
 #include <cmath>
 
-#include <fstream>
-#include <iomanip>
+#include <uav_common_msg/msg/experiment_telemetry.hpp>
 #include <string>
 
 using namespace px4_msgs::msg;
@@ -58,10 +57,16 @@ private:
     rclcpp::Subscription<SensorGps>::SharedPtr           self_gps_sub_;   // px4_1 绝对位置
     rclcpp::Subscription<SensorGps>::SharedPtr           target_gps_sub_; // px4_2 绝对位置
     rclcpp::Subscription<VehicleLocalPosition>::SharedPtr self_vel_sub_;   // px4_1 速度
-    rclcpp::Subscription<VehicleLocalPosition>::SharedPtr target_vel_sub_; // px4_2 速度
     rclcpp::Subscription<VehicleStatus>::SharedPtr        status_sub_;
 
     rclcpp::TimerBase::SharedPtr timer_;
+    void publish_telemetry();
+    rclcpp::TimerBase::SharedPtr telemetry_timer_;
+    rclcpp::Publisher<uav_common_msg::msg::ExperimentTelemetry>::SharedPtr telemetry_pub_;
+    std::string parameters_yaml_;
+    float los_v_{0.0f}, los_z_{0.0f};
+    float used_dlos_v_{0.0f}, used_dlos_z_{0.0f};
+    bool guidance_valid_{false};
 
     // -------- 状态 --------
     InterceptState state_{InterceptState::INIT};
@@ -79,7 +84,6 @@ private:
 
     // 目标位置（NED，转换到自身坐标系后）
     Eigen::Vector3f target_pos_{0.0f, 0.0f, 0.0f};
-    Eigen::Vector3f target_vel_{0.0f, 0.0f, 0.0f};
     bool target_pos_ok_{false};
 
     // 坐标系：以自身第一个GPS为原点的 LocalCartesian
@@ -97,18 +101,11 @@ private:
     float target_yaw_{0.0f};        // 目标方位角（用于机头指向目标）
 
     // -------- 导引参数 --------
-    const float N_{4.0f};               // 导引比
-    const float intercept_speed_{8.0f}; // 最大拦截速度 m/s
+    float N_{4.0f};               // N_png
+    float intercept_speed_{8.0f}; // speed_cmd, m/s
     const float takeoff_alt_{-5.0f};    // 起飞 NED 高度（与目标一致）
-    const float hit_radius_{0.5f};      // 判定命中距离 m
-    const float dt_{0.05f};             // 控制周期 20Hz
+    float hit_radius_{0.5f};      // hit_radius, m
 
-    // -------- 数据记录 --------
-    std::ofstream csv_file_;
-    std::string csv_path_;
-    GeographicLib::LocalCartesian geo_converter_; // 统一的坐标转换器
-    bool origin_set_ = false;
-    void save_data_to_csv();
 };
 
 #endif // PNG_CONTROL_HPP

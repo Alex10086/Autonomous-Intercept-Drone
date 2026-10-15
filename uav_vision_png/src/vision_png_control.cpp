@@ -10,9 +10,10 @@
  * │    3. PNG：d_v_angle = N * dLOS + last_v_angle              │
  * │    4. 速度指令：vx/vy/vz                                      │
  * ├──────────────────────────────────────────────────────────────┤
- * │  统计记录（仅用于数据分析，不参与导引计算）                     │
- * │    订阅 px4_2 GPS → LocalCartesian → 计算真实距离 → CSV       │
+ * │  GPS 命中评估（不参与视觉导引计算）                             │
+ * │    双方 GPS → LocalCartesian → 真实距离 → DONE 悬停           │
  * └──────────────────────────────────────────────────────────────┘
+ * 遥测独立以 20 Hz 发布至 /experiment/telemetry；文件记录由 recorder 负责。
  *
  * 参考：
  *   uav_ibvs_control/src/los_control.cpp    —— 视觉 LOS 计算方式
@@ -23,6 +24,8 @@
 #include "uav_vision_png/vision_png_control.hpp"
 #include <iomanip>
 #include <cmath>
+#include <limits>
+#include <sstream>
 
 // ============================================================
 //  构造函数
@@ -50,7 +53,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     this->declare_parameter("coast_thresh",       coast_thresh_);
     this->declare_parameter("lost_thresh",        lost_thresh_);
     this->declare_parameter("hit_radius",         (double)hit_radius_);
-    this->declare_parameter("csv_path",           csv_path_);
 
     focal_length_      = this->get_parameter("focal_length").as_double();
     image_width_       = this->get_parameter("image_width").as_int();
@@ -67,7 +69,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     coast_thresh_      = this->get_parameter("coast_thresh").as_int();
     lost_thresh_       = this->get_parameter("lost_thresh").as_int();
     hit_radius_        = (float)this->get_parameter("hit_radius").as_double();
-    csv_path_          = this->get_parameter("csv_path").as_string();
 
     // ---- 相机→机体旋转矩阵（与 los_control.cpp 保持一致）----
     // Cx → By,  Cy → Bz,  Cz → Bx
@@ -85,6 +86,8 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     cmd_pub_ = create_publisher<VehicleCommand>(
         "/px4_1/fmu/in/vehicle_command", 10);
     data_pub_ = create_publisher<DataMsg>("/vpng_data", 10);
+    telemetry_pub_ = create_publisher<uav_common_msg::msg::ExperimentTelemetry>(
+        "/experiment/telemetry", 10);
 
     // ============================================================
     //  订阅者 —— 导引专用
@@ -98,7 +101,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
             detect_y_ = msg->y;
             detect_w_ = msg->width;
             detect_h_ = msg->height;
-            detect_fresh_ = true;
 
             if (msg->width == -1) {
                 lost_frames_++;
@@ -117,10 +119,6 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
                 }
             }
 
-            // 记录检测时间戳（ms）
-            auto now = std::chrono::system_clock::now();
-            detect_timestamp_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()).count();
         });
 
     // 自身姿态（四元数 → 欧拉角）
@@ -212,41 +210,37 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     timer_png_ = create_wall_timer(
         std::chrono::milliseconds(25),
         std::bind(&VisionPNG::png_calculate, this));
+    // Cache startup parameters, including effective launch overrides and ROS parameters.
+    std::ostringstream yaml;
+    yaml << std::setprecision(17);
+    for (const auto &name : list_parameters({}, 0).names) {
+        const auto parameter = get_parameter(name);
+        yaml << std::quoted(name) << ": ";
+        if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+            yaml << std::quoted(parameter.as_string());
+        } else if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+            yaml << parameter.as_double();
+        } else {
+            yaml << parameter.value_to_string();
+        }
+        yaml << '\n';
+    }
+    yaml << "controller: \"px4_velocity\"\nplanner: \"none\"\n";
+    parameters_yaml_ = yaml.str();
+    timer_telemetry_ = create_wall_timer(std::chrono::milliseconds(50),
+        std::bind(&VisionPNG::publish_telemetry, this));
 
     RCLCPP_INFO(get_logger(),
         "VisionPNG 节点已启动 | focal=%.1f img=%dx%d N=%.1f spd=%.1f",
         focal_length_, image_width_, image_height_, N_png_, speed_cmd_);
 }
 
-// ============================================================
-//  析构函数 —— 关闭 CSV 文件
-// ============================================================
-VisionPNG::~VisionPNG()
-{
-    if (csv_file_.is_open()) {
-        // 写入摘要行
-        csv_file_ << "\n# ========== 统计摘要 ==========\n";
-        csv_file_ << "# 总检测帧数,"    << stats_.total_detect_frames << "\n";
-        csv_file_ << "# 累计丢失帧数,"  << stats_.lost_frames_total   << "\n";
-        csv_file_ << "# 最近接距离(m)," << stats_.min_distance         << "\n";
-        if (stats_.hit_recorded) {
-            csv_file_ << "# 命中时刻(s)," << stats_.intercept_time << "\n";
-        }
-        csv_file_.close();
-        RCLCPP_INFO(get_logger(), "[统计] CSV 已保存至: %s", csv_path_.c_str());
-    }
-    std::cout << "VisionPNG 节点已退出" << std::endl;
-}
 
 // ============================================================
 //  200 Hz 主控制循环
 // ============================================================
 void VisionPNG::control_loop()
 {
-    auto now = std::chrono::system_clock::now();
-    control_timestamp_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()).count();
-    time_diff_ = control_timestamp_ - detect_timestamp_;
 
     switch (state_) {
     case VpngState::TAKE_OFF:    handle_takeoff();    break;
@@ -314,6 +308,8 @@ void VisionPNG::png_calculate()
         last_v_angle_v_   = LOS_angle_v_;  // 用 LOS 而非实测速度，避免起飞残余污染
         last_v_angle_z_   = LOS_angle_z_;
         png_initialized_  = true;
+        used_dlos_v_ = 0.0;
+        used_dlos_z_ = 0.0;
         RCLCPP_INFO(get_logger(),
             "[PNG 初始化] LOS(v=%.3f z=%.3f) |V|=%.2f",
             LOS_angle_v_, LOS_angle_z_, Vt.norm());
@@ -336,6 +332,9 @@ void VisionPNG::png_calculate()
         // PNG 核心公式（与 los_control.cpp 完全一致）
         d_v_angle_v_ = kv_ * diff_LOS_v + last_v_angle_v_;
         d_v_angle_z_ = kz_ * diff_LOS_z + last_v_angle_z_;
+        // Retain the wrapped increments used by PNG before advancing LOS references.
+        used_dlos_v_ = diff_LOS_v;
+        used_dlos_z_ = diff_LOS_z;
 
         // 限制仰角范围（±45°），防止仰角过大导致无人机猛冲高空
         d_v_angle_v_ = std::max(-M_PI/4.0, std::min(M_PI/4.0, d_v_angle_v_));
@@ -375,8 +374,8 @@ void VisionPNG::png_calculate()
     data.v_angle_z     = (float)std::atan2(Vt(0), Vt(1));
     data.los_angle_v   = (float)LOS_angle_v_;
     data.los_angle_z   = (float)LOS_angle_z_;
-    data.diff_los_angle_v = (float)(LOS_angle_v_ - last_LOS_angle_v_);
-    data.diff_los_angle_z = (float)(LOS_angle_z_ - last_LOS_angle_z_);
+    data.diff_los_angle_v = (float)diff_LOS_v;
+    data.diff_los_angle_z = (float)diff_LOS_z;
     data.ex            = (float)ex_;
     data.ey            = (float)ey_;
     data.yaw           = (float)yaw_;
@@ -387,9 +386,6 @@ void VisionPNG::png_calculate()
     data.vel_total     = (float)Vt.norm();
     data_pub_->publish(data);
 
-    // ---------- Step 8: 更新统计计数 ----------
-    stats_.total_detect_frames++;
-    if (detect_w_ == -1) stats_.lost_frames_total++;
 }
 
 // ============================================================
@@ -495,13 +491,12 @@ void VisionPNG::handle_intercept()
     coast_vx_  = vx_cmd;
     coast_vy_  = vy_cmd;
     coast_vz_  = vz_cmd;
-    coast_yaw_ = (float)d_yaw_;
 
     publish_offboard_velocity_mode();
     publish_velocity_setpoint(vx_cmd, vy_cmd, vz_cmd, (float)d_yaw_);
 
-    // ---- 统计：更新最近接距离 + 命中判定 ----
-    save_stats_to_csv();
+    // GPS only evaluates the hit; it never enters the visual command calculation.
+    evaluate_hit();
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 200,
         "[INTERCEPT] v_cmd=(%.2f,%.2f,%.2f) yaw_r=%.3f |V|=%.2f ex=%.0f ey=%.0f",
@@ -537,74 +532,45 @@ void VisionPNG::handle_done()
     RCLCPP_INFO_ONCE(get_logger(), "★★★ 拦截完成，悬停中 ★★★");
 }
 
-// ============================================================
-//  统计记录 —— 写 CSV（仅在 INTERCEPT 阶段调用）
-//  使用 target_pos_stats_ 计算真实距离（导引算法不得调用此变量）
-// ============================================================
-void VisionPNG::save_stats_to_csv()
+// GPS hit evaluation preserves the existing INTERCEPT -> DONE safety transition.
+// Called at the same point after publishing the visual velocity command as before.
+void VisionPNG::evaluate_hit()
 {
-    // 延迟打开文件
-    if (!csv_file_.is_open()) {
-        csv_file_.open(csv_path_, std::ios::out);
-        if (!csv_file_.is_open()) {
-            RCLCPP_ERROR(get_logger(), "[统计] 无法打开 CSV 文件: %s", csv_path_.c_str());
-            return;
-        }
-        csv_file_ << "time_s,"
-                  << "self_x,self_y,self_z,"
-                  << "target_x,target_y,target_z,"
-                  << "dist_m,"
-                  << "los_angle_v,los_angle_z,"
-                  << "d_v_angle_v,d_v_angle_z,"
-                  << "ex,ey,"
-                  << "vx,vy,vz,"
-                  << "detect_w,state\n";
-        RCLCPP_INFO(get_logger(), "[统计] CSV 已创建: %s", csv_path_.c_str());
+    if (!target_pos_ok_) return;
+    const float dist = (target_pos_stats_ - self_pos_stats_).norm();
+    if (dist < hit_radius_) {
+        RCLCPP_WARN(get_logger(), "★ 检测到命中！真实距离=%.3f m (GPS 评估)", dist);
+        state_ = VpngState::DONE;
     }
+}
 
-    double ros_time = this->now().seconds();
-
-    // 计算真实距离（统计用，导引不使用）
-    float dist = -1.0f;
-    bool just_hit = false; //标记是否在当前帧命中
-    if (target_pos_ok_) {
-        dist = (target_pos_stats_ - self_pos_stats_).norm();
-
-        // 更新最近接距离
-        if ((double)dist < stats_.min_distance) {
-            stats_.min_distance = (double)dist;
-        }
-
-        // 命中判定（统计层）
-        if (dist < hit_radius_ && !stats_.hit_recorded) {
-            stats_.hit_recorded   = true;
-            stats_.intercept_time = ros_time;
-            just_hit = true; // 标记本帧为命中帧
-            RCLCPP_WARN(get_logger(),
-                "★ [统计] 检测到命中！真实距离=%.3f m (统计专用)", dist);
-            state_ = VpngState::DONE;
-        }
+void VisionPNG::publish_telemetry()
+{
+    uav_common_msg::msg::ExperimentTelemetry msg{};
+    msg.header.stamp = now();
+    msg.header.frame_id = "ned";
+    msg.algorithm = "vision_png";
+    switch (state_) {
+    case VpngState::TAKE_OFF: msg.state = "TAKEOFF"; break;
+    case VpngState::SEARCHING: msg.state = "SEARCHING"; break;
+    case VpngState::INTERCEPT: msg.state = "INTERCEPT"; break;
+    case VpngState::TRACK_LOST: msg.state = "TRACK_LOST"; break;
+    case VpngState::DONE: msg.state = "DONE"; break;
     }
-
-    // 节流：每 10 帧（约 200ms @ 20Hz png_calculate）写一行，避免文件过大
-    static int csv_counter = 0;
-    csv_counter++;
-    if ((csv_counter % 2 != 0) && !just_hit) {
-            return; 
-        }
-
-    csv_file_ << std::fixed << std::setprecision(4)
-              << ros_time << ","
-              << self_pos_stats_(0) << "," << self_pos_stats_(1) << "," << -self_pos_stats_(2) << ","
-              << target_pos_stats_(0) << "," << target_pos_stats_(1) << "," << -target_pos_stats_(2) << ","
-              << dist << ","
-              << LOS_angle_v_ << "," << LOS_angle_z_ << ","
-              << d_v_angle_v_ << "," << d_v_angle_z_ << ","
-              << ex_ << "," << ey_ << ","
-              << vx_ << "," << vy_ << "," << vz_ << ","
-              << detect_w_ << ","
-              << static_cast<int>(state_) << "\n";
-    csv_file_.flush();
+    msg.parameters_yaml = parameters_yaml_;
+    msg.guidance_valid = state_ == VpngState::INTERCEPT && detect_w_ != -1 &&
+        png_initialized_ && std::isfinite(LOS_angle_v_) && std::isfinite(LOS_angle_z_) &&
+        std::isfinite(d_v_angle_v_) && std::isfinite(d_v_angle_z_);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    msg.los_v = msg.guidance_valid ? LOS_angle_v_ : nan;
+    msg.los_z = msg.guidance_valid ? LOS_angle_z_ : nan;
+    msg.dlos_v = msg.guidance_valid ? used_dlos_v_ : nan;
+    msg.dlos_z = msg.guidance_valid ? used_dlos_z_ : nan;
+    msg.png_v = msg.guidance_valid ? d_v_angle_v_ : nan;
+    msg.png_z = msg.guidance_valid ? d_v_angle_z_ : nan;
+    msg.solver_time_ms = nan;
+    msg.cost = nan;
+    telemetry_pub_->publish(msg);
 }
 
 // ============================================================

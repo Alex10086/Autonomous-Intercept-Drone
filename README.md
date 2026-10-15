@@ -159,7 +159,7 @@ source /opt/ros/jazzy/setup.bash
 cd ~/intercept_ws
 colcon build --packages-select \
   px4_msgs uav_common_msg uav_vehicle_controller uav_target_sim \
-  uav_png_intercept uav_keyboard_control uav_vision_png ros2_helloworld \
+  uav_png_intercept uav_keyboard_control uav_vision_png uav_bc_recorder ros2_helloworld \
   --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF
 source install/setup.bash
 ```
@@ -181,7 +181,7 @@ Run these commands in four separate terminals:
 1. `~/.local/bin/qgroundcontrol` (the prepared user-local launcher; keep it open).
 2. `bash ~/PX4-Autopilot/run_swarm.sh`. First place the repository world at PX4's `Tools/simulation/gz/worlds/grass_world.sdf`; the launcher can be linked into the PX4 root. Set `PX4_ROOT` to override the default source directory, or `HEADLESS=1` to omit the Gazebo GUI.
 3. `ros2 run uav_target_sim uav_target_sim`.
-4. `ros2 run uav_png_intercept uav_png_intercept --ros-args -p csv_path:="$HOME/intercept_ws/intercept_data.csv"`.
+4. `ros2 run uav_png_intercept uav_png_intercept`. For recording, start `experiment_recorder` from section 2.3 first with `algorithm:=pure_png`.
 
 `run_swarm.sh` stops only its own process groups and no longer globally kills other simulations or deletes historical logs. Stopping control nodes triggers normal Offboard-loss protection; verification covers takeoff and communication, not a completed interception.
 
@@ -214,8 +214,7 @@ ros2 run uav_vision_dectect uav_vision_dectect
 ```
 
 ```bash
-ros2 run uav_vision_png uav_vision_png \
-  --ros-args -p csv_path:="$HOME/intercept_ws/vpng_intercept_stats.csv"
+ros2 run uav_vision_png uav_vision_png
 ```
 
 Detector parameters:
@@ -226,6 +225,73 @@ Detector parameters:
 * Original thresholds remain: inference confidence 0.4, IoU 0.45, and target acquisition strictly `>0.8`. One result is published per processed image with its original timestamp. Lost targets use `-1` for all four bbox fields; stale boxes are not repeatedly stamped as fresh detections.
 
 Guidance enters `SEARCHING` after reaching standby altitude and converging hover-thrust estimation, then enters `INTERCEPT` on a valid detection. `/vpng_data` exposes actual LOS and pixel errors; a running process or an existing topic alone does not prove detection or interception.
+
+### 2.3 Unified Experiment Recording
+
+The `uav_bc_recorder` package now provides `experiment_recorder`, replacing the old BC executable. Both PNG nodes publish `/experiment/telemetry` (`uav_common_msg/ExperimentTelemetry`) instead of writing CSV or accepting `csv_path`. Vision PNG also retains `/vpng_data`. The recorder is a subscriber only: it does not publish flight commands. Currently supported algorithms are `pure_png` and `vision_png`; only `scenario:=intercept` is implemented, and unsupported scenarios fail explicitly.
+
+Rebuild `uav_common_msg`, both PNG packages, `uav_vision_dectect`, and `uav_bc_recorder`, then source the workspace in every terminal. Rebuild other `RectMsg` consumers too: its new `confidence` field changes the message contract, so old/new message binaries must not be mixed. Dependencies include `python3-yaml`, `python3-numpy`, `python3-opencv`, `ros-jazzy-ros2bag`, `ros-jazzy-rosbag2-transport`, and `ros-jazzy-rosbag2-storage-default-plugins`; regression tests additionally use `python3-pytest`.
+
+| `profile` | Capture | Use |
+| --- | --- | --- |
+| `debug` (default) | CSV, metadata, summary; no raw-image subscription | Development |
+| `compare` | Above + selected-topic rosbag; no raw-image subscription | Algorithm comparison |
+| `archive` | Above + extended rosbag + `camera.mp4` | Results and archival |
+
+Start the recorder before the chosen guidance node; never run both interceptor controllers together:
+
+```bash
+ros2 run uav_bc_recorder experiment_recorder --ros-args \
+  -p out_dir:="$HOME/intercept_ws/experiment_data" \
+  -p algorithm:=vision_png -p target_motion:=circle \
+  -p scenario:=intercept -p profile:=debug -p max_duration:=120.0
+```
+
+`target_motion` labels the experiment; it must match the target node's actual `motion_mode` and does not command target motion. Metadata gets actual `N_png`, `speed_cmd`, `hit_radius`, planner/controller, and the complete parameter mapping from guidance telemetry, not independent recorder defaults. Vision PNG currently uses `kv`/`kz` for its angle update; these are recorded alongside `N_png`, which alone does not identify the effective gain. Control parameters are read at startup; restart guidance when changing them.
+
+Installed profiles can be loaded with subsequent `-p` overrides:
+
+```bash
+ros2 run uav_bc_recorder experiment_recorder --ros-args \
+  --params-file "$(ros2 pkg prefix --share uav_bc_recorder)/config/archive.yaml" \
+  -p algorithm:=vision_png -p target_motion:=circle
+```
+
+To orchestrate the complete simulation from the repository, load the ROS/vision environment and keep QGroundControl connected, then run:
+
+```bash
+bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archive vision_png
+# Arguments: motion, output root, interception duration, profile, algorithm.
+# Use pure_png as the last argument to omit the detector.
+```
+
+The script starts recording first, then the repository's `run_swarm.sh`, target, optional detector, and guidance. Shutdown finalizes recording before stopping only its owned processes.
+
+Each startup immediately creates an independent directory beneath `out_dir`, e.g. `2026-10-15_14-30-00_vision_png_circle_001/`, containing `meta.yaml`, `timeseries.csv`, and `summary.csv`. Archive adds `camera.mp4`; compare/archive add `rosbag/` and `rosbag.log`. Atomic directory creation increments the suffix instead of overwriting runs. An optional string `experiment_id` is included in the directory name and metadata, with a separate collision-safe suffix.
+
+**Lifecycle**
+
+* CSV sampling defaults to 20 Hz (`sample_rate`), independently of image callbacks or zero velocity components.
+* Start requires fresh `INTERCEPT` telemetry, valid self/target GPS and NED velocities. Vision PNG also requires a valid detection; purePNG requires neither camera nor detection. `topic_timeout` defaults to one second.
+* Continue through detection loss and stale topics; unavailable numeric fields become `NaN`. Detection/lost/reacquisition counters use callbacks and freshness transitions, not repeated CSV rows.
+* Finalize on distance within the actual `hit_radius`, algorithm `DONE`, `max_duration`, or Ctrl+C. `intercept_time` is elapsed ROS seconds from eligible interception start to observed hit, not an absolute timestamp. A run that never intercepts still gets a `no_intercept` summary; missing metrics are not fabricated as zero.
+* Bag/video capture begins at recorder startup, including takeoff/acquisition; duration starts only after interception prerequisites are met. Video uses a fixed receipt-time grid, holding the previous frame across missing slots; metadata records its ROS start/end and duplicate-frame count. Gaps beyond `max_duration` fail explicitly instead of causing unbounded backfill.
+* Requested bag/video startup/finalization failures, including zero encodable images, produce error metadata and a nonzero exit rather than silently downgrading capture.
+
+**Data semantics**
+
+`timeseries.csv` contains self p/v, wxyz quaternion and body angular rates; ground-truth target p/v and distance; bbox/confidence/pixel error; LOS increments and PNG angles; reference velocity; thrust/torque; solver diagnostics; state; latency and events, plus per-source `*_age_s`. There is no OMMPC publisher yet, so its diagnostics remain `NaN`/empty. Unpublished thrust/torque likewise remain `NaN`, never inferred from velocity commands.
+
+Positions use a common first-valid-self-GPS NED origin (meters, **z positive down**), not a subtraction of independent vehicle local origins. Ellipsoid altitude is preferred; MSL fallback is explicitly approximate and mixed altitude datums are rejected. Velocities are PX4 local NED in m/s; angular rates are body FRD in rad/s. Guidance angles are radians with existing `atan2(North, East)` azimuth; `dlos_*` are wrapped algorithm increments in rad/update, not angular rates. `cmd_thrust=-thrust.xyz[2]` and `cmd_tx/ty/tz` are normalized PX4 body-FRD setpoints, not SI force/torque; enable their DDS publications if needed.
+
+Bounding boxes use original-image pixels. Confidence is the YOLO acquisition score or LightTrack tracking score, not a common calibrated probability; unavailable/lost scores are `NaN`. Detection freshness is receipt-based and does not guarantee source-image age. `vision_latency_ms` is computed only for a nonzero, nonfuture image stamp within `topic_timeout` of the recorder clock. Mixed Gazebo simulation/wall epochs produce `NaN`, not bogus latency. For meaningful latency, configure a common time domain; enable `use_sim_time` only when `/clock` is actually available and related nodes agree.
+
+`meta.yaml` records identifiers, actual parameters, git commit (source revision for symlink installs; embedded build revision for copied installs; null only when neither is available), recorder configuration, time/frame/unit provenance, GPS origin, resource outcomes, and bag message counts. `summary.csv` has one row per run with hit/interception time, minimum distance, sample/detection/lost/reacquisition counts, latency aggregates, and resource errors.
+
+Compare bags include `/experiment/telemetry`, `/vpng_data`, `/camera_detect_result`, both vehicles' GPS/local position, and self trajectory setpoint. Archive additionally records self odometry, thrust/torque setpoints, and `/clock`, covering the recommended eight topics. Raw images are not duplicated in bags; MP4 is separate. Installed `bag_qos.yaml` accepts PX4 BEST_EFFORT publishers. Unpublished topics do not produce messages; metadata reports actual counts.
+
+Existing `assets/vpng_intercept_stats_*.csv` and plotting scripts remain historical-format artifacts, not consumers of the new unified schema.
+
 
 ### 3. Running the Interception Task (Step Sequence)
 Please run each node in a separate terminal in the following order:

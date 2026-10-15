@@ -12,7 +12,7 @@
  *
  * PNG 算法（与现有 uav_ibvs_control/los_control.cpp 完全一致的角度更新公式）：
  *   LOS_angle_v = atan2(Rz, sqrt(Rx²+Ry²))   仰角（NED Down 为正）
- *   LOS_angle_z = atan2(Rx, Ry)               方位角（NED North 为 0）
+ *   LOS_angle_z = atan2(Rx, Ry)               方位角（East 为 0，朝 North 为正）
  *   d_v_angle_v = N × (LOS_v - last_LOS_v) + last_v_angle_v
  *   d_v_angle_z = N × (LOS_z - last_LOS_z) + last_v_angle_z
  *   v_cmd = [cos(d_v_v)·sin(d_v_z), cos(d_v_v)·cos(d_v_z), sin(d_v_v)] × speed
@@ -20,13 +20,20 @@
 
 #include "uav_png_intercept/png_control.hpp"
 #include <iostream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 // ============================================================
 //  构造函数
 // ============================================================
 PngInterceptor::PngInterceptor() : Node("png_interceptor")
 {
-    csv_path_ = declare_parameter<std::string>("csv_path", "intercept_data.csv");
+    N_ = static_cast<float>(declare_parameter<double>("N_png", 4.0));
+    intercept_speed_ = static_cast<float>(declare_parameter<double>("speed_cmd", 8.0));
+    hit_radius_ = static_cast<float>(declare_parameter<double>("hit_radius", 0.5));
+    telemetry_pub_ = create_publisher<uav_common_msg::msg::ExperimentTelemetry>(
+        "/experiment/telemetry", 10);
 
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos = rclcpp::QoS(
@@ -81,13 +88,6 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
             local_z_ = msg->z;
         });
 
-    // ---------- 订阅：目标速度（px4_2 VehicleLocalPosition）----------
-    // 速度方向（NED）在两架无人机中是一致的，无需坐标系转换
-    target_vel_sub_ = create_subscription<VehicleLocalPosition>(
-        "/px4_2/fmu/out/vehicle_local_position", qos,
-        [this](const VehicleLocalPosition::SharedPtr msg) {
-            target_vel_ = {msg->vx, msg->vy, msg->vz};
-        });
 
     // ---------- 订阅：飞行状态 ----------
     status_sub_ = create_subscription<VehicleStatus>(
@@ -103,6 +103,25 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
     // ---------- 50Hz 控制定时器 ----------
     timer_ = create_wall_timer(30ms,
         std::bind(&PngInterceptor::control_loop, this));
+    // Cache the actual declared parameter mapping; control parameters are read at startup.
+    std::ostringstream yaml;
+    yaml << std::setprecision(17);
+    for (const auto &name : list_parameters({}, 0).names) {
+        const auto parameter = get_parameter(name);
+        yaml << std::quoted(name) << ": ";
+        if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+            yaml << std::quoted(parameter.as_string());
+        } else if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+            yaml << parameter.as_double();
+        } else {
+            yaml << parameter.value_to_string();
+        }
+        yaml << '\n';
+    }
+    yaml << "controller: \"px4_velocity\"\nplanner: \"none\"\n";
+    parameters_yaml_ = yaml.str();
+    telemetry_timer_ = create_wall_timer(50ms,
+        std::bind(&PngInterceptor::publish_telemetry, this));
 
     RCLCPP_INFO(get_logger(), "PNG Interceptor 节点已启动，等待 GPS 数据...");
 }
@@ -112,7 +131,7 @@ PngInterceptor::PngInterceptor() : Node("png_interceptor")
 //
 //  LOS 角度定义（NED 坐标系）：
 //    LOS_angle_v = atan2(Rz, sqrt(Rx²+Ry²))  仰角（D轴向下为正）
-//    LOS_angle_z = atan2(Rx, Ry)              方位角（北为0，顺时针）
+//    LOS_angle_z = atan2(Rx, Ry)              方位角（East 为 0，朝 North 为正）
 //
 //  PNG 更新：
 //    d_v_angle_v = N × (LOS_v - last_LOS_v) + last_v_angle_v
@@ -136,7 +155,7 @@ Eigen::Vector3f PngInterceptor::compute_png_velocity(
     // ---- 计算当前 LOS 角度（水平面方位角 + 仰角）----
     float rxy = sqrtf(R(0)*R(0) + R(1)*R(1));
     float LOS_angle_v = atan2f(R(2), rxy);          // 仰角（NED Down 为正）
-    float LOS_angle_z = atan2f(R(0), R(1));          // 方位角（NED：北=0，顺时针）
+    float LOS_angle_z = atan2f(R(0), R(1));          // East 为 0，朝 North 为正
     target_yaw_ = atan2f(R(1), R(0));               // PX4 yaw = atan2(East, North)
 
     // ---- 首次进入：用 LOS 方向初始化，不使用当前飞行速度 ----
@@ -163,6 +182,9 @@ Eigen::Vector3f PngInterceptor::compute_png_velocity(
     // 仰角一般不会穿越，但为安全起见也加上
     while (diff_LOS_v >  (float)M_PI) diff_LOS_v -= 2.0f * (float)M_PI;
     while (diff_LOS_v < -(float)M_PI) diff_LOS_v += 2.0f * (float)M_PI;
+    los_v_ = LOS_angle_v;
+    los_z_ = LOS_angle_z;
+    guidance_valid_ = true;
 
     // ---- LOS 角度变化足够大时执行 PNG 更新 ----
     if (fabsf(diff_LOS_v) > 0.005f || fabsf(diff_LOS_z) > 0.005f) {
@@ -176,6 +198,9 @@ Eigen::Vector3f PngInterceptor::compute_png_velocity(
         // PNG 角度更新（与 los_control.cpp 公式完全一致）
         d_v_angle_v_ = N_ * diff_LOS_v + last_v_angle_v_;
         d_v_angle_z_ = N_ * diff_LOS_z + last_v_angle_z_;
+        // Preserve the wrapped increments actually consumed before updating references.
+        used_dlos_v_ = diff_LOS_v;
+        used_dlos_z_ = diff_LOS_z;
 
         // 限制仰角范围，防止指向近垂直方向（±60°）
         d_v_angle_v_ = std::max(-(float)M_PI/3.0f,
@@ -213,6 +238,7 @@ Eigen::Vector3f PngInterceptor::compute_png_velocity(
 // ============================================================
 void PngInterceptor::control_loop()
 {
+    guidance_valid_ = false;
     switch (state_) {
     case InterceptState::INIT:    handle_init();      break;
     case InterceptState::TAKEOFF: handle_takeoff();   break;
@@ -223,7 +249,6 @@ void PngInterceptor::control_loop()
         RCLCPP_INFO_ONCE(get_logger(), "★★★ 拦截完成，悬停中 ★★★");
         break;
     }
-    save_data_to_csv();
 }
 
 // ============================================================
@@ -408,27 +433,32 @@ void PngInterceptor::publish_vehicle_command(uint16_t command, float p1, float p
     cmd_pub_->publish(msg);
 }
 
-void PngInterceptor::save_data_to_csv() {
-    if (!csv_file_.is_open()) {
-        csv_file_.open(csv_path_, std::ios::out);
-        if (!csv_file_.is_open()) {
-            RCLCPP_ERROR(get_logger(), "无法打开 CSV 文件: %s", csv_path_.c_str());
-            return;
-        }
-        csv_file_ << "time,s_x,s_y,s_z,t_x,t_y,t_z,dist\n";
+void PngInterceptor::publish_telemetry()
+{
+    uav_common_msg::msg::ExperimentTelemetry msg{};
+    msg.header.stamp = now();
+    msg.header.frame_id = "ned";
+    msg.algorithm = "pure_png";
+    switch (state_) {
+    case InterceptState::INIT: msg.state = "INIT"; break;
+    case InterceptState::TAKEOFF: msg.state = "TAKEOFF"; break;
+    case InterceptState::INTERCEPT: msg.state = "INTERCEPT"; break;
+    case InterceptState::DONE: msg.state = "DONE"; break;
     }
-
-    // 假设 self_pos_ 和 target_pos_ 已经是转换后的 ENU 坐标
-    double distance = (target_pos_ - self_pos_).norm();
-    double ros_time = this->now().seconds();
-
-    csv_file_ << std::fixed << std::setprecision(4)
-              << ros_time << ","
-              << self_pos_(0) << "," << self_pos_(1) << "," << -self_pos_(2) << "," // 转为 Up 为正
-              << target_pos_(0) << "," << target_pos_(1) << "," << -target_pos_(2) << ","
-              << distance << "\n";
-    
-
+    msg.parameters_yaml = parameters_yaml_;
+    msg.guidance_valid = state_ == InterceptState::INTERCEPT && guidance_valid_ &&
+        std::isfinite(los_v_) && std::isfinite(los_z_) &&
+        std::isfinite(d_v_angle_v_) && std::isfinite(d_v_angle_z_);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    msg.los_v = msg.guidance_valid ? los_v_ : nan;
+    msg.los_z = msg.guidance_valid ? los_z_ : nan;
+    msg.dlos_v = msg.guidance_valid ? used_dlos_v_ : nan;
+    msg.dlos_z = msg.guidance_valid ? used_dlos_z_ : nan;
+    msg.png_v = msg.guidance_valid ? d_v_angle_v_ : nan;
+    msg.png_z = msg.guidance_valid ? d_v_angle_z_ : nan;
+    msg.solver_time_ms = nan;
+    msg.cost = nan;
+    telemetry_pub_->publish(msg);
 }
 
 // ============================================================

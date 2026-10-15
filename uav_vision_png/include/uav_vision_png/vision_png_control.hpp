@@ -14,10 +14,9 @@
  * │          /px4_1/fmu/in/vehicle_command                              │
  * │          /vpng_data  (uav_common_msg/Data，导引过程数据，用于绘图)    │
  * ├─────────────────────────────────────────────────────────────────────┤
- * │  统计记录（仅用于数据分析，不参与导引计算）                             │
- * │    输入：/px4_2/fmu/out/vehicle_gps_position (目标真实GPS，统计专用)  │
- * │          /px4_1/fmu/out/vehicle_gps_position (自身GPS，统计专用)      │
- * │    输出：vpng_intercept_stats.csv（记录拦截全程数据）                  │
+ * │  命中评估（不参与视觉导引计算）                                      │
+ * │    输入：双方 GPS，仅计算真实距离并触发 DONE 悬停                     │
+ * │    观测：/experiment/telemetry；文件记录由独立 recorder 负责          │
  * └─────────────────────────────────────────────────────────────────────┘
  *
  * 算法原理：
@@ -40,7 +39,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Dense>
-#include <fstream>
+#include <uav_common_msg/msg/experiment_telemetry.hpp>
 #include <string>
 #include <array>
 #include <chrono>
@@ -94,7 +93,7 @@ class VisionPNG : public rclcpp::Node
 {
 public:
     VisionPNG();
-    ~VisionPNG();
+    ~VisionPNG() = default;
 
 private:
     // ----------------------------------------------------------
@@ -125,15 +124,21 @@ private:
     void publish_vehicle_command(uint16_t command, float p1 = 0.0f, float p2 = 0.0f);
 
     // ----------------------------------------------------------
-    //  统计 / CSV 记录（不参与导引）
+    //  GPS 命中评估（不参与视觉导引）
     // ----------------------------------------------------------
-    void save_stats_to_csv();
+    void evaluate_hit();
+    void publish_telemetry();
 
     // ----------------------------------------------------------
     //  定时器
     // ----------------------------------------------------------
     rclcpp::TimerBase::SharedPtr timer_control_;   ///< 200 Hz
     rclcpp::TimerBase::SharedPtr timer_png_;       ///< 20  Hz
+    rclcpp::TimerBase::SharedPtr timer_telemetry_;
+    rclcpp::Publisher<uav_common_msg::msg::ExperimentTelemetry>::SharedPtr telemetry_pub_;
+    std::string parameters_yaml_;
+    double used_dlos_v_ = 0.0;
+    double used_dlos_z_ = 0.0;
 
     // ----------------------------------------------------------
     //  发布者
@@ -177,7 +182,6 @@ private:
     int detect_y_      = 0;   ///< bbox 左上角 y（像素）
     int detect_w_      = -1;  ///< bbox 宽度；-1 = 目标丢失
     int detect_h_      = 0;   ///< bbox 高度
-    bool detect_fresh_ = false;  ///< 是否有新检测帧
 
     // 连续丢失帧计数与阈值
     int lost_frames_   = 0;
@@ -242,7 +246,6 @@ private:
     float coast_vx_ = 0.0f;  ///< 惯性续飞 vx 缓存
     float coast_vy_ = 0.0f;  ///< 惯性续飞 vy 缓存
     float coast_vz_ = 0.0f;  ///< 惯性续飞 vz 缓存
-    float coast_yaw_= 0.0f;  ///< 惯性续飞 yawspeed 缓存
 
     bool png_initialized_ = false;
 
@@ -254,13 +257,9 @@ private:
     // 状态机
     VpngState state_ = VpngState::TAKE_OFF;
 
-    // 时间戳（毫秒）
-    int64_t detect_timestamp_  = 0;  ///< 最新检测帧时间
-    int64_t control_timestamp_ = 0;  ///< 控制循环时间
-    int64_t time_diff_         = 0;  ///< 检测与控制的时间差（ms）
 
     // ===========================================================
-    //  ██  统计记录成员变量（不参与导引）██
+    //  ██  GPS 命中评估成员变量（不参与视觉导引）██
     // ===========================================================
     // 坐标系（以 px4_1 首次 GPS 为原点）
     GeographicLib::LocalCartesian lc_stats_;
@@ -273,16 +272,5 @@ private:
     // 命中判定半径（统计用）
     float hit_radius_ = 0.8f;
 
-    // CSV 文件
-    std::ofstream csv_file_;
-    std::string   csv_path_ = "vpng_intercept_stats.csv";
-
-    // 拦截统计摘要
-    struct InterceptStats {
-        int    total_detect_frames  = 0;  ///< 总检测帧数
-        int    lost_frames_total    = 0;  ///< 累计丢失帧数
-        double min_distance         = 1e9;///< 最近接距离（m）
-        double intercept_time       = -1.0;///< 命中时刻（ROS 时间 s）
-        bool   hit_recorded         = false;
-    } stats_;
+    // Recorder owns experiment counters and files.
 };

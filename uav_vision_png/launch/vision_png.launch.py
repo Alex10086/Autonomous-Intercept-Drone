@@ -29,10 +29,6 @@ def generate_launch_description():
         'N_png', default_value='4.0',
         description='比例导引系数（导航增益）')
 
-    declare_csv = DeclareLaunchArgument(
-        'csv_path',
-        default_value='vpng_intercept_stats.csv',
-        description='拦截统计 CSV 输出路径')
 
     vision_png_node = Node(
         package='uav_vision_png',
@@ -45,7 +41,6 @@ def generate_launch_description():
                 # 命令行参数可覆盖 yaml 中同名参数
                 'speed_cmd': LaunchConfiguration('speed_cmd'),
                 'N_png':     LaunchConfiguration('N_png'),
-                'csv_path':  LaunchConfiguration('csv_path'),
             }
         ],
         # 打印节点完整输出（方便调试）
@@ -55,6 +50,5 @@ def generate_launch_description():
     return LaunchDescription([
         declare_speed,
         declare_N,
-        declare_csv,
         vision_png_node,
     ])

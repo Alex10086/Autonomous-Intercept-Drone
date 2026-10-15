@@ -4,6 +4,7 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <string>
 
 UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
@@ -67,6 +68,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     }
 
     cv::Rect result_rect(-1, -1, -1, -1);
+    float result_confidence = std::numeric_limits<float>::quiet_NaN();
     std::string status_text;
     cv::Scalar color(0, 255, 0);
     const double start = cv::getTickCount();
@@ -96,6 +98,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                     color = cv::Scalar(0, 0, 255);
                 }
                 result_rect = safe_rect;
+                result_confidence = best->conf;
             }
         }
     } else {
@@ -105,6 +108,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
         const cv::Rect safe_rect = rect & cv::Rect(0, 0, frame.cols, frame.rows);
         if (safe_rect.area() > 0 && !siam_tracker->target_pos_change()) {
             result_rect = safe_rect;
+            result_confidence = siam_tracker->track_score;
             status_text = "Tracking";
         } else {
             tracking_ = false;
@@ -121,6 +125,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     result.width = result_rect.width;
     result.height = result_rect.height;
     result.depth = 0;
+    result.confidence = result_confidence;
     uav_detect_result_publisher_->publish(result);
 
     if (show_debug_window_) {
