@@ -28,6 +28,14 @@
 #include <sstream>
 #include <stdexcept>
 
+namespace {
+double stamp_seconds(const builtin_interfaces::msg::Time &stamp)
+{
+    return stamp.sec >= 0 && stamp.nanosec < 1000000000u ?
+        stamp.sec + stamp.nanosec * 1e-9 : std::numeric_limits<double>::quiet_NaN();
+}
+}
+
 // ============================================================
 //  构造函数
 // ============================================================
@@ -56,6 +64,10 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     guidance_source_ = declare_parameter<std::string>("guidance_source", "vision");
     if (guidance_source_ != "vision" && guidance_source_ != "truth_los") {
         throw std::invalid_argument("guidance_source must be vision or truth_los");
+    }
+    image_time_domain_ = declare_parameter<std::string>("image_time_domain", "gazebo");
+    if (image_time_domain_ != "gazebo" && image_time_domain_ != "ros") {
+        throw std::invalid_argument("image_time_domain must be gazebo or ros");
     }
 
     focal_length_      = this->get_parameter("focal_length").as_double();
@@ -114,6 +126,14 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     data_pub_ = create_publisher<DataMsg>("/vpng_data", 10);
     telemetry_pub_ = create_publisher<uav_common_msg::msg::ExperimentTelemetry>(
         "/experiment/telemetry", 10);
+    observation_pub_ = create_publisher<uav_common_msg::msg::VisionObservation>(
+        "/vision/observations", 100);
+    clock_sub_ = create_subscription<uav_common_msg::msg::SimulationClock>(
+        "/simulation/clock_pairs", rclcpp::SensorDataQoS().keep_last(100),
+        [this](const uav_common_msg::msg::SimulationClock &msg) {
+            clock_history_.add(stamp_seconds(msg.sim_time),
+                stamp_seconds(msg.system_time), now().seconds());
+        });
 
     // ============================================================
     //  订阅者 —— 导引专用
@@ -128,6 +148,7 @@ VisionPNG::VisionPNG() : Node("uav_vision_png")
     odometry_sub_ = create_subscription<VehicleOdometry>(
         "/px4_1/fmu/out/vehicle_odometry", qos,
         [this](const VehicleOdometry::SharedPtr msg) {
+            latest_attitude_time_ = msg->timestamp_sample * 1e-6;
             double q0 = msg->q[0], q1 = msg->q[1];
             double q2 = msg->q[2], q3 = msg->q[3];
             roll_  = std::atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2));
@@ -338,25 +359,77 @@ void VisionPNG::update_visual_state()
 void VisionPNG::detection_callback(const RectMsg &msg)
 {
     if (guidance_source_ != "vision") return;
+    // Flush an accepted observation superseded before any control tick used it.
+    if (observation_pending_) {
+        observation_pub_->publish(observation_);
+        observation_pending_ = false;
+    }
+    const double received = now().seconds();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    observation_ = uav_common_msg::msg::VisionObservation{};
+    observation_.header.stamp = now();
+    observation_.image_stamp = msg.header.stamp;
+    observation_.image_time_ros = nan;
+    observation_.bbox_receive_time = received;
+    observation_.projection_time = observation_.control_time = nan;
+    observation_.attitude_before_time = observation_.attitude_after_time = nan;
+    observation_.image_to_bbox_ms = observation_.image_to_control_ms = nan;
+    observation_.los_v = observation_.los_z = nan;
+    observation_.receive_pose_los_v = observation_.receive_pose_los_z = nan;
+    observation_.source = msg.source;
+    observation_.confidence = msg.confidence;
+    observation_.x = msg.x;
+    observation_.y = msg.y;
+    observation_.width = msg.width;
+    observation_.height = msg.height;
+    const double image_time = stamp_seconds(msg.header.stamp);
+    if (image_time_domain_ == "gazebo") {
+        observation_.clock_valid = clock_history_.map(
+            image_time, received, observation_.image_time_ros);
+    } else if (image_time > 0.0 && received - image_time >= 0.0 &&
+               received - image_time <= 2.0) {
+        observation_.clock_valid = true;
+        observation_.image_time_ros = image_time;
+    }
+    if (observation_.clock_valid) {
+        observation_.image_to_bbox_ms =
+            (received - observation_.image_time_ros) * 1000.0;
+    }
     // Check the previous observation before a new arrival can refresh its age.
     update_visual_state();
     // Invalid results neither replace the cached observation nor refresh its age.
-    if (msg.width <= 0 || msg.height <= 0) return;
+    if (msg.width <= 0 || msg.height <= 0) {
+        observation_.status = observation_.INVALID_BOX;
+        observation_pub_->publish(observation_);
+        return;
+    }
     const double roll = roll_, pitch = pitch_, yaw = yaw_;
     detect_x_ = msg.x;
     detect_y_ = msg.y;
     detect_w_ = msg.width;
     detect_h_ = msg.height;
     last_visual_observation_ = std::chrono::steady_clock::now();
-    if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE) return;
-    if (state_ == VpngState::SEARCHING &&
-        ((require_experiment_start_ && !experiment_start_) ||
-         (precise_standby_ && !takeoff_ready()))) return;
+    if (state_ == VpngState::TAKE_OFF || state_ == VpngState::DONE ||
+        (state_ == VpngState::SEARCHING &&
+         ((require_experiment_start_ && !experiment_start_) ||
+          (precise_standby_ && !takeoff_ready())))) {
+        observation_.status = observation_.NOT_GUIDING;
+        observation_pub_->publish(observation_);
+        return;
+    }
 
     // First acquisition and either loss recovery use the existing initialization.
     if (state_ != VpngState::INTERCEPT) png_initialized_ = false;
     state_ = VpngState::INTERCEPT;
     png_calculate(roll, pitch, yaw);
+    observation_.projection_time = now().seconds();
+    observation_.attitude_before_time = observation_.attitude_after_time =
+        latest_attitude_time_;
+    observation_.los_v = observation_.receive_pose_los_v = LOS_angle_v_;
+    observation_.los_z = observation_.receive_pose_los_z = LOS_angle_z_;
+    observation_.accepted = true;
+    observation_.status = observation_.RECEIVE_POSE;
+    observation_pending_ = true;
 }
 
 // ============================================================
@@ -736,6 +809,16 @@ void VisionPNG::publish_velocity_setpoint(float vx, float vy, float vz, float ya
     msg.yawspeed  = yaw_rate;
     msg.timestamp = get_clock()->now().nanoseconds() / 1000;
     traj_pub_->publish(msg);
+    if (observation_pending_) {
+        observation_.control_time = msg.timestamp * 1e-6;
+        observation_.header.stamp = now();
+        if (observation_.clock_valid) {
+            observation_.image_to_control_ms =
+                (observation_.control_time - observation_.image_time_ros) * 1000.0;
+        }
+        observation_pub_->publish(observation_);
+        observation_pending_ = false;
+    }
 }
 
 void VisionPNG::publish_vehicle_command(uint16_t command, float p1, float p2)

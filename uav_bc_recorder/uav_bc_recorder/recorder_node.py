@@ -15,11 +15,11 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, Float64, String
-from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg
+from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, VisionObservation
 import yaml
 
 from .experiment_storage import (
-    ARCHIVE_TOPICS, COMPARE_TOPICS, COLUMNS, NAN, TOPICS,
+    ARCHIVE_TOPICS, COMPARE_TOPICS, COLUMNS, NAN, OBSERVATION_COLUMNS, TOPICS,
     BagCapture, RunStorage, VideoCapture, safe_identifier,
 )
 
@@ -88,6 +88,7 @@ class ExperimentRecorder(Node):
         self.video = None
         self.cache = {}
         self.origin = None
+        self.pending_geometry = []
         self.start_time = None
         self.start_wait_monotonic = monotonic()
         self.intercept_start = None
@@ -200,6 +201,7 @@ class ExperimentRecorder(Node):
             ("telemetry", ExperimentTelemetry, self._telemetry_cb),
             ("vpng", Data, lambda message: self._cache("vpng", message)),
             ("detection", RectMsg, self._detect_cb),
+            ("observations", VisionObservation, self._observation_cb),
             ("self_gps", SensorGps, lambda message: self._gps_cb("self_gps", message)),
             ("target_gps", SensorGps, lambda message: self._gps_cb("target_gps", message)),
             ("self_local", VehicleLocalPosition, lambda message: self._cache("self_local", message)),
@@ -309,10 +311,52 @@ class ExperimentRecorder(Node):
                     self._begin_tail(now, "done")
                 self._check_wall_time()
 
+    def _observation_cb(self, message):
+        if self.finished:
+            return
+        row = {key: getattr(message, key) for key in OBSERVATION_COLUMNS if key != "image_stamp_s"}
+        stamp = message.image_stamp
+        row["image_stamp_s"] = (
+            stamp.sec + stamp.nanosec * 1e-9
+            if stamp.sec >= 0 and 0 <= stamp.nanosec < 1_000_000_000 else NAN)
+        if not message.clock_valid:
+            for key in ("image_time_ros", "image_to_bbox_ms", "image_to_control_ms"):
+                row[key] = NAN
+        self.cache["observations"] = (message, self._now())
+        try:
+            self.storage.write_sidecar("observations", row)
+        except Exception as exc:
+            self._error(f"cannot record observation diagnostic: {exc}")
+
+    def _geometry_event(self, key, message, coordinates, receive_time):
+        source_time = float(getattr(message, "timestamp", 0)) * 1e-6
+        if not (math.isfinite(source_time) and source_time > 0
+                and 0 <= receive_time - source_time <= self.config["topic_timeout"]):
+            source_time = NAN
+        event = (key, coordinates, source_time, receive_time)
+        if self.origin is None:
+            self.pending_geometry.append(event)
+            return
+        events = self.pending_geometry
+        self.pending_geometry = []
+        events.append(event)
+        for vehicle_key, point, source, received in events:
+            if point[3] != self.storage.meta["gps_origin"]["altitude_source"]:
+                continue
+            position = gps_to_ned(*point[:3], *self.origin)
+            try:
+                self.storage.write_sidecar("geometry", dict(
+                    vehicle="self" if vehicle_key == "self_gps" else "target",
+                    source_time=source, receive_time=received,
+                    **dict(zip(("x", "y", "z"), position))))
+            except Exception as exc:
+                self._error(f"cannot record geometry diagnostic: {exc}")
+
     def _gps_cb(self, key, message):
         if self.finished:
             return
         self._cache(key, message)
+        receive_time = self.cache[key][1]
         coordinates = gps_coordinates(message)
         if coordinates is not None:
             altitude_sources = self.storage.meta.setdefault("gps_altitude_sources", {})
@@ -323,6 +367,7 @@ class ExperimentRecorder(Node):
                 self.origin = coordinates[:3]
                 self.storage.meta["gps_origin"] = {"latitude_deg": self.origin[0], "longitude_deg": self.origin[1], "altitude_m": self.origin[2], "altitude_source": coordinates[3]}
                 self.storage.save_meta()
+            self._geometry_event(key, message, coordinates, receive_time)
         now = self._now()
         self._maybe_start(now)
         if self.intercept_start is not None:
@@ -658,6 +703,15 @@ class ExperimentRecorder(Node):
                     self._error(text)
         if self.storage is None:
             return
+        for key, _, source_time, receive_time in self.pending_geometry:
+            try:
+                self.storage.write_sidecar("geometry", dict(
+                    vehicle="self" if key == "self_gps" else "target",
+                    source_time=source_time, receive_time=receive_time,
+                    x=NAN, y=NAN, z=NAN))
+            except Exception as exc:
+                self._error(f"cannot record geometry diagnostic without origin: {exc}")
+        self.pending_geometry.clear()
         elapsed = max(0.0, now - self.intercept_start) if self.intercept_start is not None else NAN
         self.storage.meta.update(
             status="error" if self.errors else ("complete" if self.samples else "no_intercept"), reason=reason,

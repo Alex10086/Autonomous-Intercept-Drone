@@ -23,6 +23,13 @@ COLUMNS = (
     "target_local_age_s odom_age_s detection_age_s vpng_age_s trajectory_age_s "
     "thrust_age_s torque_age_s"
 ).split()
+OBSERVATION_COLUMNS = (
+    "image_stamp_s image_time_ros bbox_receive_time projection_time control_time "
+    "attitude_before_time attitude_after_time image_to_bbox_ms image_to_control_ms "
+    "clock_valid accepted attitude_synced status source confidence x y width height "
+    "los_v los_z receive_pose_los_v receive_pose_los_z"
+).split()
+GEOMETRY_COLUMNS = "vehicle source_time receive_time x y z".split()
 SUMMARY_COLUMNS = (
     "status reason hit intercept_time elapsed_s min_distance samples detection_count "
     "lost_count reacquire_count latency_mean_ms latency_max_ms video_frames "
@@ -45,12 +52,14 @@ TOPICS = {
     "target_state": "/target/experiment_state",
     "experiment_start": "/experiment/start",
     "target_start": "/experiment/target_start",
+    "clock_pairs": "/simulation/clock_pairs",
+    "observations": "/vision/observations",
 }
 COMPARE_TOPICS = [TOPICS[key] for key in (
     "telemetry", "vpng", "detection", "self_gps", "target_gps",
     "self_local", "target_local", "trajectory", "conditions", "target_state",
-    "experiment_start", "target_start")]
-ARCHIVE_TOPICS = COMPARE_TOPICS + [TOPICS[key] for key in ("odom", "thrust", "torque")] + ["/clock"]
+    "experiment_start", "target_start", "clock_pairs", "observations", "odom")]
+ARCHIVE_TOPICS = COMPARE_TOPICS + [TOPICS[key] for key in ("thrust", "torque")] + ["/clock"]
 
 
 def safe_identifier(value, name):
@@ -95,6 +104,8 @@ class RunStorage:
                 index += 1
         sync_directory(root)
         self.stream = None
+        self.sidecar_streams = {}
+        self.sidecar_writers = {}
         self.meta = {
             "algorithm": config["algorithm"], "target_motion": config["target_motion"],
             "experiment_id": config["experiment_id"] or f"{index:03d}",
@@ -132,6 +143,14 @@ class RunStorage:
                 "vision_latency_ms": "receipt ROS time minus original image ROS stamp only when nonzero and within topic_timeout; incompatible epochs/invalid/future stamps yield NaN",
                 "detection_count": "valid fresh detection callbacks, not sampled timer snapshots",
                 "missing_values": "NaN numeric values; false stale detection; empty unavailable strings",
+                "observations.csv": "one diagnostic event per bbox, including rejected and never-consumed observations; not timer snapshots; absent publishers leave a header-only file",
+                "observation_clock": "image_stamp_s retains camera simulation domain; image_time_ros maps to system epoch via /simulation/clock_pairs only when clock_valid; unmapped image and derived latency values are NaN; control_time is first velocity setpoint using the image, or NaN",
+                "observation_attitude": "attitude_before_time/attitude_after_time bracket image_time_ros; attitude_synced distinguishes image-pose from receive-pose projection; LOS radians, azimuth atan2(North,East)",
+                "observation_status": "0 RECEIVE_POSE, 1 IMAGE_POSE, 2 CLOCK_UNAVAILABLE, 3 ATTITUDE_UNAVAILABLE, 4 INVALID_BOX, 5 NOT_GUIDING, 6 OUT_OF_ORDER",
+                "observation_source": "0 UNKNOWN, 1 YOLO, 2 LIGHTTRACK",
+                "geometry.csv": "one row per valid GPS callback, including before INTERCEPT; self/target positions in the same GPS-origin NED as timeseries; callbacks before origin are retained until origin exists, or written with NaN positions at finish if no origin arrives; incompatible altitude datums omitted",
+                "geometry_source_time": "SensorGps.timestamp * 1e-6 only if finite, positive and 0 <= receive_time - source_time <= topic_timeout; otherwise NaN; timestamp_sample is never used",
+                "geometry_receive_time": "recorder ROS receipt epoch seconds; source_time is preferred for interpolation only when valid",
             },
             "resources": {}, "recording_errors": [], "status": "starting",
         }
@@ -140,10 +159,18 @@ class RunStorage:
             self.stream = (self.path / "timeseries.csv").open("w", newline="", encoding="utf-8")
             self.writer = csv.DictWriter(self.stream, fieldnames=COLUMNS)
             self.writer.writeheader()
+            for name, columns in (("observations", OBSERVATION_COLUMNS), ("geometry", GEOMETRY_COLUMNS)):
+                stream = (self.path / f"{name}.csv").open("w", newline="", encoding="utf-8")
+                self.sidecar_streams[name] = stream
+                writer = csv.DictWriter(stream, fieldnames=columns)
+                self.sidecar_writers[name] = writer
+                writer.writeheader()
             self.flush()
         except Exception:
-            if self.stream is not None:
-                self.stream.close()
+            try:
+                self.close()
+            except Exception:
+                pass  # Preserve the startup failure after attempting every close.
             raise
 
     @staticmethod
@@ -175,9 +202,38 @@ class RunStorage:
         atomic_yaml(self.path / "meta.yaml", self.meta)
 
     def flush(self):
-        if self.stream is not None and not self.stream.closed:
-            self.stream.flush()
-            os.fsync(self.stream.fileno())
+        error = None
+        for stream in [self.stream, *self.sidecar_streams.values()]:
+            if stream is not None and not stream.closed:
+                try:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                except Exception as exc:
+                    if error is None:
+                        error = exc
+        if error is not None:
+            raise error
+
+    def close(self):
+        error = None
+        try:
+            self.flush()
+        except Exception as exc:
+            error = exc
+        finally:
+            for stream in [self.stream, *self.sidecar_streams.values()]:
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except Exception as exc:
+                        if error is None:
+                            error = exc
+        if error is not None:
+            raise error
+
+    def write_sidecar(self, name, row):
+        self.sidecar_writers[name].writerow(row)
+        self.sidecar_streams[name].flush()
 
     def write_row(self, row):
         self.writer.writerow(row)
@@ -185,9 +241,7 @@ class RunStorage:
         self.stream.flush()
 
     def finalize(self, summary):
-        self.flush()
-        if self.stream is not None:
-            self.stream.close()
+        self.close()
         temporary = self.path / "summary.csv.tmp"
         with temporary.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=SUMMARY_COLUMNS)

@@ -107,3 +107,44 @@ def test_new_runs_do_not_inherit_previous_experiment_conditions(tmp_path):
     assert second.meta["first_hit_ros_time"] is None
     assert second.meta["first_hit_monotonic"] is None
     second.finalize({"status": "no_intercept"})
+
+
+def test_finalize_sync_failure_still_closes_every_csv(tmp_path, monkeypatch):
+    from uav_bc_recorder import experiment_storage as storage_module
+
+    storage = RunStorage(dict(DEFAULTS, out_dir=str(tmp_path)))
+    streams = [storage.stream, *storage.sidecar_streams.values()]
+    synced = []
+
+    def fail_first_sync(descriptor):
+        synced.append(descriptor)
+        if len(synced) == 1:
+            raise OSError("injected disk failure")
+
+    monkeypatch.setattr(storage_module.os, "fsync", fail_first_sync)
+    with pytest.raises(OSError, match="injected disk failure"):
+        storage.finalize({"status": "error"})
+    assert len(synced) == len(streams)
+    assert all(stream.closed for stream in streams)
+    assert not (storage.path / "summary.csv").exists()
+
+
+def test_sidecar_open_failure_closes_already_opened_csvs(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    original_open = Path.open
+    streams = []
+
+    def fail_geometry_open(path, *args, **kwargs):
+        if path.name == "geometry.csv":
+            raise OSError("injected sidecar open failure")
+        stream = original_open(path, *args, **kwargs)
+        if path.suffix == ".csv":
+            streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", fail_geometry_open)
+    with pytest.raises(OSError, match="injected sidecar open failure"):
+        RunStorage(dict(DEFAULTS, out_dir=str(tmp_path)))
+    assert len(streams) == 2
+    assert all(stream.closed for stream in streams)

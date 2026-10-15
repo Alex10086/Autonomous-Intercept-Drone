@@ -324,6 +324,10 @@ experiment_data/
 * bbox 对应原始图像像素；`confidence` 是 YOLO 捕获分数或 LightTrack 跟踪分数，未提供/丢失为 `NaN`，两种分数不应视为同一个校准概率。
 * 时间为记录器 ROS 时钟；检测新鲜度按接收时间计算，不等于源图像年龄保证。`vision_latency_ms` 仅在图像 stamp 非零、非未来且与接收时钟相差不超过 `topic_timeout` 时计算；Gazebo 仿真 stamp 与墙钟混用时为 `NaN`，不会相减出巨大“延迟”。需要有效延迟时应统一时间域；只有在 `/clock` 确实可用且相关节点配置一致时才启用 `use_sim_time`。
 
+P0 时间诊断不改变全局 `use_sim_time`。`run_swarm.sh` 同时启动 `simulation_clock_bridge`，把 Gazebo 同一条 Clock 中的 `sim` / `system` 时间发布到 `/simulation/clock_pairs`；Vision PNG 用有界历史插值将原始图像时间映射到系统时间，禁止用 bbox 接收时间反推时钟偏移。`image_time_domain` 默认为 `gazebo`；真实相机若已使用 ROS 系统时间，显式设为 `ros`。
+
+记录器另存逐回调的 `observations.csv` 和 `geometry.csv`，不把定频快照当作独立视觉样本。前者记录原始/映射后的图像时间、控制节点 bbox 接收时间、LOS 计算时间、首次使用该观测的速度指令时间、姿态样本时间、来源（0=未知、1=YOLO、2=LightTrack）及 LOS；后者记录两机各次 GPS 的源时间、接收时间与统一 NED 位置。无效映射/从未被控制使用的时刻为 `NaN`。compare bag 也保留时钟对、逐观测诊断和 odometry；原有 `timeseries.csv` / `vision_latency_ms` 口径不变。
+
 `meta.yaml` 记录实验标识、实际算法参数、git commit、`git_dirty`、源码位置、记录器配置、坐标/时间/单位口径、GPS 原点、资源状态及 bag 消息数。`experiment_conditions.requested` 保存 `/experiment/conditions` 的实验协议，`.target` 保存 `/target/experiment_state` 的目标运动配置与状态；两者不覆盖标准元数据。`initial_conditions` 在首次满足拦截采样条件时只记录一次实际 p/v、距离、水平距离、高度差（目标低于自身为正）、目标速度/方向、自身偏航、目标指令相位和实测圆周相位以及各源年龄，缺失值为 null。首次命中时间、撞后实际时长和是否被截断单独保存；`summary.csv` 每次实验一行，包含命中、拦截耗时、最近距离、计数、延迟及资源错误。
 
 compare 的 bag 包含 `/experiment/telemetry`、`/vpng_data`、`/camera_detect_result`、双机 GPS/local position 和自身 trajectory setpoint。archive 额外包含自身 odometry、thrust/torque setpoint 和 `/clock`，覆盖上述建议的八个 topic；原始图像不重复写入 bag，单独保存 MP4。安装的 `bag_qos.yaml` 使用兼容 PX4 BEST_EFFORT 的订阅；未发布话题不会凭空产生消息，实际消息数见元数据。
@@ -384,6 +388,8 @@ ros2 run uav_bc_recorder phase2_analysis \
 ```
 
 分析输出 `analysis/metrics.csv`、`results.json` 和各次首次最近点前 2 秒至后 3 秒的窗口 CSV。首次接近定义为入场后至少缩短 1 m、经过至少 1 秒，再出现“距离较运行最小值回升 1 m 并持续至少 0.2 秒”；不要求先缩短到某个比例，避免跳过远处的首次折返、把后续更好的接近当成首次成功。首次接近不等于首次近距离擦过，两者必须区分。窗口包含距离/水平距离/高度误差、bbox/检测、LOS/采样 LOS rate、yaw/yaw rate、速度指令和控制状态；视觉角速度跨 ±π 正确包裹，检测缺口不桥接。它们是定频采样指标，不替代同步真值或 Gazebo 接触事件。
+
+有 P0 sidecar 时，分析另输出 `*_observations_aligned.csv` 和可用时的误差—距离图：分别在图像映射时刻、首次控制使用时刻，对两机 GPS 源时间独立插值（最大间隔 0.15 s，禁止外推）。`los_error_image_*` 与 `los_error_control_*` 不可混为一个指标；`receive_pose_error_image_*` 是同一观测用接收姿态计算的配对基线。延迟按观测事件统计，不按 20 Hz 重复采样行加权。首次接近仅取入场至首次最近点，报告 0.8–2、2–5、5–17 m 分箱、绝对误差中位数/P95及真值覆盖率；没有覆盖时保留 `NaN`/null，不用陈旧 GPS 填补。GPS geometry 仅供分析，不进入正式视觉制导。
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 

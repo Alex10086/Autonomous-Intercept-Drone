@@ -41,6 +41,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Dense>
 #include <uav_common_msg/msg/experiment_telemetry.hpp>
+#include <uav_common_msg/msg/simulation_clock.hpp>
+#include <uav_common_msg/msg/vision_observation.hpp>
+#include "uav_vision_png/time_alignment.hpp"
 #include <string>
 #include <array>
 #include <chrono>
@@ -145,6 +148,13 @@ private:
     rclcpp::TimerBase::SharedPtr timer_telemetry_;
     rclcpp::Publisher<uav_common_msg::msg::ExperimentTelemetry>::SharedPtr telemetry_pub_;
     std::string parameters_yaml_;
+    rclcpp::Publisher<uav_common_msg::msg::VisionObservation>::SharedPtr observation_pub_;
+    rclcpp::Subscription<uav_common_msg::msg::SimulationClock>::SharedPtr clock_sub_;
+    vision_time::ClockHistory clock_history_;
+    std::string image_time_domain_ = "gazebo";
+    double latest_attitude_time_ = std::numeric_limits<double>::quiet_NaN();
+    uav_common_msg::msg::VisionObservation observation_;
+    bool observation_pending_ = false;
     double used_dlos_v_ = 0.0;
     double used_dlos_z_ = 0.0;
 

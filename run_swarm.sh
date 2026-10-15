@@ -119,6 +119,9 @@ YEOF
 	PIDS+=("$PID_BRIDGE")
 	echo "   -> Bridge PID: $PID_BRIDGE (bridge.log)"
 	echo "   -> /camera/image"
+	# Preserve Gazebo sim/system pairs without changing control-node ROS clocks.
+	setsid ros2 run uav_vision_png simulation_clock_bridge &
+	PIDS+=("$!")
 	sleep 2
 echo ""
 echo "🚀 正在启动 Drone 2 (gz_x500, Instance 2)..."

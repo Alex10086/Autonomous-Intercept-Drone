@@ -1,5 +1,23 @@
-"""Offline phase-two metrics and first-encounter diagnostic windows."""
+"""Offline phase-two metrics and first-encounter diagnostic windows.
+
+Optional observations.csv/geometry.csv add event-weighted P0 diagnostics. The
+aligned CSV retains every observation; missing geometry is NaN, never a held
+position. Metrics use degrees, aligned residuals use radians (vision - truth).
+First approach means intercept_start_ros_time through the first closest epoch.
+
+Run ``phase2_analysis ROOT --output DIRECTORY`` as for legacy recordings. New
+``*_observations_aligned.csv`` files distinguish ``los_error_image_{v,z}_rad``
+from ``los_error_control_{v,z}_rad`` and ``receive_pose_error_image_{v,z}_rad``.
+results.json and metrics.csv include ``image_to_{bbox,control}_ms_{count,median,p95}``,
+``{scope}_{image,control}_abs_{v,z}_deg_{count,median,p95}``, geometry coverage,
+and ``{scope}_paired_{v,z}_{image_abs_deg,receive_pose_abs_deg,improvement_deg}``
+median/P95 with paired counts. Scopes are observations, first_approach (0.8..5m),
+first_approach_all_distances, and first_approach_{0p8_2,2_5,5_17}m. No-coverage
+statistics are JSON null. Optional ``*_observations_errors.png`` uses image-time
+distance on the x-axis for all three residual types.
+"""
 import argparse
+from bisect import bisect_left
 import csv
 import json
 import math
@@ -24,7 +42,7 @@ def norm(values):
 
 
 def wrapped(value):
-    return math.atan2(math.sin(value),math.cos(value))
+    return math.atan2(math.sin(value),math.cos(value)) if math.isfinite(value) else math.nan
 
 
 def first_encounter(rows):
@@ -111,6 +129,227 @@ def diagnostic_rows(rows):
     return output
 
 
+MAX_GEOMETRY_GAP_S = 0.15
+OBSERVATION_FIELDS = (
+    'image_stamp_s', 'image_time_ros', 'bbox_receive_time', 'projection_time',
+    'control_time', 'attitude_before_time', 'attitude_after_time', 'image_to_bbox_ms',
+    'image_to_control_ms', 'clock_valid', 'accepted', 'attitude_synced', 'status',
+    'source', 'confidence', 'x', 'y', 'width', 'height', 'los_v', 'los_z',
+    'receive_pose_los_v', 'receive_pose_los_z',
+)
+
+
+def geometry_samples(rows):
+    """Keep finite, strictly increasing source epochs per aircraft in event order.
+
+    Never sort resets into a plausible trajectory, or substitute receipt epochs
+    for incompatible/missing source epochs. Aircraft need not share timestamps.
+    """
+    samples = {'self': [], 'target': []}
+    for row in rows:
+        vehicle = row.get('vehicle')
+        if vehicle not in samples:
+            continue
+        sample = tuple(number(row, key) for key in ('source_time', 'x', 'y', 'z'))
+        if not all(math.isfinite(value) for value in sample):
+            continue
+        if samples[vehicle] and sample[0] <= samples[vehicle][-1][0]:
+            continue
+        samples[vehicle].append(sample)
+    return samples
+
+
+def interpolate_position(samples, epoch, max_gap=MAX_GEOMETRY_GAP_S):
+    """Interpolate monotonic (source_time, N, E, D) tuples without extrapolation.
+
+    Exact endpoints remain usable even beside a large gap. The small tolerance
+    only accommodates subtraction roundoff at large ROS/system epochs.
+    """
+    missing = (math.nan, math.nan, math.nan)
+    if not math.isfinite(epoch) or not samples:
+        return missing
+    index = bisect_left(samples, (epoch,))
+    if index < len(samples) and samples[index][0] == epoch:
+        return samples[index][1:]
+    if index == 0 or index == len(samples):
+        return missing
+    before, after = samples[index - 1], samples[index]
+    gap = after[0] - before[0]
+    tolerance = max(math.ulp(before[0]), math.ulp(after[0]))
+    if gap <= 0 or gap > max_gap + tolerance:
+        return missing
+    weight = (epoch - before[0]) / gap
+    return tuple(a + weight * (b - a) for a, b in zip(before[1:], after[1:]))
+
+
+def align_observations(observations, samples):
+    """Produce one row per bbox, distinguishing image and first-control truth.
+
+    clock_valid gates both epochs. Accepted observations without control_time
+    (superseded before a setpoint) still contribute image-time diagnostics.
+    """
+    aligned = []
+    for event in observations:
+        row = {key: event.get(key, '') for key in OBSERVATION_FIELDS}
+        for key in ('accepted', 'clock_valid', 'attitude_synced'):
+            row[key] = truth(event.get(key))
+        for phase, time_key in (('image', 'image_time_ros'), ('control', 'control_time')):
+            epoch = number(event, time_key) if row['clock_valid'] else math.nan
+            positions = {vehicle: interpolate_position(samples[vehicle], epoch)
+                         for vehicle in ('self', 'target')}
+            covered = all(math.isfinite(value) for position in positions.values() for value in position)
+            row[phase + '_geometry_covered'] = covered
+            for vehicle, position in positions.items():
+                for axis, value in zip('xyz', position):
+                    row[f'{vehicle}_{phase}_{axis}'] = value
+            relative = [t - s for t, s in zip(positions['target'], positions['self'])]
+            distance = norm(relative)
+            row[phase + '_distance_m'] = distance
+            angles = (math.atan2(relative[2], math.hypot(*relative[:2])),
+                      math.atan2(relative[0], relative[1])) if distance > 0 else (math.nan, math.nan)
+            for axis, angle in zip(('v', 'z'), angles):
+                row[f'truth_los_{phase}_{axis}_rad'] = angle
+                row[f'los_error_{phase}_{axis}_rad'] = wrapped(number(event, 'los_' + axis) - angle)
+                if phase == 'image':
+                    row[f'receive_pose_error_image_{axis}_rad'] = wrapped(
+                        number(event, 'receive_pose_los_' + axis) - angle)
+        aligned.append(row)
+    return aligned
+
+
+def percentile(values, fraction):
+    """Linearly interpolated percentile; None denotes no finite coverage."""
+    values = sorted(value for value in values if math.isfinite(value))
+    if not values:
+        return None
+    index = (len(values) - 1) * fraction
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    return values[lower] + (index - lower) * (values[upper] - values[lower])
+
+
+def error_metrics(rows, prefix):
+    """Compare paired image-pose/receipt-pose errors on identical observations."""
+    metrics = {prefix + '_events': len(rows)}
+    metrics[prefix + '_attitude_synced_events'] = sum(row['attitude_synced'] for row in rows)
+    metrics[prefix + '_control_time_events'] = sum(math.isfinite(number(row, 'control_time')) for row in rows)
+    for phase in ('image', 'control'):
+        covered = sum(bool(row[phase + '_geometry_covered']) for row in rows)
+        metrics[f'{prefix}_{phase}_geometry_count'] = covered
+        metrics[f'{prefix}_{phase}_geometry_coverage'] = covered / len(rows) if rows else None
+        for axis in ('v', 'z'):
+            values = [abs(math.degrees(row[f'los_error_{phase}_{axis}_rad'])) for row in rows]
+            key = f'{prefix}_{phase}_abs_{axis}_deg'
+            metrics[key + '_count'] = sum(math.isfinite(value) for value in values)
+            metrics[key + '_median'] = percentile(values, 0.5)
+            metrics[key + '_p95'] = percentile(values, 0.95)
+    for axis in ('v', 'z'):
+        paired = [(abs(math.degrees(row[f'los_error_image_{axis}_rad'])),
+                   abs(math.degrees(row[f'receive_pose_error_image_{axis}_rad']))) for row in rows]
+        paired = [(vision, receipt) for vision, receipt in paired
+                  if math.isfinite(vision) and math.isfinite(receipt)]
+        key = f'{prefix}_paired_{axis}'
+        metrics[key + '_count'] = len(paired)
+        for label, values in (
+                ('image_abs_deg', [vision for vision, _ in paired]),
+                ('receive_pose_abs_deg', [receipt for _, receipt in paired]),
+                ('improvement_deg', [receipt - vision for vision, receipt in paired])):
+            metrics[f'{key}_{label}_median'] = percentile(values, 0.5)
+            metrics[f'{key}_{label}_p95'] = percentile(values, 0.95)
+    return metrics
+
+
+def observation_metrics(aligned, intercept_start, closest_elapsed):
+    """Flat JSON/CSV metrics, weighted once per accepted finite vision event.
+
+    first_approach is 0.8..5m inclusive; distance bins are [0.8,2),
+    [2,5), [5,17]m. Positive paired improvement means image-pose is better.
+    Latencies use only finite nonnegative event timestamps, not timer rows.
+    """
+    eligible = [row for row in aligned if row['accepted'] and row['clock_valid']
+                and all(math.isfinite(number(row, key))
+                        for key in ('image_time_ros', 'los_v', 'los_z'))]
+    metrics = {'observation_events': len(aligned), 'observation_eligible_events': len(eligible)}
+    metrics.update(error_metrics(eligible, 'observations'))
+    for label, key in (('image_to_bbox', 'bbox_receive_time'), ('image_to_control', 'control_time')):
+        latencies = [(number(row, key) - number(row, 'image_time_ros')) * 1000 for row in eligible
+                     if math.isfinite(number(row, key))
+                     and number(row, key) >= number(row, 'image_time_ros')]
+        metrics[label + '_ms_count'] = len(latencies)
+        metrics[label + '_ms_median'] = percentile(latencies, 0.5)
+        metrics[label + '_ms_p95'] = percentile(latencies, 0.95)
+    window_valid = math.isfinite(intercept_start) and math.isfinite(closest_elapsed)
+    metrics['first_approach_epoch_available'] = window_valid
+    approach = [row for row in eligible if window_valid
+                and intercept_start <= number(row, 'image_time_ros') <= intercept_start + closest_elapsed]
+    metrics.update(error_metrics(approach, 'first_approach_all_distances'))
+    near = [row for row in approach if 0.8 <= row['image_distance_m'] <= 5.0]
+    metrics.update(error_metrics(near, 'first_approach'))
+    for label, lower, upper in (('0p8_2', 0.8, 2.0), ('2_5', 2.0, 5.0), ('5_17', 5.0, 17.0)):
+        subset = [row for row in approach if lower <= row['image_distance_m']
+                  and (row['image_distance_m'] <= upper if upper == 17.0
+                       else row['image_distance_m'] < upper)]
+        metrics.update(error_metrics(subset, 'first_approach_' + label + 'm'))
+    return metrics
+
+
+def plot_observation_errors(aligned, path, intercept_start, closest_elapsed):
+    """Optional diagnostic only; analysis does not require matplotlib."""
+    try:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    except ImportError:
+        return None
+    figure = Figure(figsize=(10, 7))
+    FigureCanvasAgg(figure)
+    for index, axis in enumerate(('v', 'z'), start=1):
+        panel = figure.add_subplot(2, 1, index)
+        for field, label in (('los_error_image', 'Image-time vision'),
+                             ('los_error_control', 'First-control-time vision'),
+                             ('receive_pose_error_image', 'Receipt-pose at image time')):
+            points = [(row['image_distance_m'], math.degrees(row[f'{field}_{axis}_rad']))
+                      for row in aligned if row['accepted'] and row['clock_valid']
+                      and all(math.isfinite(number(row, key)) for key in ('image_time_ros', 'los_v', 'los_z'))
+                      and intercept_start <= number(row, 'image_time_ros') <= intercept_start + closest_elapsed
+                      and 0.8 <= row['image_distance_m'] <= 17.0
+                      and math.isfinite(row[f'{field}_{axis}_rad'])]
+            panel.scatter([point[0] for point in points], [point[1] for point in points],
+                          s=8, alpha=0.6, label=label)
+        panel.set_xlabel('Image-time separation (m)')
+        panel.set_ylabel(f'{axis} residual (deg)')
+        panel.axhline(0, color='black', linewidth=0.5)
+        panel.legend()
+    figure.tight_layout()
+    figure.savefig(path)
+    return str(path)
+
+
+def analyze_observations(recording, output, name, meta, closest_elapsed):
+    observations_path = recording / 'observations.csv'
+    geometry_path = recording / 'geometry.csv'
+    if not observations_path.exists() or not geometry_path.exists():
+        return {}
+    with observations_path.open() as stream:
+        observations = list(csv.DictReader(stream))
+    with geometry_path.open() as stream:
+        samples = geometry_samples(csv.DictReader(stream))
+    aligned = align_observations(observations, samples)
+    path = output / (name + '_observations_aligned.csv')
+    # Derive the schema even for a recording with no bbox events.
+    fields = list((aligned or align_observations([{}], samples))[0])
+    with path.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(aligned)
+    start = number(meta, 'intercept_start_ros_time')
+    metrics = observation_metrics(aligned, start, closest_elapsed)
+    metrics.update(observations_aligned=str(path), geometry_max_gap_s=MAX_GEOMETRY_GAP_S,
+                   geometry_self_samples=len(samples['self']), geometry_target_samples=len(samples['target']))
+    metrics['observations_error_plot'] = plot_observation_errors(
+        aligned, output / (name + '_observations_errors.png'), start, closest_elapsed)
+    return metrics
+
+
 def analyze_recording(recording, output):
     meta=yaml.safe_load((recording/'meta.yaml').read_text())
     with (recording/'summary.csv').open() as stream:
@@ -118,7 +357,11 @@ def analyze_recording(recording, output):
     with (recording/'timeseries.csv').open() as stream:
         rows=list(csv.DictReader(stream))
     if not rows:
-        return {'recording':str(recording),'status':summary['status'],'reason':summary['reason'],'valid':False}
+        result = {'recording':str(recording),'status':summary['status'],'reason':summary['reason'],'valid':False}
+        requested = meta.get('experiment_conditions', {}).get('requested') or {}
+        name = f"{recording.name}_{meta.get('algorithm', 'unknown')}_{requested.get('group', 'unknown')}_{requested.get('trial', 'unknown')}"
+        result.update(analyze_observations(recording, output, name, meta, math.nan))
+        return result
     closest,end=first_encounter(rows)
     diagnostics=diagnostic_rows(rows)
     tclose=number(rows[closest],'elapsed_s')
@@ -159,6 +402,7 @@ def analyze_recording(recording, output):
         'track_lost_fraction':sum(r['controller_state']=='TRACK_LOST' for r in diagnostics)/len(diagnostics),
         'window':str(window),
     }
+    result.update(analyze_observations(recording, output, name, meta, tclose))
     return result
 
 

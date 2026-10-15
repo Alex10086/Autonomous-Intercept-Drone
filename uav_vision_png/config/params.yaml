@@ -28,6 +28,8 @@ uav_vision_png:
     k_ey: 0.0056
     # Guidance input. truth_los is diagnostic-only SITL GPS geometry.
     guidance_source: "vision"
+    # Original camera stamp domain; Gazebo sim/system pairs are mapped explicitly.
+    image_time_domain: "gazebo"
 
 
     # ---- 起飞参数 ----

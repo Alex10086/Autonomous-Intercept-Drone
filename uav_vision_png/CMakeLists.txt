@@ -25,6 +25,8 @@ find_package(px4_msgs    REQUIRED)
 find_package(uav_common_msg REQUIRED)
 find_package(GeographicLib  REQUIRED)
 find_package(Eigen3         REQUIRED)
+find_package(gz_transport_vendor REQUIRED)
+find_package(gz-transport13 REQUIRED)
 
 include_directories(
   include
@@ -52,8 +54,12 @@ ament_target_dependencies(uav_vision_png
   uav_common_msg
 )
 
+add_executable(simulation_clock_bridge src/simulation_clock_bridge.cpp)
+target_link_libraries(simulation_clock_bridge gz-transport13::gz-transport13)
+ament_target_dependencies(simulation_clock_bridge rclcpp uav_common_msg)
+
 # ---- 安装 ----
-install(TARGETS uav_vision_png
+install(TARGETS uav_vision_png simulation_clock_bridge
   DESTINATION lib/${PROJECT_NAME}
 )
 

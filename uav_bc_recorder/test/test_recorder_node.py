@@ -30,6 +30,38 @@ def recorder(tmp_path, monkeypatch):
         rclpy.shutdown()
 
 
+def test_geometry_retains_pre_origin_events_and_rejects_wrong_clock(recorder):
+    node, clock = recorder
+    clock[0] = 1_800_000_000.0
+    target = SensorGps()
+    target.fix_type = 3
+    target.latitude_deg, target.longitude_deg = 47.0001, 8.0
+    target.altitude_ellipsoid_m = 547.0
+    target.timestamp = 42_000_000
+    target.timestamp_sample = int(clock[0] * 1e6)
+    node._gps_cb("target_gps", target)
+    clock[0] += 0.1
+    own = SensorGps()
+    own.fix_type = 3
+    own.latitude_deg, own.longitude_deg = 47.0, 8.0
+    own.altitude_ellipsoid_m = 547.0
+    own.timestamp = int((clock[0] - 0.05) * 1e6)
+    node._gps_cb("self_gps", own)
+    target.timestamp = int((clock[0] + 10.0) * 1e6)
+    node._gps_cb("target_gps", target)
+    assert node.intercept_start is None
+    with (node.storage.path / "geometry.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 3
+    assert rows[0]["vehicle"] == "target"
+    assert float(rows[0]["receive_time"]) == 1_800_000_000.0
+    assert math.isnan(float(rows[0]["source_time"]))
+    assert float(rows[0]["x"]) > 10.0
+    assert float(rows[1]["source_time"]) == pytest.approx(clock[0] - 0.05)
+    assert float(rows[1]["x"]) == pytest.approx(0.0)
+    assert math.isnan(float(rows[2]["source_time"]))
+
+
 def ready(node, clock, algorithm="pure_png", target_altitude=547.0,
           target_velocity=(8.0, 0.0, 0.0), self_heading=0.0):
     for key, latitude in (("self_gps", 47.0), ("target_gps", 47.0001)):

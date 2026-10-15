@@ -165,6 +165,8 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     result.height = result_rect.height;
     result.depth = 0;
     result.confidence = result_confidence;
+    result.source = result_rect.width <= 0 ? result.UNKNOWN :
+        (acquired ? result.YOLO : result.LIGHTTRACK);
     uav_detect_result_publisher_->publish(result);
 
     if (show_debug_window_) {
