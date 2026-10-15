@@ -127,24 +127,41 @@ def test_finalize_sync_failure_still_closes_every_csv(tmp_path, monkeypatch):
     assert len(synced) == len(streams)
     assert all(stream.closed for stream in streams)
     assert not (storage.path / "summary.csv").exists()
+    assert "clock_offsets" in storage.sidecar_streams
 
 
-def test_sidecar_open_failure_closes_already_opened_csvs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_name, opened_count", [("geometry.csv", 2), ("clock_offsets.csv", 3)])
+def test_sidecar_open_failure_closes_already_opened_csvs(tmp_path, monkeypatch, failed_name, opened_count):
     from pathlib import Path
 
     original_open = Path.open
     streams = []
 
-    def fail_geometry_open(path, *args, **kwargs):
-        if path.name == "geometry.csv":
+    def fail_sidecar_open(path, *args, **kwargs):
+        if path.name == failed_name:
             raise OSError("injected sidecar open failure")
         stream = original_open(path, *args, **kwargs)
         if path.suffix == ".csv":
             streams.append(stream)
         return stream
 
-    monkeypatch.setattr(Path, "open", fail_geometry_open)
+    monkeypatch.setattr(Path, "open", fail_sidecar_open)
     with pytest.raises(OSError, match="injected sidecar open failure"):
         RunStorage(dict(DEFAULTS, out_dir=str(tmp_path)))
-    assert len(streams) == 2
+    assert len(streams) == opened_count
     assert all(stream.closed for stream in streams)
+
+
+def test_clock_offset_integer_precision_survives_durable_finalize(tmp_path):
+    storage = RunStorage(dict(DEFAULTS, out_dir=str(tmp_path)))
+    storage.write_sidecar("clock_offsets", dict(
+        vehicle="target", receive_time=1_800_000_000.1, timestamp_dds=1_799_999_999.8,
+        remote_time=1_800_000_000.0, estimated_offset_us=-1_799_999_957_800_000,
+        observed_offset_us=-1_799_999_957_800_100, round_trip_time_us=2000))
+    storage.finalize({"status": "no_intercept"})
+    assert all(stream.closed for stream in storage.sidecar_streams.values())
+    with (storage.path / "clock_offsets.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+    assert int(row["estimated_offset_us"]) == -1_799_999_957_800_000
+
+

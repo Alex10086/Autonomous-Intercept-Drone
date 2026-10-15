@@ -8,27 +8,28 @@ from time import monotonic
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from px4_msgs.msg import (
-    SensorGps, TrajectorySetpoint, VehicleLocalPosition, VehicleOdometry,
+    SensorGps, TimesyncStatus, TrajectorySetpoint, VehicleLocalPosition, VehicleOdometry,
     VehicleThrustSetpoint, VehicleTorqueSetpoint,
 )
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, Float64, String
-from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, VisionObservation
+from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, SimulationClock, VisionObservation
 import yaml
 
 from .experiment_storage import (
     ARCHIVE_TOPICS, COMPARE_TOPICS, COLUMNS, NAN, OBSERVATION_COLUMNS, TOPICS,
     BagCapture, RunStorage, VideoCapture, safe_identifier,
 )
+from .time_alignment import ClockHistory, DdsClock
 
 DEFAULTS = {
     "out_dir": "experiment_data", "algorithm": "vision_png", "target_motion": "circle",
     "profile": "debug", "scenario": "intercept", "experiment_id": "",
     "start_timeout": 60.0, "max_duration": 120.0, "sample_rate": 20.0, "topic_timeout": 1.0,
     "video_fps": 20.0, "camera_topic": "/camera/image", "image_width": 1920,
-    "image_height": 1080, "post_hit_duration": 2.0,
+    "image_height": 1080, "post_hit_duration": 2.0, "px4_time_domain": "gazebo_dds",
 }
 
 
@@ -89,6 +90,8 @@ class ExperimentRecorder(Node):
         self.cache = {}
         self.origin = None
         self.pending_geometry = []
+        self.clock_history = ClockHistory()
+        self.dds_clocks = {"self_gps": DdsClock(), "target_gps": DdsClock()}
         self.start_time = None
         self.start_wait_monotonic = monotonic()
         self.intercept_start = None
@@ -150,6 +153,8 @@ class ExperimentRecorder(Node):
             raise ValueError("algorithm must be pure_png or vision_png")
         if cfg["profile"] not in ("debug", "compare", "archive"):
             raise ValueError("profile must be debug, compare, or archive")
+        if cfg["px4_time_domain"] not in ("gazebo_dds", "ros"):
+            raise ValueError("px4_time_domain must be gazebo_dds or ros")
         safe_identifier(cfg["target_motion"], "target_motion")
         if cfg["experiment_id"]:
             safe_identifier(cfg["experiment_id"], "experiment_id")
@@ -202,6 +207,9 @@ class ExperimentRecorder(Node):
             ("vpng", Data, lambda message: self._cache("vpng", message)),
             ("detection", RectMsg, self._detect_cb),
             ("observations", VisionObservation, self._observation_cb),
+            ("clock_pairs", SimulationClock, self._clock_cb),
+            ("self_timesync", TimesyncStatus, lambda message: self._timesync_cb("self_gps", message)),
+            ("target_timesync", TimesyncStatus, lambda message: self._timesync_cb("target_gps", message)),
             ("self_gps", SensorGps, lambda message: self._gps_cb("self_gps", message)),
             ("target_gps", SensorGps, lambda message: self._gps_cb("target_gps", message)),
             ("self_local", VehicleLocalPosition, lambda message: self._cache("self_local", message)),
@@ -328,19 +336,62 @@ class ExperimentRecorder(Node):
         except Exception as exc:
             self._error(f"cannot record observation diagnostic: {exc}")
 
+    def _clock_cb(self, message):
+        if self.finished:
+            return
+        self._cache("clock_pairs", message)
+        sim, system = message.sim_time, message.system_time
+        if (sim.sec < 0 or system.sec < 0
+                or not 0 <= sim.nanosec < 1_000_000_000
+                or not 0 <= system.nanosec < 1_000_000_000):
+            return
+        if self.clock_history.add(
+                sim.sec + sim.nanosec * 1e-9,
+                system.sec + system.nanosec * 1e-9, self.cache["clock_pairs"][1]):
+            for clock in self.dds_clocks.values():
+                clock.clear()
+
+    def _timesync_cb(self, key, message):
+        if self.finished or message.source_protocol != TimesyncStatus.SOURCE_PROTOCOL_DDS:
+            return
+        status_key = "self_timesync" if key == "self_gps" else "target_timesync"
+        self._cache(status_key, message)
+        received = self.cache[status_key][1]
+        try:
+            self.storage.write_sidecar("clock_offsets", dict(
+                vehicle="self" if key == "self_gps" else "target",
+                receive_time=received, timestamp_dds=message.timestamp * 1e-6,
+                remote_time=message.remote_timestamp * 1e-6,
+                estimated_offset_us=message.estimated_offset,
+                observed_offset_us=message.observed_offset,
+                round_trip_time_us=message.round_trip_time))
+        except Exception as exc:
+            self._error(f"cannot record DDS clock diagnostic: {exc}")
+        self.dds_clocks[key].update(
+            message.timestamp, message.remote_timestamp, message.estimated_offset,
+            message.round_trip_time, received)
+
     def _geometry_event(self, key, message, coordinates, receive_time):
-        source_time = float(getattr(message, "timestamp", 0)) * 1e-6
-        if not (math.isfinite(source_time) and source_time > 0
-                and 0 <= receive_time - source_time <= self.config["topic_timeout"]):
-            source_time = NAN
-        event = (key, coordinates, source_time, receive_time)
+        timestamp = int(getattr(message, "timestamp", 0))
+        source_time_dds = timestamp * 1e-6
+        estimated_offset = NAN
+        if self.config["px4_time_domain"] == "gazebo_dds":
+            clock = self.dds_clocks[key]
+            estimated_offset = clock.offset(receive_time)
+            source_time = clock.map(timestamp, receive_time, self.clock_history)
+        else:
+            source_time = source_time_dds
+            if not (math.isfinite(source_time) and source_time > 0
+                    and 0 <= receive_time - source_time <= self.config["topic_timeout"]):
+                source_time = NAN
+        event = (key, coordinates, source_time, receive_time, source_time_dds, estimated_offset)
         if self.origin is None:
             self.pending_geometry.append(event)
             return
         events = self.pending_geometry
         self.pending_geometry = []
         events.append(event)
-        for vehicle_key, point, source, received in events:
+        for vehicle_key, point, source, received, raw_source, offset in events:
             if point[3] != self.storage.meta["gps_origin"]["altitude_source"]:
                 continue
             position = gps_to_ned(*point[:3], *self.origin)
@@ -348,6 +399,7 @@ class ExperimentRecorder(Node):
                 self.storage.write_sidecar("geometry", dict(
                     vehicle="self" if vehicle_key == "self_gps" else "target",
                     source_time=source, receive_time=received,
+                    source_time_dds=raw_source, estimated_offset_us=offset,
                     **dict(zip(("x", "y", "z"), position))))
             except Exception as exc:
                 self._error(f"cannot record geometry diagnostic: {exc}")
@@ -703,12 +755,13 @@ class ExperimentRecorder(Node):
                     self._error(text)
         if self.storage is None:
             return
-        for key, _, source_time, receive_time in self.pending_geometry:
+        for key, _, source_time, receive_time, raw_source, offset in self.pending_geometry:
             try:
                 self.storage.write_sidecar("geometry", dict(
                     vehicle="self" if key == "self_gps" else "target",
                     source_time=source_time, receive_time=receive_time,
-                    x=NAN, y=NAN, z=NAN))
+                    x=NAN, y=NAN, z=NAN,
+                    source_time_dds=raw_source, estimated_offset_us=offset))
             except Exception as exc:
                 self._error(f"cannot record geometry diagnostic without origin: {exc}")
         self.pending_geometry.clear()

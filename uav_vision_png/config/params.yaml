@@ -30,6 +30,8 @@ uav_vision_png:
     guidance_source: "vision"
     # Original camera stamp domain; Gazebo sim/system pairs are mapped explicitly.
     image_time_domain: "gazebo"
+    # Undo SITL DDS output offset, then use the native Gazebo clock mapping.
+    px4_time_domain: "gazebo_dds"
     # Image-epoch quaternion SLERP. false is the explicit receipt-pose A/B control.
     attitude_sync: true
 

@@ -72,6 +72,9 @@ install(FILES config/params.yaml
 )
 
 if(BUILD_TESTING)
+  add_executable(test_time_alignment test/test_time_alignment.cpp)
+  target_link_libraries(test_time_alignment Eigen3::Eigen)
+  add_test(NAME time_alignment COMMAND test_time_alignment)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(visual_freshness test/test_visual_freshness.py
     TIMEOUT 60

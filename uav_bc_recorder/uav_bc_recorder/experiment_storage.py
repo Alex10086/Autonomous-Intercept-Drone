@@ -29,7 +29,11 @@ OBSERVATION_COLUMNS = (
     "clock_valid accepted attitude_synced status source confidence x y width height "
     "los_v los_z receive_pose_los_v receive_pose_los_z"
 ).split()
-GEOMETRY_COLUMNS = "vehicle source_time receive_time x y z".split()
+GEOMETRY_COLUMNS = "vehicle source_time receive_time x y z source_time_dds estimated_offset_us".split()
+CLOCK_OFFSET_COLUMNS = (
+    "vehicle receive_time timestamp_dds remote_time estimated_offset_us "
+    "observed_offset_us round_trip_time_us"
+).split()
 SUMMARY_COLUMNS = (
     "status reason hit intercept_time elapsed_s min_distance samples detection_count "
     "lost_count reacquire_count latency_mean_ms latency_max_ms video_frames "
@@ -53,13 +57,17 @@ TOPICS = {
     "experiment_start": "/experiment/start",
     "target_start": "/experiment/target_start",
     "clock_pairs": "/simulation/clock_pairs",
+    "self_timesync": "/px4_1/fmu/out/timesync_status",
+    "target_timesync": "/px4_2/fmu/out/timesync_status",
     "observations": "/vision/observations",
 }
-COMPARE_TOPICS = [TOPICS[key] for key in (
+COMPARE_TOPICS = list(dict.fromkeys(TOPICS[key] for key in (
     "telemetry", "vpng", "detection", "self_gps", "target_gps",
     "self_local", "target_local", "trajectory", "conditions", "target_state",
-    "experiment_start", "target_start", "clock_pairs", "observations", "odom")]
-ARCHIVE_TOPICS = COMPARE_TOPICS + [TOPICS[key] for key in ("thrust", "torque")] + ["/clock"]
+    "experiment_start", "target_start", "clock_pairs", "observations", "odom",
+    "self_timesync", "target_timesync")))
+ARCHIVE_TOPICS = list(dict.fromkeys(
+    COMPARE_TOPICS + [TOPICS[key] for key in ("thrust", "torque")] + ["/clock"]))
 
 
 def safe_identifier(value, name):
@@ -149,8 +157,11 @@ class RunStorage:
                 "observation_status": "0 RECEIVE_POSE, 1 IMAGE_POSE, 2 CLOCK_UNAVAILABLE, 3 ATTITUDE_UNAVAILABLE, 4 INVALID_BOX, 5 NOT_GUIDING, 6 OUT_OF_ORDER",
                 "observation_source": "0 UNKNOWN, 1 YOLO, 2 LIGHTTRACK",
                 "geometry.csv": "one row per valid GPS callback, including before INTERCEPT; self/target positions in the same GPS-origin NED as timeseries; callbacks before origin are retained until origin exists, or written with NaN positions at finish if no origin arrives; incompatible altitude datums omitted",
-                "geometry_source_time": "SensorGps.timestamp * 1e-6 only if finite, positive and 0 <= receive_time - source_time <= topic_timeout; otherwise NaN; timestamp_sample is never used",
-                "geometry_receive_time": "recorder ROS receipt epoch seconds; source_time is preferred for interpolation only when valid",
+                "geometry_source_time": "gazebo_dds: signed integer SensorGps.timestamp + aircraft DDS estimated_offset recovers native Gazebo/PX4 HRT microseconds, then bounded /simulation/clock_pairs interpolation gives ROS/system epoch; ros: timestamp * 1e-6 only if positive and 0 <= receipt - source <= topic_timeout; unavailable mappings are NaN; timestamp_sample is never used",
+                "geometry_receive_time": "original recorder ROS receipt epoch seconds, unchanged by clock recovery or pre-origin queuing",
+                "geometry_clock_inputs": "source_time_dds retains SensorGps.timestamp seconds; estimated_offset_us is the latest accepted aircraft-specific DDS status offset used for recovery, or NaN if unavailable; accepted offset steps >20ms reset validation, but status loss and DDS topic boundaries still leave residual timing ambiguity, not a <=20ms error guarantee; raw status/sample inputs remain auditable; no receipt-derived offset or fallback",
+                "clock_offsets.csv": "every DDS TimesyncStatus callback for both aircraft, including before INTERCEPT and rejected/unmapped statuses; timestamp_dds and unmodified Agent remote_time are seconds; estimated/observed offsets and RTT are microseconds; non-DDS protocols are ignored",
+                "geometry_clock_validation": "status age <=2s; original recovered status and GPS sample must map without native-clock extrapolation; status native system time must agree with unmodified Agent remote_time within 50ms + RTT/2; bounded native history resets invalidate status validation",
             },
             "resources": {}, "recording_errors": [], "status": "starting",
         }
@@ -159,7 +170,9 @@ class RunStorage:
             self.stream = (self.path / "timeseries.csv").open("w", newline="", encoding="utf-8")
             self.writer = csv.DictWriter(self.stream, fieldnames=COLUMNS)
             self.writer.writeheader()
-            for name, columns in (("observations", OBSERVATION_COLUMNS), ("geometry", GEOMETRY_COLUMNS)):
+            for name, columns in (("observations", OBSERVATION_COLUMNS),
+                                  ("geometry", GEOMETRY_COLUMNS),
+                                  ("clock_offsets", CLOCK_OFFSET_COLUMNS)):
                 stream = (self.path / f"{name}.csv").open("w", newline="", encoding="utf-8")
                 self.sidecar_streams[name] = stream
                 writer = csv.DictWriter(stream, fieldnames=columns)

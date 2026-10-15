@@ -5,19 +5,21 @@ import math
 
 import pytest
 import rclpy
-from px4_msgs.msg import SensorGps, TrajectorySetpoint, VehicleLocalPosition, VehicleOdometry
+from px4_msgs.msg import SensorGps, TimesyncStatus, TrajectorySetpoint, VehicleLocalPosition, VehicleOdometry
 from std_msgs.msg import String
-from uav_common_msg.msg import ExperimentTelemetry, RectMsg
+from uav_common_msg.msg import ExperimentTelemetry, RectMsg, SimulationClock
 import yaml
 
 from uav_bc_recorder import recorder_node as recorder_module
 from uav_bc_recorder.recorder_node import DEFAULTS, ExperimentRecorder
+from uav_bc_recorder.time_alignment import ClockHistory, DdsClock, recover_sim_us
 
 
 @pytest.fixture
 def recorder(tmp_path, monkeypatch):
     monkeypatch.setitem(DEFAULTS, "out_dir", str(tmp_path))
     monkeypatch.setitem(DEFAULTS, "algorithm", "pure_png")
+    monkeypatch.setitem(DEFAULTS, "px4_time_domain", "ros")
     rclpy.init(args=[])
     node = ExperimentRecorder()
     clock = [100.0]
@@ -60,6 +62,226 @@ def test_geometry_retains_pre_origin_events_and_rejects_wrong_clock(recorder):
     assert float(rows[1]["source_time"]) == pytest.approx(clock[0] - 0.05)
     assert float(rows[1]["x"]) == pytest.approx(0.0)
     assert math.isnan(float(rows[2]["source_time"]))
+    assert float(rows[1]["source_time_dds"]) == pytest.approx(clock[0] - 0.05)
+    assert math.isnan(float(rows[1]["estimated_offset_us"]))
+
+
+EPOCH_US = 1_800_000_000_000_000
+SIM_US = 42_000_000
+
+
+def native_pair(node, sim_us, system_us):
+    message = SimulationClock()
+    message.sim_time.sec, remainder = divmod(sim_us, 1_000_000)
+    message.sim_time.nanosec = remainder * 1000
+    message.system_time.sec, remainder = divmod(system_us, 1_000_000)
+    message.system_time.nanosec = remainder * 1000
+    node._clock_cb(message)
+
+
+def native_status(node, key, offset, *, remote_shift_us=0):
+    message = TimesyncStatus()
+    message.source_protocol = TimesyncStatus.SOURCE_PROTOCOL_DDS
+    message.timestamp = SIM_US + 20_000 - offset
+    message.remote_timestamp = EPOCH_US + 20_000 + remote_shift_us
+    message.estimated_offset = offset
+    message.observed_offset = offset + 123
+    message.round_trip_time = 2000
+    node._timesync_cb(key, message)
+    return message
+
+
+def native_gps(node, key, offset, sim_us=SIM_US + 40_000):
+    message = SensorGps()
+    message.fix_type = 3
+    message.latitude_deg = 47.0 if key == "self_gps" else 47.0001
+    message.longitude_deg = 8.0
+    message.altitude_ellipsoid_m = 547.0
+    message.timestamp = sim_us - offset
+    # Deliberately incompatible: geometry must use timestamp, not timestamp_sample.
+    message.timestamp_sample = 1
+    node._gps_cb(key, message)
+    return message
+
+
+def seed_native_pairs(node, clock):
+    node.config["px4_time_domain"] = "gazebo_dds"
+    clock[0] = (EPOCH_US + 50_000) * 1e-6
+    native_pair(node, SIM_US, EPOCH_US)
+    native_pair(node, SIM_US + 50_000, EPOCH_US + 50_000)
+
+
+def sidecar(node, name):
+    with (node.storage.path / f"{name}.csv").open() as stream:
+        return list(csv.DictReader(stream))
+
+
+def test_native_geometry_recovers_independent_aircraft_clocks_before_intercept(recorder):
+    node, clock = recorder
+    seed_native_pairs(node, clock)
+    own_offset = SIM_US - EPOCH_US + 200_000
+    target_offset = SIM_US - EPOCH_US + 400_000
+    native_status(node, "self_gps", own_offset)
+    native_status(node, "target_gps", target_offset)
+    clock[0] = (EPOCH_US + 60_000) * 1e-6
+    target = native_gps(node, "target_gps", target_offset)
+    assert sidecar(node, "geometry") == []
+    clock[0] = (EPOCH_US + 70_000) * 1e-6
+    own = native_gps(node, "self_gps", own_offset)
+    rows = sidecar(node, "geometry")
+    assert [row["vehicle"] for row in rows] == ["target", "self"]
+    assert [float(row["source_time"]) for row in rows] == pytest.approx(
+        [(EPOCH_US + 40_000) * 1e-6] * 2, abs=1e-6)
+    assert [float(row["receive_time"]) for row in rows] == pytest.approx(
+        [(EPOCH_US + 60_000) * 1e-6, (EPOCH_US + 70_000) * 1e-6])
+    assert [int(row["estimated_offset_us"]) for row in rows] == [target_offset, own_offset]
+    assert [float(row["source_time_dds"]) for row in rows] == pytest.approx(
+        [target.timestamp * 1e-6, own.timestamp * 1e-6])
+    assert float(rows[0]["x"]) > 10
+    assert node.intercept_start is None
+    offsets = sidecar(node, "clock_offsets")
+    assert [row["vehicle"] for row in offsets] == ["self", "target"]
+    assert int(offsets[0]["observed_offset_us"]) == own_offset + 123
+    assert int(offsets[0]["round_trip_time_us"]) == 2000
+    assert float(offsets[0]["remote_time"]) == pytest.approx((EPOCH_US + 20_000) * 1e-6)
+    assert float(offsets[0]["timestamp_dds"]) == pytest.approx(
+        (SIM_US + 20_000 - own_offset) * 1e-6)
+
+
+@pytest.mark.parametrize("failure", ["no_status", "no_pairs", "bad_residual", "outside_history",
+                                    "status_outside_history", "stale_status", "stale_pairs",
+                                    "wrong_epoch", "wrong_protocol"])
+def test_native_geometry_missing_or_bad_mapping_is_nan_without_receipt_fallback(recorder, failure):
+    node, clock = recorder
+    seed_native_pairs(node, clock)
+    offset = SIM_US - EPOCH_US + 200_000
+    if failure != "no_status":
+        message = native_status(node, "self_gps", offset,
+                                remote_shift_us=100_000 if failure == "bad_residual" else 0)
+        if failure == "wrong_epoch":
+            node.dds_clocks["self_gps"].clear()
+            message.remote_timestamp = SIM_US
+            node._timesync_cb("self_gps", message)
+        elif failure == "wrong_protocol":
+            node.dds_clocks["self_gps"].clear()
+            message.source_protocol = TimesyncStatus.SOURCE_PROTOCOL_MAVLINK
+            node._timesync_cb("self_gps", message)
+        elif failure == "status_outside_history":
+            message.timestamp += 40_000
+            node._timesync_cb("self_gps", message)
+    if failure == "no_pairs":
+        node.clock_history.clear()
+    elif failure == "stale_status":
+        clock[0] += 2.01
+    elif failure == "stale_pairs":
+        clock[0] += 0.251
+    sample = SIM_US + (60_000 if failure == "outside_history" else 40_000)
+    native_gps(node, "self_gps", offset, sample)
+    row = sidecar(node, "geometry")[0]
+    assert math.isnan(float(row["source_time"]))
+    assert math.isfinite(float(row["source_time_dds"]))
+    assert float(row["receive_time"]) == clock[0]
+    if failure != "no_status":
+        assert sidecar(node, "clock_offsets")
+    if failure == "wrong_protocol":
+        assert len(sidecar(node, "clock_offsets")) == 1
+
+
+def test_native_clock_reset_invalidates_both_aircraft_statuses(recorder):
+    node, clock = recorder
+    seed_native_pairs(node, clock)
+    offset = SIM_US - EPOCH_US + 200_000
+    native_status(node, "self_gps", offset)
+    native_status(node, "target_gps", offset + 200_000)
+    native_gps(node, "self_gps", offset)
+    assert node.dds_clocks["self_gps"].validated
+    native_pair(node, SIM_US - 1_000_000, EPOCH_US + 50_000)
+    assert all(status.status is None for status in node.dds_clocks.values())
+    assert len(sidecar(node, "clock_offsets")) == 2
+    native_gps(node, "self_gps", offset)
+    assert math.isnan(float(sidecar(node, "geometry")[1]["source_time"]))
+
+
+@pytest.mark.parametrize("time_domain", ["", "sim", "gazebo"])
+def test_px4_time_domain_rejects_unknown_modes(recorder, time_domain):
+    node, _ = recorder
+    node.config["px4_time_domain"] = time_domain
+    with pytest.raises(ValueError, match="px4_time_domain"):
+        node._validate_config()
+    node.config["px4_time_domain"] = "ros"
+
+
+def test_native_offset_records_rejected_status_and_preserves_previous_valid_status(recorder):
+    node, clock = recorder
+    seed_native_pairs(node, clock)
+    offset = SIM_US - EPOCH_US + 200_000
+    message = native_status(node, "self_gps", offset)
+    message.remote_timestamp = SIM_US
+    message.estimated_offset += 100_000
+    node._timesync_cb("self_gps", message)
+    native_gps(node, "self_gps", offset)
+    assert float(sidecar(node, "geometry")[0]["source_time"]) == pytest.approx(
+        (EPOCH_US + 40_000) * 1e-6)
+    rows = sidecar(node, "clock_offsets")
+    assert len(rows) == 2
+    assert int(rows[1]["estimated_offset_us"]) == offset + 100_000
+    assert float(rows[1]["remote_time"]) == 42.0
+    # A new valid epoch with a bad native residual must invalidate cached success.
+    native_status(node, "self_gps", offset, remote_shift_us=100_000)
+    native_gps(node, "self_gps", offset)
+    assert math.isnan(float(sidecar(node, "geometry")[1]["source_time"]))
+
+
+def test_native_pending_geometry_without_origin_keeps_clock_inputs_at_finish(recorder):
+    node, clock = recorder
+    seed_native_pairs(node, clock)
+    offset = SIM_US - EPOCH_US + 400_000
+    native_status(node, "target_gps", offset)
+    message = native_gps(node, "target_gps", offset)
+    received = clock[0]
+    clock[0] += 0.1
+    node.finish()
+    row = sidecar(node, "geometry")[0]
+    assert float(row["source_time"]) == pytest.approx((EPOCH_US + 40_000) * 1e-6)
+    assert float(row["receive_time"]) == received
+    assert float(row["source_time_dds"]) == pytest.approx(message.timestamp * 1e-6)
+    assert int(row["estimated_offset_us"]) == offset
+    assert all(math.isnan(float(row[key])) for key in ("x", "y", "z"))
+
+
+def test_dds_recovery_adds_signed_integers_before_converting_to_seconds():
+    assert recover_sim_us((1 << 63) - 10, -(1 << 63) + 52) == 42
+    assert recover_sim_us((1 << 63) - 1, 1) is None
+    assert recover_sim_us(1 << 63, -(1 << 63) + 42) is None
+    assert recover_sim_us(100, -100) is None
+
+
+def test_dds_clock_reset_and_bounded_native_mapping():
+    history, clock = ClockHistory(), DdsClock()
+    epoch = EPOCH_US * 1e-6
+    offset = SIM_US - EPOCH_US + 200_000
+    assert not history.add(42.0, epoch, epoch + 0.05)
+    assert not history.add(42.05, epoch + 0.05, epoch + 0.05)
+    assert not clock.update(SIM_US + 20_000 - offset, EPOCH_US + 20_000,
+                            offset, 2000, epoch + 0.05)
+    assert clock.map(SIM_US + 40_000 - offset, epoch + 0.05, history) == pytest.approx(epoch + 0.04)
+    assert math.isnan(clock.map(SIM_US + 60_000 - offset, epoch + 0.05, history))
+    assert math.isnan(clock.map(SIM_US + 40_000 - offset, epoch + 2.06, history))
+    assert clock.update(SIM_US + 20_000 - offset, EPOCH_US + 20_000,
+                        offset + 20_001, 2000, epoch + 0.05)
+    assert not clock.validated
+    assert clock.offset(epoch + 0.05) == offset + 20_001
+    assert clock.update(SIM_US + 20_000 - offset, EPOCH_US + 19_999,
+                        offset + 20_001, 2000, epoch + 0.05)
+    assert clock.update(SIM_US + 20_000 - offset, EPOCH_US + 20_000,
+                        offset + 20_001, 2000, epoch + 0.04)
+    for index in range(ClockHistory.CAPACITY + 10):
+        sample = index * 0.01 + 43
+        history.add(sample, epoch + sample, epoch + sample)
+    assert len(history.samples) == ClockHistory.CAPACITY
+    assert math.isnan(history.map(42.04, epoch + 90))
+    assert history.add(1.0, epoch + 100, epoch + 100)
+    assert len(history.samples) == 1
 
 
 def ready(node, clock, algorithm="pure_png", target_altitude=547.0,

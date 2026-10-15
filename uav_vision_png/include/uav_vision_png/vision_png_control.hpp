@@ -56,6 +56,7 @@
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/timesync_status.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <px4_msgs/msg/sensor_gps.hpp>
 #include <px4_msgs/msg/hover_thrust_estimate.hpp>
@@ -154,6 +155,9 @@ private:
     std::string parameters_yaml_;
     rclcpp::Publisher<uav_common_msg::msg::VisionObservation>::SharedPtr observation_pub_;
     rclcpp::Subscription<uav_common_msg::msg::SimulationClock>::SharedPtr clock_sub_;
+    rclcpp::Subscription<px4_msgs::msg::TimesyncStatus>::SharedPtr timesync_sub_;
+    vision_time::DdsClock dds_clock_;
+    std::string px4_time_domain_ = "gazebo_dds";
     vision_time::ClockHistory clock_history_;
     vision_time::AttitudeHistory attitude_history_;
     bool attitude_sync_ = true;

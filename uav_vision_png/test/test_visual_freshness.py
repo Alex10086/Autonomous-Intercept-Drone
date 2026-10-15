@@ -11,9 +11,9 @@ import rclpy
 from ament_index_python.packages import get_package_prefix
 from px4_msgs.msg import (
     HoverThrustEstimate, SensorGps, TrajectorySetpoint,
-    VehicleLocalPosition, VehicleOdometry,
+    VehicleLocalPosition, VehicleOdometry, TimesyncStatus,
 )
-from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, VisionObservation
+from uav_common_msg.msg import Data, ExperimentTelemetry, RectMsg, VisionObservation, SimulationClock
 
 
 @pytest.fixture
@@ -31,6 +31,7 @@ def flight(tmp_path, request):
         '/px4_1/fmu/in/offboard_control_mode',
         '/px4_1/fmu/in/trajectory_setpoint', '/px4_1/fmu/in/vehicle_command',
         '/px4_1/fmu/out/vehicle_odometry',
+        '/px4_1/fmu/out/timesync_status',
         '/px4_1/fmu/out/vehicle_local_position',
         '/px4_1/fmu/out/vehicle_status_v1',
         '/px4_1/fmu/out/hover_thrust_estimate',
@@ -47,6 +48,7 @@ def flight(tmp_path, request):
                '-p', 'track_lost_timeout:=1.0',
                '-p', f'guidance_source:={guidance_source}',
                '-p', 'image_time_domain:=ros',
+               '-p', f'px4_time_domain:={config.get("px4_time_domain", "ros")}',
                '-p', f'attitude_sync:={str(config.get("attitude_sync", False)).lower()}']
     for topic in topics:
         command += ['-r', f'{topic}:={prefix}{topic}']
@@ -68,8 +70,10 @@ def flight(tmp_path, request):
         ('hover', HoverThrustEstimate, '/px4_1/fmu/out/hover_thrust_estimate'),
         ('self_gps', SensorGps, '/px4_1/fmu/out/vehicle_gps_position'),
         ('target_gps', SensorGps, '/px4_2/fmu/out/vehicle_gps_position'),
+        ('clock', SimulationClock, '/simulation/clock_pairs'),
+        ('timesync', TimesyncStatus, '/px4_1/fmu/out/timesync_status'),
     ]:
-        publishers[key] = node.create_publisher(message_type, prefix + topic, 10)
+        publishers[key] = node.create_publisher(message_type, prefix + topic, 100)
 
     def pump(duration, action=None):
         deadline = time.monotonic() + duration
@@ -314,3 +318,41 @@ def test_late_attitude_is_bounded_without_receipt_pose_fallback(flight, future_a
         publishers['pose'].publish(pose)
         pump(0.04)
         assert state('SEARCHING')
+
+
+@pytest.mark.parametrize('flight', [
+    {'attitude_sync': True, 'px4_time_domain': 'gazebo_dds'}], indirect=True)
+def test_native_clock_recovers_drifting_dds_epoch_before_slerp(flight):
+    messages, publishers, pose, _, pump, wait, _, box = flight
+    epoch_us = time.time_ns() // 1000
+    # DDS says samples are 200ms older, but raw PX4 HRT is Gazebo simulation time.
+    estimated_offset = -(epoch_us - 10_000_000 - 200_000)
+    for sim_us in range(9_800_000, 10_000_001, 5_000):
+        clock = SimulationClock()
+        clock.sim_time.sec, rem = divmod(sim_us, 1_000_000)
+        clock.sim_time.nanosec = rem * 1000
+        system_us = epoch_us + sim_us - 10_000_000
+        clock.system_time.sec, rem = divmod(system_us, 1_000_000)
+        clock.system_time.nanosec = rem * 1000
+        publishers['clock'].publish(clock)
+    status = TimesyncStatus()
+    status.source_protocol = TimesyncStatus.SOURCE_PROTOCOL_DDS
+    status.estimated_offset = estimated_offset
+    status.timestamp = 9_950_000 - estimated_offset
+    status.remote_timestamp = epoch_us - 50_000
+    status.round_trip_time = 1000
+    publishers['timesync'].publish(status)
+    pump(0.03)
+    for sim_us, yaw in ((9_900_000, 0.0), (9_980_000, 0.4)):
+        pose.timestamp_sample = pose.timestamp = sim_us - estimated_offset
+        pose.reset_counter = 2
+        pose.q = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
+        publishers['pose'].publish(pose)
+        pump(0.025)
+    image_ns = (epoch_us - 60_000) * 1000
+    box(x=920, y=510, stamp_ns=image_ns)
+    wait(lambda: messages['observations'] and messages['observations'][-1].accepted)
+    event = messages['observations'][-1]
+    assert event.los_z == pytest.approx(math.pi / 2 - 0.2, abs=1e-4)
+    assert event.attitude_before_time <= event.image_time_ros <= event.attitude_after_time
+    assert event.attitude_after_time - event.attitude_before_time == pytest.approx(0.08, abs=1e-5)

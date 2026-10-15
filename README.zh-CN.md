@@ -326,6 +326,10 @@ experiment_data/
 
 P0 时间诊断不改变全局 `use_sim_time`。`run_swarm.sh` 同时启动 `simulation_clock_bridge`，把 Gazebo 同一条 Clock 中的 `sim` / `system` 时间发布到 `/simulation/clock_pairs`；Vision PNG 用有界历史插值将原始图像时间映射到系统时间，禁止用 bbox 接收时间反推时钟偏移。`image_time_domain` 默认为 `gazebo`；真实相机若已使用 ROS 系统时间，显式设为 `ros`。
 
+Gazebo SITL 的 DDS 时间戳即使已落在系统 epoch，也不能直接视为精确采样时间：DDS 平滑偏移在仿真/墙钟速率变化时可能滞后。`px4_time_domain=gazebo_dds`（默认）只接受 DDS `TimesyncStatus`，以整数运算恢复 `HRT_us = DDS_timestamp_us + estimated_offset_us`，再用原生 Gazebo sim/system 时钟对映射；姿态与 GPS 分析都遵循此口径。同步状态最长保留 2 s，恢复后的状态时刻还须与 Agent `remote_timestamp` 满足 `50 ms + RTT/2` 残差界；缺失/失败不回退到未经校准的 DDS epoch。真正使用 ROS 系统域的输入需显式设 `px4_time_domain=ros`。原始 HRT 跟随 Gazebo 的依据是 PX4 `GZBridge::clockCallback()` 与 POSIX lockstep `hrt_absolute_time()`，不是按接收时刻拟合出的偏移。
+
+`clock_offsets.csv` 保留两机原始 DDS 同步状态；`geometry.csv` 另保留原 DDS 时间与当时使用的估计偏移，以便审计状态更新/话题传输边界。超过 20 ms 的偏移跳变会切断姿态/等待历史；更小的主题边界歧义仍可能存在，不能把“epoch 匹配”当作零同步误差。compare bag 包含两机 `timesync_status`。
+
 记录器另存逐回调的 `observations.csv` 和 `geometry.csv`，不把定频快照当作独立视觉样本。前者记录原始/映射后的图像时间、控制节点 bbox 接收时间、LOS 计算时间、首次使用该观测的速度指令时间、姿态样本时间、来源（0=未知、1=YOLO、2=LightTrack）及 LOS；后者记录两机各次 GPS 的源时间、接收时间与统一 NED 位置。无效映射/从未被控制使用的时刻为 `NaN`。compare bag 也保留时钟对、逐观测诊断和 odometry；原有 `timeseries.csv` / `vision_latency_ms` 口径不变。
 
 `attitude_sync=true` 为正式路径：仅缓存 NED、有限且时间域匹配的 odometry quaternion，按 `timestamp_sample` 在图像映射时刻做归一化 SLERP（最短旋转弧）。姿态历史固定容量 512，插值两侧间隔不得超过 0.1 s，禁止外推；时钟回跳/暂停、估计器 reset 会切断历史。无时钟映射、无姿态包围或重复/乱序图像均发布明确拒绝状态，不刷新有效观测年龄、不静默回退到接收姿态。`attitude_sync=false` 仅用于保留原接收姿态路径的单变量 A/B；`truth_los` 路径不受该开关影响。此修复只对齐 `LOS(t_image)`，不预测目标到当前时刻。

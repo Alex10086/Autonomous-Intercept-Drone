@@ -307,7 +307,7 @@ def plot_observation_errors(aligned, path, intercept_start, closest_elapsed):
         for field, label in (('los_error_image', 'Image-time vision'),
                              ('los_error_control', 'First-control-time vision'),
                              ('receive_pose_error_image', 'Receipt-pose at image time')):
-            points = [(row['image_distance_m'], math.degrees(row[f'{field}_{axis}_rad']))
+            points = [(row['image_distance_m'], abs(math.degrees(row[f'{field}_{axis}_rad'])))
                       for row in aligned if row['accepted'] and row['clock_valid']
                       and all(math.isfinite(number(row, key)) for key in ('image_time_ros', 'los_v', 'los_z'))
                       and intercept_start <= number(row, 'image_time_ros') <= intercept_start + closest_elapsed
@@ -316,8 +316,8 @@ def plot_observation_errors(aligned, path, intercept_start, closest_elapsed):
             panel.scatter([point[0] for point in points], [point[1] for point in points],
                           s=8, alpha=0.6, label=label)
         panel.set_xlabel('Image-time separation (m)')
-        panel.set_ylabel(f'{axis} residual (deg)')
-        panel.axhline(0, color='black', linewidth=0.5)
+        panel.set_ylabel(f'|{axis} residual| (deg)')
+        panel.set_ylim(bottom=0)
         panel.legend()
     figure.tight_layout()
     figure.savefig(path)
