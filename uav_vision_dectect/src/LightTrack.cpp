@@ -1,4 +1,5 @@
 #include "LightTrack.h"
+#include "tracking_math.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -224,7 +225,7 @@ void LightTrack::update(const cv::Mat &x_crops, float scale_z) {
 
     auto max_it = std::max_element(cls_score_sigmoid.begin(), cls_score_sigmoid.end());
     cls_score_position = std::distance(cls_score_sigmoid.begin(), max_it);
-    track_score = *max_it;
+    raw_track_score = *max_it;
 
     // Parse bbox_pred [1, 4, 18, 18]
     const float* bbox_pred_data = outputs[1].GetTensorData<float>();
@@ -259,21 +260,13 @@ void LightTrack::update(const cv::Mat &x_crops, float scale_z) {
         penalty[i] = std::exp(-1 * (s_c[i] * r_c[i] - 1) * penalty_tk);
     }
 
-    // Window penalty
-    std::vector<float> pscore(spatial);
-    int r_max = 0, c_max = 0;
-    float maxScore = 0;
-    for (int i = 0; i < spatial; i++) {
-        pscore[i] = (penalty[i] * cls_score_sigmoid[i]) * (1 - window_influence) + window[i] * window_influence;
-        if (pscore[i] > maxScore) {
-            maxScore = pscore[i];
-            r_max = std::floor(i / rows);
-            c_max = ((float)i / rows - r_max) * rows;
-        }
-    }
+    // The score, penalty and bbox regression must use the very same flat index.
+    const int idx = lighttrack::select_candidate(cls_score_sigmoid.data(), penalty.data(),
+        window.data(), spatial, window_influence);
+    selected_score_position = idx;
+    track_score = cls_score_sigmoid[idx];
 
     // Decode to real size
-    int idx = r_max * cols + c_max;
     float pred_xs = (pred_x1[idx] + pred_x2[idx]) / 2;
     float pred_ys = (pred_y1[idx] + pred_y2[idx]) / 2;
     float pred_w = pred_x2[idx] - pred_x1[idx];

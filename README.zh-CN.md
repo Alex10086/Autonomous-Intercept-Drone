@@ -321,7 +321,7 @@ experiment_data/
 * 自身和目标位置统一为首个有效自身 GPS 原点的 NED，单位 m，**z 向下为正**；不直接相减两架飞机各自原点的 local position。优先使用椭球高，MSL 回退会明确标注为近似，拒绝混合高程基准。
 * 速度为 PX4 local NED（m/s），角速度为 body FRD（rad/s）。`los_*`、`png_*` 单位 rad，方位角沿用算法的 `atan2(North, East)`；`dlos_*` 是算法使用的包裹后角增量（rad/update），不是角速度。
 * `cmd_thrust=-thrust.xyz[2]`，`cmd_tx/ty/tz` 来自 PX4 body-FRD 归一化 torque setpoint，不是 N 或 N·m。需要这些话题时，须确保 PX4 的 DDS 配置实际发布它们。
-* bbox 对应原始图像像素；`confidence` 是 YOLO 捕获分数或 LightTrack 跟踪分数，未提供/丢失为 `NaN`，两种分数不应视为同一个校准概率。
+* bbox 对应原始图像像素；`confidence` 是 YOLO 捕获分数或 LightTrack 实际选中候选的分类分数，未提供/丢失为 `NaN`，两种分数不应视为同一个校准概率。LightTrack 的全局分类最大值仅作为 `raw_score` 调试量，不能代替所发布 bbox 的分数。
 * 时间为记录器 ROS 时钟；检测新鲜度按接收时间计算，不等于源图像年龄保证。`vision_latency_ms` 仅在图像 stamp 非零、非未来且与接收时钟相差不超过 `topic_timeout` 时计算；Gazebo 仿真 stamp 与墙钟混用时为 `NaN`，不会相减出巨大“延迟”。需要有效延迟时应统一时间域；只有在 `/clock` 确实可用且相关节点配置一致时才启用 `use_sim_time`。
 
 P0 时间诊断不改变全局 `use_sim_time`。`run_swarm.sh` 同时启动 `simulation_clock_bridge`，把 Gazebo 同一条 Clock 中的 `sim` / `system` 时间发布到 `/simulation/clock_pairs`；Vision PNG 用有界历史插值将原始图像时间映射到系统时间，禁止用 bbox 接收时间反推时钟偏移。`image_time_domain` 默认为 `gazebo`；真实相机若已使用 ROS 系统时间，显式设为 `ros`。
@@ -435,6 +435,14 @@ P1 另输出 `*_source_metrics.csv`（按 YOLO/LightTrack、首次接近及距�
 `p2_stabilized_validation/2026-10-16_01-11-49/` 的首轮有效圆周验证最近 0.944 m、未命中；此前一轮因入口检测窗口不足而 invalid，保留且未放宽门槛。与直接相机 CV 首轮 9.949 m 相比，这轮回到 0.944 m，但单轮不能证明该变化由去旋转修正独立造成，也不能证明命中率改善。该轮首次接近 76 条接受观测对应 13 次 KF 参考重建，完整记录含 157/1195 个 COAST 采样；下一步单独检验短暂 COAST 不应丢弃滤波运动状态，而 PNG 本身恢复逻辑保持不变。
 
 短暂 COAST 现在只保持估计器状态，不清零其速度或重建参考平面；SEARCHING/TRACK_LOST、时钟/姿态 reset 仍会重置，图像间隔超过 0.5 s 的 CV 状态也不跨盲区携带旧速度。PNG 的 COAST 恢复初始化未改。真实节点回归已先复现“短暂停顿后 `du=0`”，修正后与其余 93 项回归一同通过。`p2_coast_validation/2026-10-16_01-22-49/` 首次接近 99 条接受观测只使用一个参考平面，但最近距离仍为 1.574 m、未命中；近接成对预测中位收益为垂直 −0.680°、方位 −1.176°。状态连续性修复不等于观测漂移被修复，接下来保留这一版本做重复对照，再推进 P3 来源融合。
+
+**LightTrack 候选一致性修复**
+
+P2 对照期间发现，原 C++ 先选出 window/size-penalized 评分最高的扁平索引，又通过浮点行列还原索引；18×18 网格在 Release 复现中有 132/324 个位置发生截断错位（例如 21→20）。当前直接保留整数索引，分类、尺度惩罚、bbox 回归严格对应同一候选，并移除不再需要的 pscore 临时数组。置信度也改为该候选的分类分数；日志同时保留 `raw_argmax` / `raw_score` 与 `selected`，不新增置信度过滤或假失锁门槛。
+
+这与[官方 LightTrack 的候选选择及返回分数语义](https://github.com/researchmm/LightTrack/blob/39c426f48ee674795cdf0e00301a0b4ad0785d2a/lib/tracker/lighttrack.py)一致。官方也保留两次尺度混合，因此本阶段没有凭 `lr²` 的外观修改尺寸公式、窗口权重或学习率。修复前数据里的高 `track_score` 可能是另一位置的全局最大分数，不应事后当作实际 bbox 的校准置信度。
+
+324 个候选位置、窗口/尺度评分优先级和并列边界的确定性回归通过。仅改前端候选关联、保持 `7b086dc` 的 image/raw 控制与全部条件不变的首轮真实 CUDA 圆周验证（`tracker_index_validation/2026-10-16_01-40-52/`）最近 2.145 m、未命中；确定性错误已修正，但该轮不能证明拦截性能提升。先以此正确前端继续对照，不用 KF 把错误索引隐藏起来。
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 

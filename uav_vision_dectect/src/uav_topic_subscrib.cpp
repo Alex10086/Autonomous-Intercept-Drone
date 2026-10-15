@@ -200,10 +200,11 @@ void UavTopicSubscrib::track_frame(
         status_text = "Tracking";
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
             "[VISION_DIAG] source=LightTrack outcome=tracking frame=%llu "
-            "score=%.4f bbox=%d,%d,%d,%d raw_argmax=%d",
+            "score=%.4f raw_score=%.4f bbox=%d,%d,%d,%d raw_argmax=%d selected=%d",
             static_cast<unsigned long long>(frame_count_), siam_tracker->track_score,
+            siam_tracker->raw_track_score,
             safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
-            siam_tracker->cls_score_position);
+            siam_tracker->cls_score_position, siam_tracker->selected_score_position);
         return;
     }
     ++tracker_loss_count_;

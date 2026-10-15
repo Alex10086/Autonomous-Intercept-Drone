@@ -24,6 +24,8 @@ public:
     void track(const uint8_t *img);
 
     int cls_score_position = 0;
+    int selected_score_position = 0;
+    float raw_track_score = 0.0f;
     float track_score = 0.0f;
 
     cv::Point target_pos = {0, 0};
