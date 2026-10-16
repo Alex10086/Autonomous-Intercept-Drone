@@ -462,6 +462,25 @@ P2 对照期间发现，原 C++ 先选出 window/size-penalized 评分最高的�
 
 `camera_reliable_validation/2026-10-16_02-38-23/` 的完整固定圆周实飞中，1112 条接受观测达到 30.16 Hz，接收间隔中位/P95/最大为 32.9/48.6/75.0 ms，采样状态没有 COAST 或 TRACK_LOST。image→bbox / 控制中位为 43.9/46.4 ms，没有靠旧帧积压换取高频。**首次近接仍在 2.749 m 擦过，后续才于 36.875 s 命中**，因此接收节拍问题已解决，但不能宣称首次拦截精度基本解决。测量 JSON、测量源码快照与正式飞行引用保存在 `~/intercept_ws/experiment_data/camera_cadence_diagnostic/qos_probe.json`。
 
+**异常帧取证（默认关闭，不改变选框或制导）**
+
+```bash
+ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" \
+  --out-root "$HOME/intercept_ws/experiment_data/bbox_anomaly_diagnostic" \
+  --groups near --trials 1 --pixel-estimator raw \
+  --image-reliability reliable --capture-anomalies
+```
+
+runner 将 `diagnostic_capture_dir` 指向该轮 `anomaly_frames/`；单独启动检测节点也可用 `-p diagnostic_capture_dir:=/绝对路径`。空目录参数默认关闭，不创建缓存或写图线程。仅当相邻处理帧的有效框中心位移大于图像对角线的 20%（1920×1080 时约 440.6 px），且同尺寸、图像 stamp 严格递增、间隔不超过 150 ms 时触发。此阈值**只决定取证，不拒绝框、不影响控制**；不会跨 invalid 或时间空档比较。
+
+每事件保存前两张、触发张、后两张已处理原图 PNG（不是保证相机连续帧），原图不画框、不缩放。`frames.csv` 记录原始 sec/ns、处理帧号、来源、最终框/分数；`candidates.csv` 记录 YOLO 经置信度筛选与 NMS 后的全部候选、裁剪前后坐标、类别/分数及选中标记，不是全部原始 anchors。`event.csv` 最后写入，记录触发位移、时间间隔和可用上下文；正常关闭时也保存未满两张后帧的 partial 事件。单后台 writer、最多两个等待事件、每进程最多 16 事件；队列满或写入失败明确报错，不等待 PNG 压缩阻塞推理。检查原图时应按 sec/ns 与 `observations.csv` 对齐，离线叠框另存，不能覆盖原图。
+
+实测 `bbox_anomaly_diagnostic/2026-10-16_08-32-48/` 为有效 Combined/image/raw/Reliable 飞行，16 个完整事件、80 张原生分辨率 PNG 已逐张解码检查。首次最近距离 **1.169 m，未命中**，60 s 内也未最终命中，不能作为修复成功率的证据。
+
+**已由图片确认：本机入镜桨叶被 YOLO 误检为目标。** `event_frame_1463_75_472000000/frame_0.png` 中真正目标仍在画面中部，唯一 YOLO 候选却是右边桨叶 `(1860,263,59,44)`、score 0.500；并非“正确候选也在，但最高分选错”。图像时刻距 INTERCEPT 约 6.415 s、GPS 距离 2.808 m、image→bbox 为 51.3 ms，错误方位残差约 −27.1°。该框立即重建 LightTrack；后两帧仍在右边缘，分数为 0.947/0.963。`event_frame_1540_78_13000000/` 另有左边桨叶误检 score 0.613。离线可视化位于该轮 `capture_review/`。本轮首次接近 image→bbox 中位/P95 为 56.4/70.4 ms；后续飞行中位增至 161.7 ms，尚未隔离其原因，不能声称取证对所有阶段时序零影响。
+
+当前结论是“YOLO 漏检真实目标并误检自身桨叶 → 刷新直接覆盖模板 → Tracker 高分延续错误目标”。尚未改变相机安装、添加边缘遮罩、目标关联、失锁门槛或 KF；后续应先针对自身入镜与目标身份验证，不用滤波掩盖错误目标。
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash

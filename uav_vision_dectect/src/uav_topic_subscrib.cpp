@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
 {
@@ -19,6 +20,11 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     enable_tracking_ = declare_parameter<bool>("enable_tracking", true);
     show_debug_window_ = declare_parameter<bool>("show_debug_window", true);
     yolo_refresh_interval_ = declare_parameter<int>("yolo_refresh_interval", 5);
+    const auto capture_directory = declare_parameter<std::string>("diagnostic_capture_dir", "");
+    if (!capture_directory.empty()) {
+        frame_capture_ = std::make_unique<vision_diagnostics::FrameCapture>(capture_directory);
+        RCLCPP_INFO(get_logger(), "Anomaly snapshots enabled: %s", capture_directory.c_str());
+    }
     const auto image_reliability = declare_parameter<std::string>("image_reliability", "reliable");
     if (image_reliability != "reliable" && image_reliability != "best_effort") {
         throw std::invalid_argument("image_reliability must be reliable or best_effort");
@@ -100,11 +106,13 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
         tracker_frames_since_yolo_ >= yolo_refresh_interval_;
     const bool need_detection = !enable_tracking_ || !tracking_ || refresh_yolo;
     bool acquired = false;
+    std::vector<Detection> candidates;
+    int selected_candidate = -1;
     if (need_detection) {
         ++yolo_frame_count_;
-        const auto results = yolo_detector_->detect(frame);
+        candidates = yolo_detector_->detect(frame);
         const Detection* best = nullptr;
-        for (const auto& det : results) {
+        for (const auto& det : candidates) {
             if (!best || det.conf > best->conf) {
                 best = &det;
             }
@@ -122,12 +130,15 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
             if (safe_rect.width > 0 && safe_rect.height > 0 && safe_rect.area() >= 10) {
                 ++acquisition_count_;
                 acquired = true;
+                if (frame_capture_) {
+                    selected_candidate = static_cast<int>(best - candidates.data());
+                }
                 tracker_frames_since_yolo_ = 0;
                 RCLCPP_INFO(get_logger(),
                     "[VISION_DIAG] source=YOLO outcome=acquired frame=%llu refresh=%s "
                     "candidates=%zu confidence=%.4f bbox=%d,%d,%d,%d acquisition=%llu",
                     static_cast<unsigned long long>(frame_count_),
-                    refresh_yolo ? "true" : "false", results.size(), best->conf,
+                    refresh_yolo ? "true" : "false", candidates.size(), best->conf,
                     safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
                     static_cast<unsigned long long>(acquisition_count_));
                 if (enable_tracking_) {
@@ -174,6 +185,12 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     result.source = result_rect.width <= 0 ? result.UNKNOWN :
         (acquired ? result.YOLO : result.LIGHTTRACK);
     uav_detect_result_publisher_->publish(result);
+
+    if (frame_capture_) {
+        frame_capture_->observe(frame_count_, msg->header.stamp.sec, msg->header.stamp.nanosec,
+            frame, result_rect, result_confidence, result.source,
+            std::move(candidates), selected_candidate, show_debug_window_);
+    }
 
     if (show_debug_window_) {
         if (result_rect.width > 0 && result_rect.height > 0) {

@@ -18,6 +18,7 @@ find_package(cv_bridge REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(uav_common_msg REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(Threads REQUIRED)
 
 # The SDK may be a release archive (include/) or a system-style installation.
 set(ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}" CACHE PATH "ONNX Runtime C++ SDK root")
@@ -34,6 +35,7 @@ message(STATUS "ONNX Runtime SDK: ${ONNXRUNTIME_INCLUDE_DIR}; ${ONNXRUNTIME_LIBR
 add_executable(uav_vision_dectect
   src/main.cpp
   src/uav_topic_subscrib.cpp
+  src/frame_capture.cpp
   src/LightTrack.cpp
   src/yolo_detector.cpp)
 target_include_directories(uav_vision_dectect PRIVATE
@@ -42,7 +44,7 @@ target_include_directories(uav_vision_dectect PRIVATE
   "${ONNXRUNTIME_INCLUDE_DIR}"
   ${OpenCV_INCLUDE_DIRS})
 # CUDA/shared provider libraries are loaded by ORT, not linked directly.
-target_link_libraries(uav_vision_dectect ${OpenCV_LIBS} "${ONNXRUNTIME_LIBRARY}")
+target_link_libraries(uav_vision_dectect ${OpenCV_LIBS} "${ONNXRUNTIME_LIBRARY}" Threads::Threads)
 set_target_properties(uav_vision_dectect PROPERTIES
   BUILD_RPATH "${ONNXRUNTIME_LIBRARY_DIR}"
   INSTALL_RPATH "${ONNXRUNTIME_LIBRARY_DIR}"
@@ -58,6 +60,11 @@ if(BUILD_TESTING)
   add_executable(test_tracking_math test/test_tracking_math.cpp)
   target_include_directories(test_tracking_math PRIVATE include/light_track)
   add_test(NAME tracking_math COMMAND test_tracking_math)
+  add_executable(test_frame_capture test/test_frame_capture.cpp src/frame_capture.cpp)
+  target_include_directories(test_frame_capture PRIVATE
+    include/uav_vision_dectect "${ONNXRUNTIME_INCLUDE_DIR}" ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_frame_capture ${OpenCV_LIBS} "${ONNXRUNTIME_LIBRARY}" Threads::Threads)
+  add_test(NAME frame_capture COMMAND test_frame_capture)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()

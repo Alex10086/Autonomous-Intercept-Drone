@@ -10,6 +10,7 @@
 #include "LightTrack.h"
 #include "uav_common_msg/msg/rect_msg.hpp"
 #include "yolo_detector.hpp"
+#include "frame_capture.hpp"
 
 class UavTopicSubscrib : public rclcpp::Node
 {
@@ -22,6 +23,7 @@ private:
     rclcpp::Publisher<uav_common_msg::msg::RectMsg>::SharedPtr uav_detect_result_publisher_;
     std::unique_ptr<LightTrack> siam_tracker;
     std::unique_ptr<YoloDetector> yolo_detector_;
+    std::unique_ptr<vision_diagnostics::FrameCapture> frame_capture_;
     bool enable_tracking_ = true;
     bool show_debug_window_ = true;
     bool tracking_ = false;
