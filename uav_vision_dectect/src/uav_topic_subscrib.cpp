@@ -3,6 +3,7 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -32,10 +33,16 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     if (yolo_refresh_interval_ < 0) {
         throw std::invalid_argument("yolo_refresh_interval must be nonnegative");
     }
-    // Apply one confidence threshold from YOLO post-processing through acquisition.
+    // Detection candidates and permission to replace a tracker are separate.
     config.confThreshold = static_cast<float>(
         declare_parameter<double>("confidence_threshold", 0.4));
     config.iouThreshold = 0.45f;
+    const double acquisition_threshold = declare_parameter<double>("acquisition_threshold", 0.0);
+    if (!std::isfinite(acquisition_threshold) ||
+        acquisition_threshold < 0.0 || acquisition_threshold > 1.0) {
+        throw std::invalid_argument("acquisition_threshold must be finite and in [0,1]");
+    }
+    acquisition_threshold_ = static_cast<float>(acquisition_threshold);
 
     RCLCPP_INFO(get_logger(), "Loading vision models with %s execution requested", config.useCuda ? "CUDA" : "CPU");
     yolo_detector_ = std::make_unique<YoloDetector>(config);
@@ -43,8 +50,8 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
         siam_tracker = std::make_unique<LightTrack>(init_model.c_str(), update_model.c_str(), config.useCuda);
     }
     RCLCPP_INFO(get_logger(),
-                "Vision sessions initialized; confidence threshold >= %.3f, YOLO refresh=%d frames",
-                config.confThreshold, yolo_refresh_interval_);
+                "Vision sessions initialized; detection >= %.3f, acquisition > %.3f, YOLO refresh=%d frames",
+                config.confThreshold, acquisition_threshold_, yolo_refresh_interval_);
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
     // Keep one recent frame. Best-effort delivery showed large-image gaps in SITL.
@@ -125,7 +132,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 refresh_yolo ? "true" : "false",
                 static_cast<unsigned long long>(yolo_frame_count_),
                 static_cast<unsigned long long>(acquisition_count_));
-        } else {
+        } else if (best->conf > acquisition_threshold_) {
             const cv::Rect safe_rect = best->box & cv::Rect(0, 0, frame.cols, frame.rows);
             if (safe_rect.width > 0 && safe_rect.height > 0 && safe_rect.area() >= 10) {
                 ++acquisition_count_;
@@ -164,6 +171,13 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                     best->box.x, best->box.y, best->box.width, best->box.height,
                     safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height);
             }
+        } else {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                "[VISION_DIAG] source=YOLO outcome=below_acquisition frame=%llu "
+                "refresh=%s candidates=%zu confidence=%.6f required_gt=%.6f",
+                static_cast<unsigned long long>(frame_count_),
+                refresh_yolo ? "true" : "false", candidates.size(),
+                best->conf, acquisition_threshold_);
         }
         if (refresh_yolo && !acquired) {
             track_frame(frame, result_rect, result_confidence, status_text, color);
@@ -189,7 +203,8 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     if (frame_capture_) {
         frame_capture_->observe(frame_count_, msg->header.stamp.sec, msg->header.stamp.nanosec,
             frame, result_rect, result_confidence, result.source,
-            std::move(candidates), selected_candidate, show_debug_window_);
+            std::move(candidates), selected_candidate, show_debug_window_,
+            acquired && acquisition_count_ == 1);
     }
 
     if (show_debug_window_) {

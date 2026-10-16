@@ -424,6 +424,30 @@ void test_writer_error_is_reported()
         "writer filesystem failure was not visibly reported");
 }
 
+void test_first_acquisition_without_history()
+{
+    TemporaryDirectory temporary;
+    {
+        FrameCapture capture(temporary.path.string());
+        const cv::Rect box(2, 2, 4, 4);
+        capture.observe(1, 10, 0, image(1), box, 0.9f, 1, detections(box), 1, false, true);
+        capture.observe(2, 10, 33000000, image(2), box, 0.99f, 2, {}, -1);
+        capture.observe(3, 10, 66000000, image(3), box, 0.99f, 2, {}, -1);
+    }
+    const auto paths = event_directories(temporary.path);
+    require(paths.size() == 1, "first acquisition did not produce exactly one clip");
+    const Csv event(paths[0] / "event.csv");
+    require(event.cell(0, "trigger_reason") == "first_acquisition", "acquisition reason lost");
+    require(event.integer(0, "available_pre_frames") == 0, "invented acquisition history");
+    require(event.integer(0, "available_post_frames") == 2, "acquisition post-context missing");
+    require(event.integer(0, "previous_frame_number") == 0, "invented previous frame");
+    const Csv frames(paths[0] / "frames.csv");
+    require(frames.rows.size() == 3 && frames.integer(0, "relative_position") == 0,
+        "first-frame acquisition window is misaligned");
+    const auto saved = cv::imread((paths[0] / "frame_0.png").string());
+    require(cv::norm(saved, image(1), cv::NORM_INF) == 0, "acquisition raw pixels changed");
+}
+
 }  // namespace
 
 int main()
@@ -435,6 +459,7 @@ int main()
     test_event_limit();
     test_unusable_directory();
     test_writer_error_is_reported();
+    test_first_acquisition_without_history();
     std::cout << "FrameCapture: raw PNG pixels, full/partial context, candidates, adjacency, "
                  "unique directories, event limit and visible writer errors passed\n";
 }

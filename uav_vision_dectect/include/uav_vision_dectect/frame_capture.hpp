@@ -32,7 +32,7 @@ public:
         std::uint32_t stamp_nanosec, const cv::Mat& raw_bgr,
         const cv::Rect& selected, float confidence, int source,
         std::vector<Detection> candidates, int selected_candidate,
-        bool copy_image = false);
+        bool copy_image = false, bool first_acquisition = false);
 
 private:
     struct Frame {
@@ -55,6 +55,7 @@ private:
         double jump_pixels = 0.0;
         double threshold_pixels = 0.0;
         double stamp_delta_seconds = 0.0;
+        bool first_acquisition = false;
     };
 
     void enqueue_active(bool wait_for_space);

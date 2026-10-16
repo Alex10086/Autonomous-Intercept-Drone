@@ -198,6 +198,9 @@ def run_trial(args, session, group, index):
         'attitude_sync':args.attitude_sync if args.algorithm=='vision_png' else None,
         'pixel_estimator':args.pixel_estimator if args.algorithm=='vision_png' else None,
         'image_reliability':args.image_reliability,
+        'confidence_threshold':args.confidence_threshold,
+        'acquisition_threshold':args.acquisition_threshold,
+        'yolo_refresh_interval':args.yolo_refresh_interval,
         'diagnostic_capture_dir':str(trial/'anomaly_frames') if args.capture_anomalies else None,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
         'requested_height_difference':0.3,'height_tolerance':0.18,
@@ -300,7 +303,10 @@ def run_trial(args, session, group, index):
         detector_parameters = {
             'show_debug_window':False,'use_cuda':True,
             'enable_tracking':args.vision_mode!='yolo_only',
-            'image_reliability':args.image_reliability}
+            'image_reliability':args.image_reliability,
+            'confidence_threshold':args.confidence_threshold,
+            'acquisition_threshold':args.acquisition_threshold,
+            'yolo_refresh_interval':args.yolo_refresh_interval}
         if args.capture_anomalies:
             detector_parameters['diagnostic_capture_dir'] = str(trial/'anomaly_frames')
         owned.start('detector',ros_command(
@@ -427,6 +433,12 @@ def main(argv=None):
                         help='P2 single-variable A/B: image LOS or current-time pixel KF')
     parser.add_argument('--image-reliability',choices=['reliable','best_effort'],default='reliable',
                         help='Camera subscription reliability; reliable matches the Gazebo large-image publisher')
+    parser.add_argument('--confidence-threshold',type=float,default=0.4,
+                        help='YOLO post-processing candidate threshold')
+    parser.add_argument('--acquisition-threshold',type=float,default=0.0,
+                        help='Independent strict score > threshold gate; 0 retains the current reference')
+    parser.add_argument('--yolo-refresh-interval',type=int,default=5,
+                        help='Tracker frames before YOLO refresh; 0 retains acquisition-only YOLO')
     parser.add_argument('--capture-anomalies',action='store_true',
                         help='Save raw frames +/-2 around large bbox jumps; diagnostic only, no guidance changes')
     parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
@@ -448,6 +460,12 @@ def main(argv=None):
         parser.error('--diagnostic-bypass-detector-entry requires vision_png')
     if args.trials<1 or args.duration<=0 or not math.isfinite(args.duration):
         parser.error('trials and finite duration must be positive')
+    for name in ('confidence_threshold','acquisition_threshold'):
+        value = getattr(args,name)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            parser.error(f'{name} must be finite and in [0,1]')
+    if args.yolo_refresh_interval < 0:
+        parser.error('yolo-refresh-interval must be nonnegative')
     for name in ('near_center_e','far_center_e','release_phase','self_altitude'):
         if not math.isfinite(getattr(args,name)):
             parser.error(f'{name} must be finite')

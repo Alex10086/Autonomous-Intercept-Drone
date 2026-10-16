@@ -110,7 +110,8 @@ FrameCapture::~FrameCapture() noexcept
 void FrameCapture::observe(std::uint64_t frame_number, std::int32_t stamp_sec,
     std::uint32_t stamp_nanosec, const cv::Mat& raw_bgr,
     const cv::Rect& selected, float confidence, int source,
-    std::vector<Detection> candidates, int selected_candidate, bool copy_image)
+    std::vector<Detection> candidates, int selected_candidate, bool copy_image,
+    bool first_acquisition)
 {
     if (event_count_ >= max_events && !active_) return;
 
@@ -119,8 +120,8 @@ void FrameCapture::observe(std::uint64_t frame_number, std::int32_t stamp_sec,
     std::int64_t delta_ns = 0;
     double threshold = 0.0;
     double jump = 0.0;
-    bool trigger = false;
-    if (!active_ && previous && !raw_bgr.empty()
+    bool trigger = !active_ && first_acquisition && !raw_bgr.empty() && valid_box(selected);
+    if (!trigger && !active_ && previous && !raw_bgr.empty()
         && frame_number > previous->number && frame_number - previous->number == 1
         && raw_bgr.size() == previous->image.size()
         && valid_box(selected) && valid_box(previous->selected)) {
@@ -142,6 +143,7 @@ void FrameCapture::observe(std::uint64_t frame_number, std::int32_t stamp_sec,
         active_clip_.jump_pixels = jump;
         active_clip_.threshold_pixels = threshold;
         active_clip_.stamp_delta_seconds = delta_ns / 1000000000.0;
+        active_clip_.first_acquisition = first_acquisition;
         const std::size_t first = history_count_ == history_.size() ? history_next_ : 0;
         for (std::size_t i = 0; i < history_count_; ++i) {
             active_clip_.frames[active_clip_.count++] = history_[(first + i) % history_.size()];
@@ -251,7 +253,7 @@ void FrameCapture::report_error(const char* context, const char* message) noexce
 void FrameCapture::write_clip(const Clip& clip)
 {
     const Frame& trigger = *clip.frames[clip.pre_frames];
-    const Frame& previous = *clip.frames[clip.pre_frames - 1];
+    const Frame* previous = clip.pre_frames > 0 ? clip.frames[clip.pre_frames - 1].get() : nullptr;
     const std::string base = "event_frame_" + std::to_string(trigger.number) + "_"
         + std::to_string(trigger.stamp_sec) + "_" + std::to_string(trigger.stamp_nanosec);
     std::filesystem::path event_directory;
@@ -307,13 +309,16 @@ void FrameCapture::write_clip(const Clip& clip)
              "previous_frame_number,previous_stamp_sec,previous_stamp_nanosec,jump_pixels,"
              "jump_threshold_pixels,stamp_delta_seconds,image_width,image_height,"
              "requested_pre_frames,requested_post_frames,available_pre_frames,"
-             "available_post_frames,partial,shutdown_partial\n";
+             "available_post_frames,partial,shutdown_partial,trigger_reason\n";
     event << trigger.number << ',' << trigger.stamp_sec << ',' << trigger.stamp_nanosec << ','
-          << previous.number << ',' << previous.stamp_sec << ',' << previous.stamp_nanosec << ','
+          << (previous ? previous->number : 0) << ','
+          << (previous ? previous->stamp_sec : 0) << ','
+          << (previous ? previous->stamp_nanosec : 0) << ','
           << clip.jump_pixels << ',' << clip.threshold_pixels << ',' << clip.stamp_delta_seconds << ','
           << trigger.image.cols << ',' << trigger.image.rows << ",2,2," << clip.pre_frames << ','
           << clip.post_frames << ',' << (clip.pre_frames != 2 || clip.post_frames != 2 ? 1 : 0)
-          << ',' << (clip.post_frames < 2 ? 1 : 0) << '\n';
+          << ',' << (clip.post_frames < 2 ? 1 : 0) << ','
+          << (clip.first_acquisition ? "first_acquisition" : "bbox_jump") << '\n';
     event.close();
 }
 

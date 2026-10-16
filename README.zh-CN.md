@@ -481,6 +481,20 @@ runner 将 `diagnostic_capture_dir` 指向该轮 `anomaly_frames/`；单独启�
 
 当前结论是“YOLO 漏检真实目标并误检自身桨叶 → 刷新直接覆盖模板 → Tracker 高分延续错误目标”。尚未改变相机安装、添加边缘遮罩、目标关联、失锁门槛或 KF；后续应先针对自身入镜与目标身份验证，不用滤波掩盖错误目标。
 
+**原仓库感知策略三组对照**
+
+上游 `6f2d53b` 在正常跟踪时不运行 YOLO，检测候选阈值为 `>=0.4`，获取模板另要求严格 `>0.8`。本地 `b74d7c7` 取消第二道门槛、`97a27ab` 增加周期刷新并删除 raw argmax 跳变失锁判据；这是策略变化，不应全部称为确定性 bug 修复。对照保留整数候选索引、时间同步、Reliable/Depth1、raw 及现有失锁判据，不整提交回滚。
+
+runner 新增 `--confidence-threshold`（默认 0.4）、`--acquisition-threshold`（默认 0.0）、`--yolo-refresh-interval`（默认 5），分别透传同名节点参数并写入协议/分析。获取比较为 `score > acquisition_threshold`；默认 0.0 保持现有候选获取行为，0.8 恢复原独立严格门槛，不能用提高检测阈值替代。参数仅在启动时读取。
+
+| 对照 | 检测候选 | 获取 | refresh |
+|---|---:|---:|---:|
+| 当前参考 | >=0.4 | >0.0（候选已过0.4） | 5 |
+| 高获取门槛 | >=0.4 | >0.8 | 5 |
+| 原式获取/持续跟踪 | >=0.4 | >0.8 | 0 |
+
+例如原式分工：在固定圆周 runner 命令上加 `--confidence-threshold 0.4 --acquisition-threshold 0.8 --yolo-refresh-interval 0 --capture-anomalies`。开启取证时也保存第一次成功获取的前后上下文，`event.csv.trigger_reason=first_acquisition`，以排查“启动就认错”；没有历史时明确记录0张前帧，不伪造。真实 CUDA 冻结原图验证：score 0.4999756515 在默认门槛下接受、与门槛相等时拒绝、比门槛高一个 float ULP 时接受、0.8门槛下拒绝；首次获取无历史的图片回归通过。三组只验证获取/刷新分工，尚未恢复原索引失锁门槛。
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash

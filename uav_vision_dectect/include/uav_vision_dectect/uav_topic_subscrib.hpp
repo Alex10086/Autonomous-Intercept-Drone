@@ -28,6 +28,7 @@ private:
     bool show_debug_window_ = true;
     bool tracking_ = false;
     int yolo_refresh_interval_ = 5;
+    float acquisition_threshold_ = 0.0f;
     int tracker_frames_since_yolo_ = 0;
     cv::Size tracked_image_size_;
     std::uint64_t frame_count_ = 0;
