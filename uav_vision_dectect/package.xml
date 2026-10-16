@@ -12,6 +12,9 @@
   <depend>rclcpp</depend>
   <depend>ament_index_cpp</depend>
   <depend>uav_common_msg</depend>
+  <depend>px4_msgs</depend>
+  <depend>uav_vision_png</depend>
+  <depend>eigen</depend>
 
   <depend>cv_bridge</depend>
   <depend>sensor_msgs</depend>

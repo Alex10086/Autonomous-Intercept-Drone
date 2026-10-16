@@ -11,6 +11,13 @@
 #include <string>
 #include <utility>
 
+namespace {
+double stamp_seconds(const builtin_interfaces::msg::Time& stamp)
+{
+    return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
+}
+}
+
 UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
 {
     const auto model_dir = ament_index_cpp::get_package_share_directory("uav_vision_dectect") + "/model/";
@@ -84,10 +91,62 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
         cv::namedWindow("Result", cv::WINDOW_NORMAL);
         cv::resizeWindow("Result", 640, 640);
     }
+    state_callback_group_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    rclcpp::SubscriptionOptions state_options;
+    state_options.callback_group = state_callback_group_;
+    const auto state_qos = rclcpp::SensorDataQoS().keep_last(1);
+    clock_sub_ = create_subscription<uav_common_msg::msg::SimulationClock>(
+        "/simulation/clock_pairs", state_qos,
+        [this](const uav_common_msg::msg::SimulationClock& msg) {
+            const double received = now().seconds();
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            rotation_history_.clock(stamp_seconds(msg.sim_time),
+                stamp_seconds(msg.system_time), received);
+        }, state_options);
+    timesync_sub_ = create_subscription<px4_msgs::msg::TimesyncStatus>(
+        "/px4_1/fmu/out/timesync_status", state_qos,
+        [this](const px4_msgs::msg::TimesyncStatus& msg) {
+            if (msg.source_protocol != msg.SOURCE_PROTOCOL_DDS) return;
+            const double received = now().seconds();
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            rotation_history_.timesync(msg.timestamp, msg.remote_timestamp,
+                msg.estimated_offset, msg.round_trip_time, received);
+        }, state_options);
+    odometry_sub_ = create_subscription<px4_msgs::msg::VehicleOdometry>(
+        "/px4_1/fmu/out/vehicle_odometry", state_qos,
+        [this](const px4_msgs::msg::VehicleOdometry& msg) {
+            if (msg.pose_frame != msg.POSE_FRAME_NED) return;
+            const double received = now().seconds();
+            const Eigen::Quaterniond attitude(msg.q[0], msg.q[1], msg.q[2], msg.q[3]);
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            rotation_history_.odometry(msg.timestamp_sample, attitude, msg.reset_counter, received);
+        }, state_options);
+    camera_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        "/camera/camera_info", state_qos,
+        [this](const sensor_msgs::msg::CameraInfo& msg) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            camera_intrinsics_.k = msg.k;
+            camera_intrinsics_.width = msg.width <= static_cast<unsigned>(std::numeric_limits<int>::max()) ?
+                static_cast<int>(msg.width) : 0;
+            camera_intrinsics_.height = msg.height <= static_cast<unsigned>(std::numeric_limits<int>::max()) ?
+                static_cast<int>(msg.height) : 0;
+            camera_info_received_ = true;
+        }, state_options);
+    state_executor_.add_callback_group(state_callback_group_, get_node_base_interface());
+    // Start last: no callback observes a partially constructed node.
+    state_thread_ = std::thread([this]() {
+        // A stop flag also covers destruction before the thread enters spin.
+        while (!state_stopping_.load(std::memory_order_acquire) && rclcpp::ok())
+            state_executor_.spin_once(std::chrono::milliseconds(50));
+    });
 }
 
 UavTopicSubscrib::~UavTopicSubscrib()
 {
+    state_stopping_.store(true, std::memory_order_release);
+    state_executor_.cancel();
+    if (state_thread_.joinable()) state_thread_.join();
     RCLCPP_INFO(get_logger(),
         "[VISION_DIAG] summary frames=%llu yolo_frames=%llu acquisitions=%llu "
         "tracker_frames=%llu tracker_losses=%llu",
@@ -118,10 +177,54 @@ void UavTopicSubscrib::reset_tracking()
     tracking_ = false;
     continuity_.reset();
     confirmed_yolo_box_ = cv::Rect(-1, -1, -1, -1);
+    confirmed_rotation_ = FrameRotation{};
     last_prediction_box_ = cv::Rect(-1, -1, -1, -1);
     tracked_image_size_ = cv::Size();
     tracker_frames_since_yolo_ = 0;
     publication_expired_ = false;
+}
+
+UavTopicSubscrib::FrameRotation UavTopicSubscrib::frame_rotation(double image_sim)
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    FrameRotation result;
+    result.attitude = rotation_history_.sample(image_sim, now().seconds());
+    result.camera = camera_intrinsics_;
+    result.camera_available = camera_info_received_;
+    return result;
+}
+
+cv::Rect UavTopicSubscrib::rotation_prior(const FrameRotation& current,
+    const cv::Size& image_size, bool& compensated, const char*& reason) const
+{
+    compensated = false;
+    const auto invalid = cv::Rect(-1, -1, -1, -1);
+    if (confirmed_rotation_.attitude.generation != current.attitude.generation) {
+        reason = "generation_changed";
+        return invalid;
+    }
+    if (!confirmed_rotation_.camera_available || !current.camera_available) {
+        reason = "no_camera_info";
+        return confirmed_yolo_box_;
+    }
+    if (!(confirmed_rotation_.camera == current.camera) ||
+        current.camera.width != image_size.width || current.camera.height != image_size.height) {
+        reason = "calibration_changed_or_size_mismatch";
+        return invalid;
+    }
+    if (!confirmed_rotation_.attitude.valid || !current.attitude.valid) {
+        reason = "no_capture_attitude_bracket";
+        return confirmed_yolo_box_;
+    }
+    cv::Rect projected;
+    if (!vision_tracking::rotate_camera_prior(confirmed_yolo_box_, current.camera,
+        confirmed_rotation_.attitude.b2n, current.attitude.b2n, projected)) {
+        reason = "projection_invalid_or_outside";
+        return invalid;
+    }
+    compensated = true;
+    reason = "capture_rotation";
+    return projected;
 }
 
 void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -158,6 +261,11 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     bool detection_ran = false;
     int selected_candidate = -1;
     vision_tracking::DetectionDecision decision;
+    cv::Rect prior_rect = confirmed_yolo_box_;
+    FrameRotation current_rotation;
+    bool motion_compensated = false;
+    const char* prior_reason = "not_queried";
+    std::uint64_t prior_generation = confirmed_rotation_.attitude.generation;
     // Transition-only diagnostics retain both the prediction and the bounded
     // anchor. A timeout before inference explicitly has no current prediction.
     const auto log_transition = [&](const char* outcome, double age) {
@@ -173,7 +281,9 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
             "prediction_current=%s prediction_bbox=%d,%d,%d,%d "
             "last_prediction_bbox=%d,%d,%d,%d anchor_bbox=%d,%d,%d,%d "
             "detection_ran=%s candidates=%zu candidate_max=%.6f candidate_max_bbox=%d,%d,%d,%d "
-            "matched=%s support_candidate=%d support_iou=%.4f local=%s",
+            "matched=%s support_candidate=%d support_iou=%.4f local=%s "
+            "motion_compensated=%s prior_bbox=%d,%d,%d,%d prior_generation=%llu "
+            "frame_generation=%llu prior_reason=%s",
             outcome, static_cast<unsigned long long>(frame_count_), age,
             prediction_rect.width > 0 ? "true" : "false",
             prediction_rect.x, prediction_rect.y, prediction_rect.width, prediction_rect.height,
@@ -187,7 +297,11 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
             maximum_box.x, maximum_box.y, maximum_box.width, maximum_box.height,
             decision.action != vision_tracking::DetectionAction::Invalid ? "true" : "false",
             decision.candidate_index, decision.support_iou,
-            decision.local_recovery ? "true" : "false");
+            decision.local_recovery ? "true" : "false",
+            motion_compensated ? "true" : "false",
+            prior_rect.x, prior_rect.y, prior_rect.width, prior_rect.height,
+            static_cast<unsigned long long>(prior_generation),
+            static_cast<unsigned long long>(current_rotation.attitude.generation), prior_reason);
     };
     const double initial_age = continuity_.active() ? continuity_.support_age(frame_time) : 0.0;
     const auto expiry = continuity_.begin_frame(frame_time);
@@ -217,14 +331,35 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
         candidates = yolo_detector_->detect(frame);
         detection_ran = true;
         tracker_frames_since_yolo_ = 0;
+        // Inference gives the independent state executor time to collect clock
+        // and pose brackets; never replace capture-time attitude with receipt pose.
+        current_rotation = frame_rotation(stamp_seconds(msg->header.stamp));
+        if (had_tracker && continuity_.in_probation()) {
+            prior_rect = rotation_prior(current_rotation, frame.size(),
+                motion_compensated, prior_reason);
+        }
         decision = had_tracker ?
             vision_tracking::select_tracking_detection(candidates,
                 cv::Rect(0, 0, frame.cols, frame.rows), prediction_rect,
-                confirmed_yolo_box_, continuity_, frame_time,
+                prior_rect, continuity_, frame_time,
                 tracking_validation_iou_, acquisition_threshold_) :
             vision_tracking::select_detection(candidates,
                 cv::Rect(0, 0, frame.cols, frame.rows), nullptr,
                 tracking_validation_iou_, acquisition_threshold_);
+        if (had_tracker && continuity_.in_probation()) {
+            RCLCPP_INFO(get_logger(),
+                "[VISION_DIAG] outcome=probation_prior frame=%llu motion_compensated=%s "
+                "prior_bbox=%d,%d,%d,%d prior_generation=%llu frame_generation=%llu "
+                "prior_reason=%s frame_epoch=%.9f attitude_before=%.9f attitude_after=%.9f "
+                "local=%s support_candidate=%d support_iou=%.4f",
+                static_cast<unsigned long long>(frame_count_), motion_compensated ? "true" : "false",
+                prior_rect.x, prior_rect.y, prior_rect.width, prior_rect.height,
+                static_cast<unsigned long long>(prior_generation),
+                static_cast<unsigned long long>(current_rotation.attitude.generation), prior_reason,
+                current_rotation.attitude.epoch, current_rotation.attitude.before,
+                current_rotation.attitude.after, decision.local_recovery ? "true" : "false",
+                decision.candidate_index, decision.support_iou);
+        }
         if (had_tracker) {
             const auto evidence_time = Budget::Clock::now();
             const double evidence_age = continuity_.support_age(evidence_time);
@@ -252,6 +387,7 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 log_transition("probation_recovered", supported_age);
             }
             confirmed_yolo_box_ = decision.box;
+            confirmed_rotation_ = current_rotation;
             publication_expired_ = false;
             if (decision.action == vision_tracking::DetectionAction::Acquire) {
                 selected_candidate = decision.candidate_index;

@@ -161,6 +161,11 @@ sleep 15
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
   direction: GZ_TO_ROS
+- ros_topic_name: "/camera/camera_info"
+  gz_topic_name: "/world/grass_world/model/x500_depth_external_view_1/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
 YEOF
 
 	setsid bash -o pipefail -c 'ros2 run ros_gz_bridge parameter_bridge \

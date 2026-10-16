@@ -62,6 +62,9 @@ ament_target_dependencies(simulation_clock_bridge rclcpp uav_common_msg)
 install(TARGETS uav_vision_png simulation_clock_bridge
   DESTINATION lib/${PROJECT_NAME}
 )
+install(DIRECTORY include/ DESTINATION include)
+ament_export_include_directories(include)
+ament_export_dependencies(Eigen3)
 
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch

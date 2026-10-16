@@ -555,6 +555,13 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 
 本机visual隔离、独立世界、Reliable、姿态/时钟同步、raw与PNG参数均未回退。此处只证明机制与有界性，不把它当作新baseline资格或旧命中率复现。日志区分global_acquired、probation_enter/recovered、local_recovery、publication_expired和recovery_expired；低分局部重建也标为YOLO测量，不能误解为低分全局首次获取。验证数据在 `~/intercept_ws/experiment_data/probation_validation/`。
 
+**补偿有界恢复先验的自身转动。** 首版 `fb5e6db` 的24m先导三次中，两次入口有效：一次首次最近19.994m、TRACK_LOST80.3%，另一次0.680m首次命中、TRACK_LOST0%；第三次从未全局获取，保留为入口无效，不计控制失败。失败帧1375并非没有YOLO：候选0.776、框`1230,125,59,36`，但最后确认框`1280,496,55,39`与其IoU为0。按既有原生时钟/姿态重建，相隔约198ms自身旋转14.684°；补偿后框`1254,116,58,46`与候选IoU约0.357，可通过原0.1门槛。上次支持帧1369由刷新序列和support_age推定，原始YOLO该帧未留图，故这是有证据边界的离线反事实重叠，不是端到端恢复成绩。
+
+现在只在未过期probation的局部恢复分支，用实际 `/camera/camera_info` 的K和图像采样时刻自身姿态旋转最后确认框；仍先匹配当前Tracker，仍须真实YOLO候选支持才能续期。复用既有ClockHistory/DdsClock/AttitudeHistory，状态回调独立消费，推理后取图像epoch的SLERP，不拿接收姿态冒充。不同时间generation、改变的标定、后向或完全出图的投影拒绝旧先验；无姿态/标定时仅保留原保守像素先验。不估计目标速度、不使用GPS补偿平移、不扩ROI、不降低0.8全局门槛、不改PNG控制。PNG侧仅安装/export已有时间头和Eigen依赖。
+
+新版本真实CUDA回放的十项断言均通过；`live_20261016_143920` 重复15.003s空场景SEARCHING/零平移，12m静态目标获取、消失后0.950s零平移且内部最终过期。原生CameraInfo为1920×1080，fx≈1397.2236、fy≈1397.2235；日志已观察到capture_rotation及实际姿态bracket。几何/时钟回归通过；上述仍不是移动圆周命中率。离线依据在 `rotation_evidence/`，首版先导保留在 `formal_far/`，最终六次须另用同一固定版本评估。
+
+
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
 ```bash
