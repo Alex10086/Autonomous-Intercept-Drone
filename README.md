@@ -548,6 +548,19 @@ Near trial2 recovered after .626s/.488s support gaps using .586592/.460884 candi
 **Current decision at the user's request: temporarily adopt this version as the `vision_png` default, tagged `visionpng-baseline-high08-refresh5-probation-raw`; preserve the historical tag and do not restore unsafe behavior on main.** This is a provisional diagnostic baseline, not solved performance. Safety and24m continuity have end-to-end evidence, but one near60s miss/long loss remains. Next capture the near-approach image window on the same configuration to distinguish detection absence from tracker-coordinate drift, before KF/fusion or any further threshold change. Evidence: `motion_prior_far/2026-10-16_14-41-54`, `motion_prior_near/2026-10-16_14-46-49`, `final_validation_summary.json` and per-group `analysis/continuity_summary.json` under the probation root; all pilot negatives remain. Temporary diagnostic sources are archived in `validation_provenance.json`.
 
 
+**Non-circular GUI diagnosis: two sinusoidal and two random-walk trials (`b8511b7`, implementation still `4160914`).** Evidence is under `~/intercept_ws/experiment_data/visionpng_motion_gui/2026-10-16_15-39-11/`. All four had visible Gazebo/Result, actual interception entry, completed capture and finalized bags. Ordinary automatic entry, compare profile and0,0/20,0 spawns; no baseline threshold, budget, estimator or control changes.
+
+| Target / trial | Entry range m | First minimum m | Overall minimum m | 0.8m criterion s | Full TRACK_LOST | Pre-hit TRACK_LOST |
+|---|---:|---:|---:|---:|---:|---:|
+| sinusoidal 1 | 23.130 | .493 | .493 | 19.030 | 62.1% | 68.6% |
+| sinusoidal 2 | 23.514 | 8.315 | .509 | 34.879 | 81.2% | 85.8% |
+| random_walk 1 | 15.725 | .286 | .219 | 3.384 | 0.0% | 0.0% |
+| random_walk 2 | 15.607 | .648 | .632 | 4.031 | 45.5% | 18.5% |
+
+Sinusoidal first hits1/2 and eventual hits2/2 conceal long losses and three global acquisitions per trial. Random-walk first/eventual hits2/2 had nearer entry ranges and different motion directions/phases, so two trials cannot rank difficulty fairly. Full fractions include the2s post-hit tail. Recorded states nearest the criterion were COAST in three trials and TRACK_LOST in random_walk2: GPS-distance success is not continuous visual stability or physical-contact proof.
+
+Do not pool these ordinary-entry results with controlled24m/16.8m,0.3m-height-difference trials; targets were still climbing at initial takeover. Original random_device seeding is unchanged and actual paths are retained. Keep the temporary baseline/tag unchanged; do not lower gates or add KF from these results. Next control entry range/takeoff stability before diagnosing FOV exit, detector misses or tracker drift from near-pass images. Preserve `results.json`, `metrics.csv`, `actual_xy_paths.png`, per-trial CSV/bags/logs and GUI screenshots; no video was recorded.
+
 
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
 

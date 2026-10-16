@@ -705,6 +705,21 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 **当前决定（按用户指定）：暂时将本版本作为 `vision_png` 默认基线，标签 `visionpng-baseline-high08-refresh5-probation-raw`；历史冻结标签不覆写，main不回退旧的不安全行为。** 这是阶段性诊断基线，不宣称性能问题已解决：安全退出和24m弱分恢复有端到端证据，但16.8m仍有一次60s未命中和长期失锁。下一步优先用同一配置记录近接窗口原图，区分YOLO可见目标漏检与Tracker坐标漂移，不先加KF/融合、不放宽门槛。完整结果 `final_validation_summary.json`、分组 `analysis/continuity_summary.json`、bag/日志及首版负向记录全部保留；临时诊断源码归档于 `validation_provenance.json`。
 
 
+**非圆周GUI诊断：正弦与随机游走各两次（`b8511b7`，算法仍为 `4160914`）**
+
+数据位于 `~/intercept_ws/experiment_data/visionpng_motion_gui/2026-10-16_15-39-11/`。四次均显示Gazebo与Result、实际进入拦截，记录器正常完成且bag finalized；使用普通GUI自动接管、compare、出生位置0,0/20,0，未改临时基线阈值、恢复预算、raw或控制参数。
+
+| 目标轨迹/轮次 | 起追距离 m | 首次最近 m | 全程最近 m | 达到0.8m判据 s | 全段TRACK_LOST | 达标前TRACK_LOST |
+|---|---:|---:|---:|---:|---:|---:|
+| sinusoidal 1 | 23.130 | 0.493 | 0.493 | 19.030 | 62.1% | 68.6% |
+| sinusoidal 2 | 23.514 | 8.315 | 0.509 | 34.879 | 81.2% | 85.8% |
+| random_walk 1 | 15.725 | 0.286 | 0.219 | 3.384 | 0.0% | 0.0% |
+| random_walk 2 | 15.607 | 0.648 | 0.632 | 4.031 | 45.5% | 18.5% |
+
+结论：正弦首次1/2、最终2/2，但两次均有长失锁和三次全局获取；第二轮首次接近失败，不能用最终命中掩盖连续性问题。随机首次/最终均2/2，但起追距离更近且运动方向、实际相位不同，两轮样本不能公平排序轨迹难度。全段比例包含2s命中后尾段，短实验尤其受其影响；判据附近三轮记录为COAST、random_walk第2轮为TRACK_LOST，因此“GPS距离达标”不等于持续视觉制导稳定，更不证明物理撞击。
+
+本批不是固定24m/16.8m、0.3m高度差的受控入口，不能并入前述六次成绩；目标在初始接管时仍有爬升运动。随机种子沿用原std::random_device，实际轨迹保留在记录中。当前临时基线与标签不变，不据此放宽获取门槛或增加KF。后续对照应先统一起追距离和起飞稳定条件，再以近接原图区分目标出画、YOLO漏检和Tracker几何漂移。完整结果为 `results.json`、`metrics.csv`，实际空间轨迹为 `actual_xy_paths.png`，每轮保留CSV、bag、日志和GUI截图，无视频。
+
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
