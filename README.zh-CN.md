@@ -342,6 +342,82 @@ bash "$HOME/Documents/GitHub/Autonomous-Intercept-Drone/uav_bc_recorder/launch_b
 
 真实GUI烟测 `~/intercept_ws/experiment_data/visionpng_probation_baseline_freeze/gui_20261016_150725/`：Gazebo、QGroundControl和 `Result` 窗口存在，截图中实际目标带跟踪框；读取运行参数确认默认CUDA/refresh5/hold0.35/timeout2/raw/image同步，实际CameraInfo收到，脚本退出0、bag finalized。该10s普通入口烟测最近1.076m、未命中，仅证明GUI全链路与默认值，不计入上述固定距离六次结果。
 
+**分步GUI：目标机先飞，手动选择何时追击**
+
+这是前述一键流程的替代入口，不要与 `launch_bc_collection.sh` 或 `phase2_runner` 同时运行。复用已有 `require_experiment_start` 和 `/experiment/start`，不改算法代码、控制增益或临时基线标签。“开始”指追击制导；YOLO/LightTrack可提前预览，出现框不等于允许飞机追。
+
+每个ROS终端（下述终端2–6及可选记录终端）先执行相同环境：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/.local/opt/intercept/vision-env.bash"
+source "$HOME/intercept_ws/install/setup.bash"
+export ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0
+unset HEADLESS QT_QPA_PLATFORM
+```
+
+终端1：地面站，已有则不重复启动。
+
+```bash
+"$HOME/.local/bin/qgroundcontrol"
+```
+
+终端2：只启动双机仿真、相机和时钟桥。
+
+```bash
+export PX4_SELF_POSE="0,0" PX4_TARGET_POSE="20,0"
+unset GZ_PARTITION
+bash "$HOME/Documents/GitHub/Autonomous-Intercept-Drone/run_swarm.sh"
+```
+
+等脚本打印启动完成、两机在地面站上线。终端3：先让目标机自主起飞并做圆周运动。
+
+```bash
+ros2 run uav_target_sim uav_target_sim --ros-args -p motion_mode:=circle
+```
+
+确认目标机已起飞。终端4：打开第一视角识别/跟踪预览，沿用临时基线默认值。
+
+```bash
+ros2 run uav_vision_dectect uav_vision_dectect
+```
+
+终端5：拦截机自动起飞到待机高度，然后悬停等手动放行；即使预览有框也不会开始追击。
+
+```bash
+ros2 run uav_vision_png uav_vision_png --ros-args \
+  -p require_experiment_start:=true
+```
+
+终端6：可先观察状态，看到 `SEARCHING` 后按Ctrl+C停止这个观察命令（不会停止其它终端的控制节点）。
+
+```bash
+ros2 topic echo /experiment/telemetry --field state
+```
+
+准备好时，在终端6执行一次：
+
+```bash
+ros2 topic pub --once /experiment/start std_msgs/msg/Bool "{data: true}"
+```
+
+放行后仍需新鲜有效视觉观测及起飞就绪，没看到目标不会强制追击。这个Bool仅门控首次进入追击，**不是暂停/急停开关**；追击后发送false不能保证停止。重做一轮需正常结束当前各节点并重新启动，不要依赖重复发false重置。
+
+可选：需要记录时，在另一个已加载相同环境的终端、放行前启动记录器：
+
+```bash
+ros2 run uav_bc_recorder experiment_recorder --ros-args \
+  -p out_dir:="$HOME/intercept_ws/experiment_data/visionpng_manual_gui" \
+  -p algorithm:=vision_png -p target_motion:=circle \
+  -p scenario:=intercept -p profile:=compare \
+  -p start_timeout:=3600.0 -p max_duration:=60.0
+```
+
+记录器最多等待1小时进入拦截，时间可按需增大；控制节点的手动等待本身没有这个超时。bag从记录器启动即采集，CSV拦截采样从满足INTERCEPT条件起算。分步启动时，记录器结束不会自动关闭其它终端：先让记录器完成收尾，再逐个结束控制/检测/目标节点和仿真；用户原有地面站自行保留或关闭。
+
+真实GUI/CUDA验证 `visionpng_probation_baseline_freeze/manual_release_20261016_152025/`：目标机先起飞并运动，拦截机随后等待8.002s；期间收到241个有效框，状态始终SEARCHING，发布固定悬停位置而非追击指令；通过上述CLI放行后进入INTERCEPT。仅改变启动门控，不修改或移动临时基线标签；该验证不计入命中率。
+
+
 
 每次启动都立即在 `out_dir` 下原子创建独立目录，不覆盖历史数据；同秒启动自动递增编号。可用字符串参数 `experiment_id` 指定标识，目录仍带防碰撞后缀。
 

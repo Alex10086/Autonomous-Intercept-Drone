@@ -334,6 +334,44 @@ Expect Gazebo and the `Result` detection window, automatic takeoff/acquisition/i
 
 Actual GUI smoke is under `~/intercept_ws/experiment_data/visionpng_probation_baseline_freeze/gui_20261016_150725/`: all three windows present, actual tracked target visible, live default parameters and native CameraInfo verified, launcher exit0 and finalized bag. This10s ordinary-entry smoke missed at1.076m; it proves GUI/default operation only and is not part of the six fixed-range flights.
 
+**Split GUI workflow: target first, manual pursuit release.** This replaces, rather than runs alongside, the one-click script/phase2 runner. Reuse existing `require_experiment_start` and `/experiment/start`; no algorithm/gain/default-baseline change. Detection/tracking preview may run before pursuit authorization. Use the ROS/vision/workspace environment above in every ROS terminal, with `ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0` and `unset HEADLESS QT_QPA_PLATFORM`.
+
+Keep one QGroundControl open. Run each of the following foreground commands in its own terminal, in order; wait for simulation readiness and target takeoff:
+
+```bash
+# Simulation terminal
+export PX4_SELF_POSE="0,0" PX4_TARGET_POSE="20,0"
+unset GZ_PARTITION
+bash "$HOME/Documents/GitHub/Autonomous-Intercept-Drone/run_swarm.sh"
+```
+
+```bash
+# Target terminal
+ros2 run uav_target_sim uav_target_sim --ros-args -p motion_mode:=circle
+```
+
+```bash
+# Preview terminal
+ros2 run uav_vision_dectect uav_vision_dectect
+```
+
+```bash
+# Interceptor terminal: automatic takeoff, then position hold until released
+ros2 run uav_vision_png uav_vision_png --ros-args \
+  -p require_experiment_start:=true
+```
+
+In a further terminal, optionally monitor `ros2 topic echo /experiment/telemetry --field state`; Ctrl+C ends only the monitor. Once SEARCHING, choose when to release:
+
+```bash
+ros2 topic pub --once /experiment/start std_msgs/msg/Bool "{data: true}"
+```
+
+Release still requires fresh valid vision and takeoff readiness. This gates first pursuit only: publishing false after interception is **not a pause or emergency stop**. Restart the scenario for a new round. Optional recording before release uses `experiment_recorder` with `algorithm:=vision_png target_motion:=circle scenario:=intercept profile:=compare start_timeout:=3600.0 max_duration:=60.0` and the desired `out_dir`. Its one-hour startup limit is configurable and does not limit controller hold. Split-start recorders do not own the other terminals; finalize recording before stopping the other nodes/world.
+
+Actual GUI/CUDA verification `visionpng_probation_baseline_freeze/manual_release_20261016_152025/`: target airborne/moving first, then8.002s held SEARCHING with241 valid detections and fixed position-hold commands, followed by INTERCEPT after the manual CLI release. No code or baseline-tag changes; not hit-rate evidence. Full host-specific commands are also in the Chinese section.
+
+
 
 Each startup immediately creates an independent directory beneath `out_dir`, e.g. `2026-10-15_14-30-00_vision_png_circle_001/`, containing `meta.yaml`, `timeseries.csv`, and `summary.csv`. Archive adds `camera.mp4`; compare/archive add `rosbag/` and `rosbag.log`. Atomic directory creation increments the suffix instead of overwriting runs. An optional string `experiment_id` is included in the directory name and metadata, with a separate collision-safe suffix.
 
