@@ -12,6 +12,7 @@
 #include "yolo_detector.hpp"
 #include "frame_capture.hpp"
 
+#include "tracking_validation.hpp"
 class UavTopicSubscrib : public rclcpp::Node
 {
 public:
@@ -32,11 +33,25 @@ private:
     double tracking_validation_iou_ = 0.1;
     int tracker_frames_since_yolo_ = 0;
     cv::Size tracked_image_size_;
+    vision_tracking::ContinuityBudget continuity_{0.35, 2.0};
+    cv::Rect confirmed_yolo_box_{-1, -1, -1, -1};
+    cv::Rect last_prediction_box_{-1, -1, -1, -1};
+    bool publication_expired_ = false;
     std::uint64_t frame_count_ = 0;
     std::uint64_t yolo_frame_count_ = 0;
     std::uint64_t acquisition_count_ = 0;
     std::uint64_t tracker_frame_count_ = 0;
     std::uint64_t tracker_loss_count_ = 0;
+    std::uint64_t global_acquired_count_ = 0;
+    std::uint64_t matched_refresh_count_ = 0;
+    std::uint64_t low_score_support_count_ = 0;
+    std::uint64_t probation_enter_count_ = 0;
+    std::uint64_t probation_recovered_count_ = 0;
+    std::uint64_t local_recovery_count_ = 0;
+    std::uint64_t publication_expired_count_ = 0;
+    std::uint64_t recovery_expired_count_ = 0;
+
+    void reset_tracking();
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg);
     void track_frame(cv::Mat& frame, cv::Rect& result_rect, float& result_confidence,

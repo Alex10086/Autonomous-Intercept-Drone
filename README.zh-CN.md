@@ -212,7 +212,7 @@ Vision PNG 只在新的有效检测观测上更新一次 LOS／PNG 和 yaw-PD �
 
 接收年龄不等于图像年龄或推理时延；实际时序以逐观测诊断和native时钟映射分析为准。`uav_vision_png/test/test_visual_freshness.py` 的真实节点回归覆盖过期、恢复、重复坐标新帧和姿态时间对齐等行为；节点回归本身不证明实际拦截命中率。
 
-组合前端默认5个跟踪帧后，在下一帧用旧模板预测并运行YOLO复核。只在与当前Tracker框IoU达到 `tracking_validation_iou=0.1` 的候选中选择最高分；分数严格大于0.8才更新模板，0.4–0.8的同位候选支持保留Tracker并重置复核周期。没有同位支持则本帧发布无效框并退出跟踪，下一帧再全图获取，不能让失效Tracker无限刷新观测年龄，也不能用不相符的全局最高分直接覆盖当前跟踪。IoU只提供空间支持，不保证身份。`refresh=0` 显式关闭此复核，不适合无目标自动制导。
+组合前端保持严格全局首次获取 `>0.8`，正常refresh5并要求同帧空间支持。一次没有YOLO支持不再立刻销毁Tracker：只由YOLO支持续期的 `tracking_validation_hold=0.35 s` 允许短漏检，过期即停止有效输出；内部模板最多保留 `tracking_recovery_timeout=2.0 s`，期间逐帧复核，相符0.4–0.8候选可恢复。优先当前预测；仅未过期probation允许最后确认YOLO框作有限锚点，必要时以低分同目标候选局部重建。无关高分不能抢占有支持的当前跟踪，Tracker自身高分不续期。内部过期先于恢复判断，下一帧重新全局获取仍须>0.8。`refresh=0`仅关闭按帧周期，不能绕过时间预算。
 
 
 使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
@@ -244,7 +244,7 @@ ros2 run uav_vision_png uav_vision_png
 
 * `use_cuda` 默认 `true`。CUDA 初始化或推理失败时退出并报告错误，不会悄悄回退 CPU；显式 CPU 诊断可传 `-p use_cuda:=false`。
 * `enable_tracking` 默认 `true`；`show_debug_window` 默认 `true`。无显示环境传 `-p show_debug_window:=false`。
-* 默认候选 `confidence_threshold=0.4`、获取严格 `acquisition_threshold=0.8`、`yolo_refresh_interval=5` 保持；NMS IoU仍为0.45。新增 `tracking_validation_iou=0.1`（有限且 `0<值<=1`），要求同帧检测支持Tracker；它与NMS门槛不同，runner同名CLI可覆盖并记录。模型路径仍可覆盖，图像默认Reliable/Depth1。
+* 默认候选0.4、全局获取严格0.8、refresh5、NMS IoU0.45及 `tracking_validation_iou=0.1` 保持。新增 `tracking_validation_hold=0.35`、`tracking_recovery_timeout=2.0`，均用steady_clock秒，必须有限且 `0<hold<timeout`；runner同名CLI透传并写入协议/分析。图像Reliable/Depth1、raw、时间同步与控制参数不变。局部有界恢复不等于降低首次获取门槛，YOLO测量分数与Tracker分类分数仍不可当作共同校准概率。
 * 每张实际处理图像发布一次结果并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
 
 视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
@@ -533,7 +533,7 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 
 冻结验证：实际启动默认检测节点及VisionPNG launch并读取运行参数；真实CUDA原图序列确认低分桨叶被拒绝、真目标获取、连续5次Tracker后再YOLO，显式低门槛覆盖仍可用于诊断。默认runner不传任何感知覆盖参数的SITL入口烟测也通过，接管延迟0.103 s；该2 s烟测不启动圆周运动、不启用距离闸门，**不计入16.8/24 m命中率**。验证日志与参数位于 `~/intercept_ws/experiment_data/visionpng_baseline_freeze/`。
 
-**无目标错误接管修复（冻结基线之后）**
+**历史：无目标错误接管修复（`a326ea1`，单帧撤销版本）**
 
 用户GUI记录中，接近整屏的错误Tracker框仍以高分被制导接受。真实CUDA负向回放中，160张无外部目标图像原先全部发布有效，其中64张近整屏；修复后仅最初5个Tracker间隔帧有效，随后撤销，整屏框0张，真目标重新出现仍可获取。该回放有刻意场景切换，不冒充实飞轨迹。
 
@@ -546,6 +546,14 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 16.8 m移动圆周回归 `regression_near/2026-10-16_13-02-36` 入口有效，首次最近1.652 m未命中，随后44.057 s最终命中；采样TRACK_LOST占87.4%，表明恢复路径存在但连续性明显更保守，不能宣称性能不变。没有为此降低0.8门槛、扩大入口容差或添加KF。
 
 启动器默认生成本次独立GZ_PARTITION；显式分区若已有world clock则在创建进程前失败，不复用旧模型、更不会杀其他仿真。旧世界残留的另一架自机属于外部visual，可能绕过本机过滤，因此不能继续复用。若已有 `GZ_PARTITION` 环境变量，先 `unset GZ_PARTITION` 再运行原采集命令；启动日志会打印实际分区。共享PX4/ROS话题的其他控制节点仍须先正常关闭。
+
+**有界待确认连续性修复**
+
+`a326ea1` 将一次YOLO缺支持、撤销制导观测和清除模板绑在同一帧；24m弱目标因此只能重过>0.8。现分离“可继续找同目标”和“可发布有效制导观测”：0.35s未支持宽限覆盖单次/短漏检；超过宽限publish invalid但不清内部预测；2s无支持后清上下文，禁止过期低分先验复活。2s基于旧失败记录约1.3s的候选空档选取，不是永久记忆。YOLO支持更新last-supported，Tracker正框/高分绝不更新它。正常帧接近宽限时也提前复核，probation每帧复核，避免低FPS延长授权。
+
+真实CUDA原图回放已验证：score0.800867全局获取后，1/3帧缺支持都能以同位0.793742恢复；长期空图超hold输出invalid，超timeout清模板，过期低分图不能获取，新高分图可以。已有clock-injected回归覆盖边界、丢帧、倒退时钟、当前支持优先和有限锚点。真实PX4/Gazebo15s空场景保持SEARCHING/零平移，12m静态目标出现可获、消失后0.740s发送零平移命令，2s后内部明确过期；这不是移动目标命中率。另一次18m静态场景候选仅0.77–0.79，按首次门槛拒绝，保留记录，不降低阈值。
+
+本机visual隔离、独立世界、Reliable、姿态/时钟同步、raw与PNG参数均未回退。此处只证明机制与有界性，不把它当作新baseline资格或旧命中率复现。日志区分global_acquired、probation_enter/recovered、local_recovery、publication_expired和recovery_expired；低分局部重建也标为YOLO测量，不能误解为低分全局首次获取。验证数据在 `~/intercept_ws/experiment_data/probation_validation/`。
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 

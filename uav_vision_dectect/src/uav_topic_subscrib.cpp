@@ -49,6 +49,9 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
         tracking_validation_iou_ <= 0.0 || tracking_validation_iou_ > 1.0) {
         throw std::invalid_argument("tracking_validation_iou must be finite and in (0,1]");
     }
+    const double validation_hold = declare_parameter<double>("tracking_validation_hold", 0.35);
+    const double recovery_timeout = declare_parameter<double>("tracking_recovery_timeout", 2.0);
+    continuity_ = vision_tracking::ContinuityBudget(validation_hold, recovery_timeout);
 
     RCLCPP_INFO(get_logger(), "Loading vision models with %s execution requested", config.useCuda ? "CUDA" : "CPU");
     yolo_detector_ = std::make_unique<YoloDetector>(config);
@@ -57,13 +60,14 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     }
     RCLCPP_INFO(get_logger(),
                 "Vision sessions initialized; detection >= %.3f, acquisition > %.3f, "
-                "YOLO refresh=%d frames, tracking validation IoU >= %.3f (spatial support only)",
+                "YOLO refresh=%d frames, tracking validation IoU >= %.3f (spatial support only), "
+                "validation_hold=%.3fs recovery_timeout=%.3fs (steady clock)",
                 config.confThreshold, acquisition_threshold_, yolo_refresh_interval_,
-                tracking_validation_iou_);
+                tracking_validation_iou_, validation_hold, recovery_timeout);
     if (enable_tracking_ && yolo_refresh_interval_ == 0) {
         RCLCPP_WARN(get_logger(),
-            "YOLO refresh=0: periodic YOLO support validation is disabled; "
-            "LightTrack continues until its box becomes invalid");
+            "YOLO refresh=0: frame-count refresh disabled only; "
+            "steady-clock authorization budgets still force YOLO support validation");
     }
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
@@ -92,140 +96,248 @@ UavTopicSubscrib::~UavTopicSubscrib()
         static_cast<unsigned long long>(acquisition_count_),
         static_cast<unsigned long long>(tracker_frame_count_),
         static_cast<unsigned long long>(tracker_loss_count_));
+    RCLCPP_INFO(get_logger(),
+        "[VISION_DIAG] continuity global_acquired=%llu matched_refresh=%llu "
+        "low_score_support=%llu probation_enter=%llu probation_recovered=%llu "
+        "local_recovery=%llu publication_expired=%llu recovery_expired=%llu",
+        static_cast<unsigned long long>(global_acquired_count_),
+        static_cast<unsigned long long>(matched_refresh_count_),
+        static_cast<unsigned long long>(low_score_support_count_),
+        static_cast<unsigned long long>(probation_enter_count_),
+        static_cast<unsigned long long>(probation_recovered_count_),
+        static_cast<unsigned long long>(local_recovery_count_),
+        static_cast<unsigned long long>(publication_expired_count_),
+        static_cast<unsigned long long>(recovery_expired_count_));
     if (show_debug_window_) {
         cv::destroyWindow("Result");
     }
 }
 
+void UavTopicSubscrib::reset_tracking()
+{
+    tracking_ = false;
+    continuity_.reset();
+    confirmed_yolo_box_ = cv::Rect(-1, -1, -1, -1);
+    last_prediction_box_ = cv::Rect(-1, -1, -1, -1);
+    tracked_image_size_ = cv::Size();
+    tracker_frames_since_yolo_ = 0;
+    publication_expired_ = false;
+}
+
 void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
     ++frame_count_;
+    using Budget = vision_tracking::ContinuityBudget;
+    const auto frame_time = Budget::Clock::now();
     cv_bridge::CvImagePtr cv_ptr;
     try {
         cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
     } catch (const cv_bridge::Exception& e) {
         RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
+        reset_tracking();
         return;
     }
     cv::Mat& frame = cv_ptr->image;
     if (frame.empty()) {
+        reset_tracking();
         return;
     }
     // LightTrack wraps the packed buffer using dimensions recorded at init.
-    if (tracking_ && frame.size() != tracked_image_size_) {
-        tracking_ = false;
-    }
+    const bool size_reset = tracking_ && frame.size() != tracked_image_size_;
+    if (size_reset) reset_tracking();
 
     cv::Rect result_rect(-1, -1, -1, -1);
     float result_confidence = std::numeric_limits<float>::quiet_NaN();
     std::string status_text;
     cv::Scalar color(0, 255, 0);
     const double start = cv::getTickCount();
-    const bool refresh_yolo = enable_tracking_ && tracking_ &&
-        yolo_refresh_interval_ > 0 &&
-        tracker_frames_since_yolo_ >= yolo_refresh_interval_;
-    const bool need_detection = !enable_tracking_ || !tracking_ || refresh_yolo;
+    cv::Rect prediction_rect(-1, -1, -1, -1);
+    float prediction_confidence = std::numeric_limits<float>::quiet_NaN();
     bool acquired = false;
     std::vector<Detection> candidates;
+    bool detection_ran = false;
     int selected_candidate = -1;
-    if (need_detection) {
-        // Validate the old template's current-frame prediction, never a stale
-        // box or a template already replaced by this frame's global detection.
-        if (refresh_yolo) {
-            track_frame(frame, result_rect, result_confidence, status_text, color);
+    vision_tracking::DetectionDecision decision;
+    // Transition-only diagnostics retain both the prediction and the bounded
+    // anchor. A timeout before inference explicitly has no current prediction.
+    const auto log_transition = [&](const char* outcome, double age) {
+        int maximum = -1;
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            if (maximum < 0 || candidates[index].conf > candidates[maximum].conf)
+                maximum = static_cast<int>(index);
         }
+        const cv::Rect maximum_box = maximum >= 0 ? candidates[maximum].box :
+            cv::Rect(-1, -1, -1, -1);
+        RCLCPP_INFO(get_logger(),
+            "[VISION_DIAG] outcome=%s frame=%llu support_age=%.6f "
+            "prediction_current=%s prediction_bbox=%d,%d,%d,%d "
+            "last_prediction_bbox=%d,%d,%d,%d anchor_bbox=%d,%d,%d,%d "
+            "detection_ran=%s candidates=%zu candidate_max=%.6f candidate_max_bbox=%d,%d,%d,%d "
+            "matched=%s support_candidate=%d support_iou=%.4f local=%s",
+            outcome, static_cast<unsigned long long>(frame_count_), age,
+            prediction_rect.width > 0 ? "true" : "false",
+            prediction_rect.x, prediction_rect.y, prediction_rect.width, prediction_rect.height,
+            last_prediction_box_.x, last_prediction_box_.y,
+            last_prediction_box_.width, last_prediction_box_.height,
+            confirmed_yolo_box_.x, confirmed_yolo_box_.y,
+            confirmed_yolo_box_.width, confirmed_yolo_box_.height,
+            detection_ran ? "true" : "false",
+            candidates.size(), maximum >= 0 ? candidates[maximum].conf :
+                std::numeric_limits<float>::quiet_NaN(),
+            maximum_box.x, maximum_box.y, maximum_box.width, maximum_box.height,
+            decision.action != vision_tracking::DetectionAction::Invalid ? "true" : "false",
+            decision.candidate_index, decision.support_iou,
+            decision.local_recovery ? "true" : "false");
+    };
+    const double initial_age = continuity_.active() ? continuity_.support_age(frame_time) : 0.0;
+    const auto expiry = continuity_.begin_frame(frame_time);
+    bool defer_acquisition = size_reset || expiry != Budget::Expiry::None;
+    if (expiry != Budget::Expiry::None) {
+        ++recovery_expired_count_;
+        ++tracker_loss_count_;
+        log_transition(expiry == Budget::Expiry::NonMonotonicClock ?
+            "recovery_expired_clock_reset" : "recovery_expired", initial_age);
+        reset_tracking();
+        status_text = "Track Lost (Recovery Expired)";
+    }
+    const bool had_tracker = tracking_;
+    const bool validate = tracking_ &&
+        (continuity_.validation_due(frame_time) ||
+         (yolo_refresh_interval_ > 0 && tracker_frames_since_yolo_ >= yolo_refresh_interval_));
+    if (tracking_) {
+        track_frame(frame, prediction_rect, prediction_confidence, status_text, color);
+        if (!tracking_) defer_acquisition = true;
+        result_rect = prediction_rect;
+        result_confidence = prediction_confidence;
+    }
+    const bool need_detection = !defer_acquisition &&
+        (!enable_tracking_ || !had_tracker || validate);
+    if (need_detection) {
         ++yolo_frame_count_;
         candidates = yolo_detector_->detect(frame);
-        if (refresh_yolo) {
-            tracker_frames_since_yolo_ = 0;
+        detection_ran = true;
+        tracker_frames_since_yolo_ = 0;
+        decision = had_tracker ?
+            vision_tracking::select_tracking_detection(candidates,
+                cv::Rect(0, 0, frame.cols, frame.rows), prediction_rect,
+                confirmed_yolo_box_, continuity_, frame_time,
+                tracking_validation_iou_, acquisition_threshold_) :
+            vision_tracking::select_detection(candidates,
+                cv::Rect(0, 0, frame.cols, frame.rows), nullptr,
+                tracking_validation_iou_, acquisition_threshold_);
+        if (had_tracker) {
+            const auto evidence_time = Budget::Clock::now();
+            const double evidence_age = continuity_.support_age(evidence_time);
+            if (continuity_.expire(evidence_time) != Budget::Expiry::None) {
+                ++recovery_expired_count_;
+                ++tracker_loss_count_;
+                log_transition("recovery_expired", evidence_age);
+                reset_tracking();
+                decision.action = vision_tracking::DetectionAction::Invalid;
+            }
         }
-        const auto decision = vision_tracking::select_detection(candidates,
-            cv::Rect(0, 0, frame.cols, frame.rows), refresh_yolo ? &result_rect : nullptr,
-            tracking_validation_iou_, acquisition_threshold_);
         const Detection* best = decision.candidate_index >= 0 ?
             &candidates[decision.candidate_index] : nullptr;
-        if (decision.action == vision_tracking::DetectionAction::Acquire) {
-            selected_candidate = decision.candidate_index;
-            const cv::Rect& safe_rect = decision.box;
-            ++acquisition_count_;
-            acquired = true;
-            tracker_frames_since_yolo_ = 0;
-            RCLCPP_INFO(get_logger(),
-                "[VISION_DIAG] source=YOLO outcome=%s frame=%llu refresh=%s "
-                "candidates=%zu selected=%d support_iou=%.4f confidence=%.4f "
-                "bbox=%d,%d,%d,%d acquisition=%llu",
-                refresh_yolo ? "matched_refresh" : "acquired",
-                static_cast<unsigned long long>(frame_count_),
-                refresh_yolo ? "true" : "false", candidates.size(), selected_candidate,
-                decision.support_iou, best->conf,
-                safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
-                static_cast<unsigned long long>(acquisition_count_));
-            if (enable_tracking_) {
-                Bbox box{static_cast<float>(safe_rect.x), static_cast<float>(safe_rect.y),
-                         static_cast<float>(safe_rect.x + safe_rect.width),
-                         static_cast<float>(safe_rect.y + safe_rect.height)};
-                siam_tracker->init(frame.data, box, frame.rows, frame.cols);
-                tracked_image_size_ = frame.size();
-                tracking_ = true;
-                status_text = refresh_yolo ? "Matched Track Refresh" : "Global Track Init";
+        if (decision.action != vision_tracking::DetectionAction::Invalid &&
+            (!had_tracker || tracking_)) {
+            const bool recovered = had_tracker && continuity_.in_probation();
+            const double supported_age = had_tracker ? continuity_.support_age(frame_time) : 0.0;
+            if (had_tracker) {
+                continuity_.support(frame_time);
+            } else if (enable_tracking_) {
+                continuity_.acquire(frame_time);
+            }
+            if (recovered) {
+                ++probation_recovered_count_;
+                log_transition("probation_recovered", supported_age);
+            }
+            confirmed_yolo_box_ = decision.box;
+            publication_expired_ = false;
+            if (decision.action == vision_tracking::DetectionAction::Acquire) {
+                selected_candidate = decision.candidate_index;
+                acquired = true;
+                ++acquisition_count_;
+                if (!had_tracker) ++global_acquired_count_;
+                else if (decision.local_recovery) ++local_recovery_count_;
+                else ++matched_refresh_count_;
+                const char* outcome = !had_tracker ? "global_acquired" :
+                    (decision.local_recovery ? "local_recovery" : "matched_refresh");
+                if (!had_tracker || decision.local_recovery) {
+                    log_transition(outcome, supported_age);
+                } else {
+                    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "[VISION_DIAG] source=YOLO outcome=matched_refresh frame=%llu "
+                        "selected=%d confidence=%.6f support_iou=%.4f",
+                        static_cast<unsigned long long>(frame_count_), selected_candidate,
+                        best->conf, decision.support_iou);
+                }
+                if (enable_tracking_) {
+                    const auto& box = decision.box;
+                    Bbox tracker_box{static_cast<float>(box.x), static_cast<float>(box.y),
+                                     static_cast<float>(box.x + box.width),
+                                     static_cast<float>(box.y + box.height)};
+                    siam_tracker->init(frame.data, tracker_box, frame.rows, frame.cols);
+                    tracked_image_size_ = frame.size();
+                    tracking_ = true;
+                    last_prediction_box_ = decision.box;
+                }
+                result_rect = decision.box;
+                result_confidence = best->conf;
+                status_text = !had_tracker ? "Global Track Init" :
+                    (decision.local_recovery ? "Local Track Recovery" : "Matched Track Refresh");
                 color = cv::Scalar(255, 0, 0);
             } else {
-                status_text = "YOLO Detect (Score: " + std::to_string(best->conf).substr(0, 4) + ")";
-                color = cv::Scalar(0, 0, 255);
+                ++low_score_support_count_;
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[VISION_DIAG] source=LightTrack outcome=low_score_support frame=%llu "
+                    "support_candidate=%d support_iou=%.4f detection_confidence=%.6f",
+                    static_cast<unsigned long long>(frame_count_), decision.candidate_index,
+                    decision.support_iou, best->conf);
+                status_text = "Tracking (YOLO Support)";
             }
-            result_rect = safe_rect;
-            result_confidence = best->conf;
-        } else if (decision.action == vision_tracking::DetectionAction::KeepTracker) {
-            RCLCPP_INFO(get_logger(),
-                "[VISION_DIAG] source=LightTrack outcome=low_score_support frame=%llu "
-                "candidates=%zu support_candidate=%d support_iou=%.4f detection_confidence=%.6f "
-                "required_gt=%.6f tracker_confidence=%.4f",
-                static_cast<unsigned long long>(frame_count_), candidates.size(),
-                decision.candidate_index, decision.support_iou, best->conf,
-                acquisition_threshold_, result_confidence);
-            status_text = "Tracking (YOLO Support)";
-        } else if (refresh_yolo) {
-            // Revoke this callback's result as well as internal tracking state.
-            // A global acquisition is permitted only on the next camera frame.
-            if (tracking_) {
-                ++tracker_loss_count_;
+        } else if (had_tracker && tracking_) {
+            if (!continuity_.in_probation()) {
+                ++probation_enter_count_;
+                log_transition("probation_enter", continuity_.support_age(frame_time));
             }
-            tracking_ = false;
-            result_rect = cv::Rect(-1, -1, -1, -1);
-            result_confidence = std::numeric_limits<float>::quiet_NaN();
-            status_text = "Track Lost (No YOLO Support)";
+            continuity_.miss();
+            status_text = "Tracking (Probation)";
             color = cv::Scalar(0, 255, 255);
-            RCLCPP_WARN(get_logger(),
-                "[VISION_DIAG] source=UNKNOWN outcome=%s frame=%llu candidates=%zu "
-                "selected=%d support_iou=%.4f required_iou=%.4f loss=%llu; "
-                "global acquisition deferred to next frame",
-                best ? "rejected_supported_box" : "no_support",
-                static_cast<unsigned long long>(frame_count_), candidates.size(),
-                decision.candidate_index, decision.support_iou, tracking_validation_iou_,
-                static_cast<unsigned long long>(tracker_loss_count_));
-        } else if (!best) {
+        } else if (!had_tracker) {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                "[VISION_DIAG] source=YOLO outcome=no_candidate frame=%llu "
-                "refresh=false yolo_frames=%llu acquisitions=%llu",
-                static_cast<unsigned long long>(frame_count_),
-                static_cast<unsigned long long>(yolo_frame_count_),
-                static_cast<unsigned long long>(acquisition_count_));
-        } else if (best->conf > acquisition_threshold_) {
-            RCLCPP_WARN(get_logger(),
-                "[VISION_DIAG] source=YOLO outcome=rejected_box frame=%llu "
-                "confidence=%.4f raw_bbox=%d,%d,%d,%d clipped_bbox=%d,%d,%d,%d",
-                static_cast<unsigned long long>(frame_count_), best->conf,
-                best->box.x, best->box.y, best->box.width, best->box.height,
-                decision.box.x, decision.box.y, decision.box.width, decision.box.height);
-        } else {
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                "[VISION_DIAG] source=YOLO outcome=below_acquisition frame=%llu "
-                "refresh=false candidates=%zu confidence=%.6f required_gt=%.6f",
+                "[VISION_DIAG] source=YOLO outcome=%s frame=%llu candidates=%zu "
+                "selected=%d confidence=%.6f required_gt=%.6f",
+                !best ? "no_candidate" :
+                    (best->conf > acquisition_threshold_ ? "rejected_box" : "below_acquisition"),
                 static_cast<unsigned long long>(frame_count_), candidates.size(),
-                best->conf, acquisition_threshold_);
+                decision.candidate_index, best ? best->conf : 0.0f, acquisition_threshold_);
         }
-    } else {
-        track_frame(frame, result_rect, result_confidence, status_text, color);
+    }
+
+    // Inference itself can take time. Never publish beyond the wall-time
+    // permission, even on tracker-only frames or a slow successful refresh.
+    // Revoking this local output must not overwrite LightTrack's internal box.
+    const auto publish_time = Budget::Clock::now();
+    const double final_age = continuity_.active() ? continuity_.support_age(publish_time) : 0.0;
+    const auto final_expiry = continuity_.expire(publish_time);
+    if (final_expiry != Budget::Expiry::None) {
+        ++recovery_expired_count_;
+        ++tracker_loss_count_;
+        log_transition("recovery_expired", final_age);
+        reset_tracking();
+    }
+    if (enable_tracking_ &&
+        (!tracking_ || !continuity_.publication_allowed(publish_time))) {
+        if (tracking_ && !publication_expired_) {
+            ++publication_expired_count_;
+            log_transition("publication_expired", final_age);
+            publication_expired_ = true;
+        }
+        result_rect = cv::Rect(-1, -1, -1, -1);
+        result_confidence = std::numeric_limits<float>::quiet_NaN();
+        acquired = false;
+        selected_candidate = -1;
+        status_text = tracking_ ? "Track Output Expired (Recovering)" : "Track Lost";
     }
 
     // Publish only inference-backed results, using the camera capture stamp and
@@ -276,6 +388,7 @@ void UavTopicSubscrib::track_frame(
     const cv::Rect safe_rect = rect & cv::Rect(0, 0, frame.cols, frame.rows);
     if (safe_rect.area() > 0) {
         result_rect = safe_rect;
+        last_prediction_box_ = safe_rect;
         result_confidence = siam_tracker->track_score;
         status_text = "Tracking";
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -295,7 +408,7 @@ void UavTopicSubscrib::track_frame(
         static_cast<unsigned long long>(frame_count_), siam_tracker->track_score,
         rect.x, rect.y, rect.width, rect.height, siam_tracker->cls_score_position,
         static_cast<unsigned long long>(tracker_loss_count_));
-    tracking_ = false;
+    reset_tracking();
     status_text = "Track Lost";
     color = cv::Scalar(0, 255, 255);
 }

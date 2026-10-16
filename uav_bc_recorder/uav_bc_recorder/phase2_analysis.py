@@ -538,6 +538,8 @@ def analyze_recording(recording, output):
         'acquisition_threshold':requested.get('acquisition_threshold'),
         'yolo_refresh_interval':requested.get('yolo_refresh_interval'),
         'tracking_validation_iou':requested.get('tracking_validation_iou'),
+        'tracking_validation_hold':requested.get('tracking_validation_hold'),
+        'tracking_recovery_timeout':requested.get('tracking_recovery_timeout'),
         'camera_visibility_policy':requested.get('camera_visibility_policy'),
         'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),

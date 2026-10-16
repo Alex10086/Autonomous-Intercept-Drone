@@ -202,6 +202,8 @@ def run_trial(args, session, group, index):
         'acquisition_threshold':args.acquisition_threshold,
         'yolo_refresh_interval':args.yolo_refresh_interval,
         'tracking_validation_iou':args.tracking_validation_iou,
+        'tracking_validation_hold':args.tracking_validation_hold,
+        'tracking_recovery_timeout':args.tracking_recovery_timeout,
         'camera_visibility_policy':'self_hidden_external_visible',
         'diagnostic_capture_dir':str(trial/'anomaly_frames') if args.capture_anomalies else None,
         'requested_distance':requested_distance,'distance_tolerance':0.8,
@@ -309,7 +311,9 @@ def run_trial(args, session, group, index):
             'confidence_threshold':args.confidence_threshold,
             'acquisition_threshold':args.acquisition_threshold,
             'yolo_refresh_interval':args.yolo_refresh_interval,
-            'tracking_validation_iou':args.tracking_validation_iou}
+            'tracking_validation_iou':args.tracking_validation_iou,
+            'tracking_validation_hold':args.tracking_validation_hold,
+            'tracking_recovery_timeout':args.tracking_recovery_timeout}
         if args.capture_anomalies:
             detector_parameters['diagnostic_capture_dir'] = str(trial/'anomaly_frames')
         owned.start('detector',ros_command(
@@ -441,9 +445,13 @@ def main(argv=None):
     parser.add_argument('--acquisition-threshold',type=float,default=0.8,
                         help='Frozen VisionPNG baseline: strict score > 0.8; use 0 only for low-gate diagnostics')
     parser.add_argument('--yolo-refresh-interval',type=int,default=5,
-                        help='Tracker frames before YOLO refresh; 0 retains acquisition-only YOLO')
+                        help='Tracker frame cadence for YOLO checks; 0 disables frame cadence, not timed support checks')
     parser.add_argument('--tracking-validation-iou',type=float,default=0.1,
                         help='Same-image YOLO support required at tracker refresh; finite value in (0,1]')
+    parser.add_argument('--tracking-validation-hold',type=float,default=0.35,
+                        help='Maximum unconfirmed support age for publishing tracker observations (seconds)')
+    parser.add_argument('--tracking-recovery-timeout',type=float,default=2.0,
+                        help='Bounded internal tracker retention for spatially supported recovery (seconds)')
     parser.add_argument('--capture-anomalies',action='store_true',
                         help='Save raw frames +/-2 around large bbox jumps; diagnostic only, no guidance changes')
     parser.add_argument('--diagnostic-bypass-detector-entry',action='store_true',
@@ -473,6 +481,10 @@ def main(argv=None):
         parser.error('yolo-refresh-interval must be nonnegative')
     if not math.isfinite(args.tracking_validation_iou) or not 0.0 < args.tracking_validation_iou <= 1.0:
         parser.error('tracking-validation-iou must be finite and in (0,1]')
+    if (not math.isfinite(args.tracking_validation_hold) or
+            not math.isfinite(args.tracking_recovery_timeout) or
+            not 0.0 < args.tracking_validation_hold < args.tracking_recovery_timeout):
+        parser.error('tracking times must be finite and 0 < validation-hold < recovery-timeout')
     for name in ('near_center_e','far_center_e','release_phase','self_altitude'):
         if not math.isfinite(getattr(args,name)):
             parser.error(f'{name} must be finite')
