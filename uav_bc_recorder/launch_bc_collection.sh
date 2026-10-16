@@ -15,6 +15,14 @@ PX4_ROOT="${PX4_ROOT:-$HOME/PX4-Autopilot}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 case "$PROFILE" in debug|compare|archive) ;; *) echo "Invalid profile: $PROFILE" >&2; exit 2 ;; esac
 case "$ALGORITHM" in vision_png|pure_png) ;; *) echo "Invalid algorithm: $ALGORITHM" >&2; exit 2 ;; esac
+# ROS parameters are statically typed: YAML "60" is INTEGER, not DOUBLE.
+# Preserve decimal inputs and give integer seconds an explicit decimal point.
+for parameter in MAX_DURATION START_TIMEOUT; do
+    value="${!parameter}"
+    if [[ "$value" =~ ^[+-]?[0-9]+$ ]]; then
+        printf -v "$parameter" '%s.0' "$value"
+    fi
+done
 for command in ros2 setsid; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
@@ -48,6 +56,18 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+check_recorder_alive() {
+    local status=0
+    if kill -0 "$RECORDER_PID" 2>/dev/null; then
+        return
+    fi
+    wait "$RECORDER_PID" || status=$?
+    printf 'Recorder exited before experiment startup completed (status %s); see its error above.\n' \
+        "$status" >&2
+    (( status != 0 )) || status=1
+    exit "$status"
+}
+
 printf 'Experiment: algorithm=%s motion=%s profile=%s root=%s\n' \
     "$ALGORITHM" "$MOTION" "$PROFILE" "$OUT_DIR"
 setsid ros2 run uav_bc_recorder experiment_recorder --ros-args \
@@ -56,13 +76,13 @@ setsid ros2 run uav_bc_recorder experiment_recorder --ros-args \
     -p start_timeout:="$START_TIMEOUT" &
 RECORDER_PID=$!
 sleep 1
-kill -0 "$RECORDER_PID"
+check_recorder_alive
 
 PX4_ROOT="$PX4_ROOT" bash "$SCRIPT_DIR/../run_swarm.sh" &
 SIM_PID=$!
 ready=false
 for ((i=0; i<90; i++)); do
-    kill -0 "$RECORDER_PID"
+    check_recorder_alive
     kill -0 "$SIM_PID"
     topics="$(ros2 topic list 2>/dev/null || true)"
     if [[ "$topics" == *"/px4_1/fmu/out/vehicle_status_v1"* &&

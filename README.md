@@ -287,6 +287,8 @@ bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archiv
 
 The script starts recording first, then the repository's `run_swarm.sh`, target, optional detector, and guidance. Shutdown finalizes recording before stopping only its owned processes.
 
+`duration` and `start_timeout` accept integer or decimal seconds, e.g. `60`/`180` or `60.0`/`180.0`. The script normalizes integer inputs to ROS DOUBLE literals; direct `ros2 run ... -p` commands still need floating-point values. If the recorder exits early, startup reports its status and original error instead of a misleading missing-PID `kill` error. Stop other simulations/controllers using the same PX4/vision topics before starting, keeping QGroundControl connected, to avoid consuming another run's data.
+
 Each startup immediately creates an independent directory beneath `out_dir`, e.g. `2026-10-15_14-30-00_vision_png_circle_001/`, containing `meta.yaml`, `timeseries.csv`, and `summary.csv`. Archive adds `camera.mp4`; compare/archive add `rosbag/` and `rosbag.log`. Atomic directory creation increments the suffix instead of overwriting runs. An optional string `experiment_id` is included in the directory name and metadata, with a separate collision-safe suffix.
 
 **Lifecycle**

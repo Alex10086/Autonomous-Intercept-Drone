@@ -291,6 +291,8 @@ bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archiv
 
 脚本先启动记录器，再运行仓库的 `run_swarm.sh`、目标机、可选检测和制导；退出时先完成记录文件，再停止自己启动的进程，不会全局 kill 其他实验。
 
+`duration` 和 `start_timeout` 均接受整数或小数秒，例如 `60` / `180` 或 `60.0` / `180.0`；脚本会将纯整数归一为ROS DOUBLE字面量，避免 `INTEGER, expecting DOUBLE`。直接使用 `ros2 run ... -p` 时仍应写浮点值。记录器若提前退出，脚本报告其退出码和原始错误后停止，不再以 `kill: 没有那个进程` 掩盖原因。启动前请关闭其它使用同一组PX4/视觉话题的仿真与控制节点，只保留QGroundControl，避免读到上一套运行的数据。
+
 每次启动都立即在 `out_dir` 下原子创建独立目录，不覆盖历史数据；同秒启动自动递增编号。可用字符串参数 `experiment_id` 指定标识，目录仍带防碰撞后缀。
 
 ```text
