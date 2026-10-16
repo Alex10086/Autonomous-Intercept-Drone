@@ -189,7 +189,7 @@ export GZ_PARTITION=intercept_jazzy
 Run these commands in four separate terminals:
 
 1. `~/.local/bin/qgroundcontrol` (the prepared user-local launcher; keep it open).
-2. `bash ~/PX4-Autopilot/run_swarm.sh`. First place the repository world at PX4's `Tools/simulation/gz/worlds/grass_world.sdf`; the launcher can be linked into the PX4 root. Set `PX4_ROOT` to override the default source directory, or `HEADLESS=1` to omit the Gazebo GUI.
+2. `bash "$HOME/intercept_ws/src/Autonomous-Intercept-Drone/run_swarm.sh"` (adjust to the actual repository path). Deploy the repository world first; run from the complete repository rather than copying/linking the script alone into PX4. It deploys a small self-model wrapper without replacing upstream resources. `PX4_ROOT` overrides PX4; `HEADLESS=1` omits GUI.
 3. `ros2 run uav_target_sim uav_target_sim`.
 4. `ros2 run uav_png_intercept uav_png_intercept`. For recording, start `experiment_recorder` from section 2.3 first with `algorithm:=pure_png`.
 
@@ -198,7 +198,7 @@ Run these commands in four separate terminals:
 
 ### 2.2 Jazzy Visual Detection and Guidance
 
-The frozen VisionPNG baseline is high acquisition/refresh5/raw with real CUDA inference and fixed-circle SITL evidence: first GPS hits3/3 at24m and2/3 at16.8m. These small cohorts do not establish physical contact or universal reliability. RL remains outside this baseline's verification scope.
+The historical frozen tag `visionpng-baseline-high08-refresh5-raw` retains its small-cohort GPS results (first hits3/3 at24m,2/3 at16.8m). Current post-baseline self-visual isolation and same-image support validation change behavior; old hit rates are not new-version performance or general safety guarantees. RL is outside this scope.
 
 The vision chain is `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`. The detector publishes no flight-control commands; do not simultaneously run `uav_png_intercept` or another interceptor controller.
 
@@ -208,7 +208,7 @@ Loss limits are now seconds: `freshness_timeout: 0.15` and `track_lost_timeout: 
 
 Receipt age is not image age or inference latency; use native-clock-aligned observation diagnostics. `uav_vision_png/test/test_visual_freshness.py` launches real nodes for freshness, recovery, repeated-coordinate frames and attitude-time alignment. Node regressions alone do not establish interception success rates.
 
-The frontend attempts YOLO refresh after five tracker frames and only reinitializes on a legal box with score strictly above0.8; unsuccessful refresh continues tracking and retries next frame. LightTrack retains the current adaptive size update. Removing the upstream raw-argmax loss gate was a historical strategy change; this baseline retains area-only tracker validity, not a reliable identity/loss detector. High scores or zero loss counts do not prove correct localization.
+After five tracker-only frames, refresh predicts with the old template and checks same-image YOLO support. Among candidates overlapping the tracker box by `tracking_validation_iou` (default0.1), only score>0.8 updates the template; lower-score supported candidates retain tracking and reset the validation period. No support revokes the current result and returns to global acquisition next frame. An unrelated highest-score candidate cannot directly replace supported tracking. Spatial support is not identity proof. Explicit refresh0 disables periodic validation.
 
 
 Use ONNX Runtime C++ GPU SDK 1.23.2 with Blackwell-capable CUDA 12.8 and cuDNN 9 runtime libraries. A full CUDA Toolkit, PyTorch, and TensorRT are not required. The SDK may reside at `~/.local/opt/intercept/onnxruntime`; keep CUDA/cuDNN libraries in an isolated user-local environment instead of changing system Python. See the [ONNX CUDA dependency documentation](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
@@ -240,7 +240,7 @@ Detector parameters:
 
 * `use_cuda` defaults to `true`. CUDA initialization/inference failures exit with an error rather than silently falling back to CPU; explicit CPU diagnostics use `-p use_cuda:=false`.
 * `enable_tracking` and `show_debug_window` default to `true`; use `-p show_debug_window:=false` without a display.
-* Override installed models with `yolo_model_path`, `tracker_init_model_path`, and `tracker_update_model_path`. Frozen defaults are candidate `confidence_threshold=0.4`, independent strict `acquisition_threshold=0.8`, and `yolo_refresh_interval=5`; a valid candidate is not automatically permitted to replace the tracker. IoU stays 0.45, camera QoS Reliable/Depth1.
+* Installed models remain configurable. Candidates>=0.4, acquisition>0.8, refresh5 and NMS IoU0.45 remain. New `tracking_validation_iou=0.1` must be finite in(0,1] and is recorded/forwarded by the runner; it is distinct from NMS IoU. Camera QoS stays Reliable/Depth1.
 * One result is published per processed image with its original timestamp. Lost targets use `-1` for all four bbox fields; stale boxes are not repeatedly stamped as fresh detections.
 
 Guidance enters `SEARCHING` after reaching standby altitude and converging hover-thrust estimation, then enters `INTERCEPT` on a valid detection. `/vpng_data` exposes actual LOS and pixel errors; a running process or an existing topic alone does not prove detection or interception.
@@ -418,11 +418,23 @@ The actual CUDA Combined/image/raw/Reliable flight `bbox_anomaly_diagnostic/2026
 
 The current-policy third run switched to a 0.7916 propeller candidate at 6.392 s / 3.126 m before its first miss at 7.077 s / 2.026 m. Separately, high-gate refresh trial 2 captured **propeller 0.814677 versus actual target 0.800589 in the same image**; highest-score refresh replaced a tracker still on the true target. That event was at 18.921 s, **after** the 6.375 s first encounter, so it is not evidence for the cause of that first miss. High thresholds reduce wrong acquisition but are not an identity guarantee. Other late frames show high-score tracking of empty sky; the area-only loss rule remains unchanged. High-gate refresh ran YOLO on 85–90% of all processed frames including startup, because unsuccessful refresh retries next frame. All results, identity evidence and phase-qualified observations are in `analysis/policy_diagnosis.json` and `review/`. Sequential n=3 groups, GPS noise/entry variations and a GPS-only 0.8 m hit criterion limit conclusions. No default strategy, camera, mask, association or KF changes were deployed.
 
-**Frozen VisionPNG baseline: `visionpng-baseline-high08-refresh5-raw`.** Combined/CUDA with unchanged GDUT_UAV and LightTrack models; candidates >=0.4, acquisition/replacement strictly >0.8, IoU0.45, refresh after five tracker frames (existing next-frame retry on failure preserved); IMX214 1920×1080 Reliable/Depth1; raw pixels/KF off, image-epoch attitude SLERP and native Gazebo/DDS clocks; speed5, kv=kz=4, d_gain2, yaw .0008/.0002, k_ey .0056, GPS hit radius .8m. Keep the current tracker area-only loss rule and .15/.6s guidance freshness/loss limits; no upstream argmax gate, masks, fusion or association were added. Direct detector runs, collection scripts and runner defaults now agree; controller YAML/launch retain raw/image attitude. Explicit diagnostic overrides remain available. Snapshot capture remains opt-in.
+**Historical frozen VisionPNG baseline: `visionpng-baseline-high08-refresh5-raw` (tag preserved).** It records Combined/CUDA, candidates>=0.4, acquisition>0.8, refresh5 with unsuccessful-acquisition retries, the original camera view, raw/image-epoch attitude/native clocks, unchanged gains and area-only tracker validity. Current post-baseline safety changes below are not retroactively attributed to this tag.
 
-Additional 24m trials on `5807967` are archived in `~/intercept_ws/experiment_data/perception_policy_24m/analysis/policy24_diagnosis.json`: refresh5 first minima .308/.418/.214m, first/final hits3/3; refresh0 first minima21.027/21.131/20.872m, hits0/3 despite correct initial acquisition. Captured refresh corrected background tracking. Combined with the 16.8m refresh5 first-hit result2/3, this supports the chosen baseline but not universal reliability: high-score propeller overrides and tracker degradation remain possible. Each cohort has only three sequential trials; GPS hits are not physical-contact proof. Default reproducibility command: `ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" --groups near far --trials 3`; no perception flags are needed. Normal launch takeoff settings are not the runner's fixed-circle entry protocol.
+Historical24m trials on `5807967` are in `~/intercept_ws/experiment_data/perception_policy_24m/analysis/policy24_diagnosis.json`: refresh5 first minima .308/.418/.214m with3/3 first hits; refresh0 had0/3 despite correct initial acquisition. Reproduce that behavior by checking out the frozen tag; current main adds the safety changes below and cannot inherit its hit rate. Small cohorts and GPS-only evaluation are not general safety/contact guarantees.
 
 Freeze verification started the default detector and actual VisionPNG launch, read their live parameters, and exercised real CUDA images: reject a low-score propeller, acquire the UAV, run five tracker updates, then refresh with YOLO. Explicit low-gate diagnostics still work. A default-runner SITL entry smoke without perception overrides passed with 0.103s entry delay. This 2s smoke has no circle motion or distance gate and is **not included in either range's hit rate**. Evidence is under `~/intercept_ws/experiment_data/visionpng_baseline_freeze/`.
+
+**Post-baseline no-target protection.** Real-CUDA negative replay previously published all160 empty-scene frames as valid (64 near-fullscreen); support validation now permits only the first five intervening tracker frames, then revokes tracking, with zero fullscreen boxes and successful UAV reacquisition. Deliberate replay scene changes are not a recorded flight trajectory.
+
+The launcher deploys `x500_depth_external_view`:17 self visuals use flags1, only IMX214 RGB uses mask2; target/ground retain default flags and GUI still sees self. Expanded-SDF comparison verifies unchanged camera pose/FOV/resolution, collision, inertia and depth settings. The wrapper references upstream resources without copying meshes or editing shared models. This is simulator sensing policy, not a physical camera remedy; no screen-edge mask or KF was added.
+
+Actual PX4/Gazebo appearance/removal smoke:15s without an external UAV produced455 invalid detections, SEARCHING only and maximum translation command0. A rendered static x500 then triggered INTERCEPT; removal led to zero translation command after0.724s. Images confirm no self parts and a visible external target. This is not a circular-target hit-rate trial. Existing .15/.6s freshness/coast semantics remain, so invalidation is not immediate braking; yaw search remains. Normal startup still takes off to standby before waiting.
+
+The safety/continuity tradeoff is explicit:24m circular regression `regression_far/2026-10-16_12-57-43` lost support, later candidates stayed below0.8, and admission was rejected for lack of a recent valid window. Preserve this invalid trial, not a control miss; do not lower the gate or transfer historical3/3 claims. Evidence is in `~/intercept_ws/experiment_data/no_target_diagnostic/`; the old frozen tag is untouched.
+
+The16.8m moving-circle regression `regression_near/2026-10-16_13-02-36` admitted successfully, missed the first pass at1.652m and finally hit at44.057s. Sampled TRACK_LOST fraction87.4% shows recovery exists but continuity is more conservative; performance equivalence is not claimed and no thresholds/gains were loosened.
+
+The launcher creates a fresh GZ_PARTITION by default. An explicitly occupied partition is rejected before processes start, without killing its world: an old self-model would otherwise be an external visible object to the new camera. If a partition is already exported, `unset GZ_PARTITION` before rerunning the collection command; startup prints the actual partition. Other controllers sharing PX4/ROS topics must still be stopped normally.
 
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
 
@@ -438,20 +450,17 @@ Please run each node in a separate terminal in the following order:
 
 
 0. **Start the Simulation Environment**:
-   Before starting, copy the simulation resources from this repository to the PX4-Autopilot directory:
+   Run from the repository root, retaining its complete model-wrapper assets:
 
    ```bash
-   # Step 1: Copy the run_swarm.sh script from this repository to the PX4-Autopilot root directory (if not already copied)
-   cp ros2_ws/src/run_swarm.sh ~/PX4-Autopilot/
-
-   # Step 2: Copy the custom world file to the PX4 Gazebo worlds directory
-   cp ros2_ws/src/assets/gazebo_world/grass_world.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
+   # Deploy the world only; do not copy run_swarm.sh alone
+   cp assets/gazebo_world/grass_world.sdf \
+     "${PX4_ROOT:-$HOME/PX4-Autopilot}/Tools/simulation/gz/worlds/"
    ```
 
-   > The above steps only need to be performed once. After that, to start the simulation, simply enter the PX4-Autopilot directory and run the startup script:
+   > Run the repository launcher each time; it links the independent wrapper into PX4's model directory without replacing upstream resources:
    ```bash
-   cd ~/PX4-Autopilot
-   ./run_swarm.sh
+   bash ./run_swarm.sh
    ```
 
    This script automatically starts the Gazebo simulation server, two drones (px4_1 interceptor + px4_2 target), the MicroXRCEAgent, and the camera topic bridge.

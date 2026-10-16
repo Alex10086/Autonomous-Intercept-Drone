@@ -1,4 +1,5 @@
 #include "uav_topic_subscrib.hpp"
+#include "tracking_validation.hpp"
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -43,6 +44,11 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
         throw std::invalid_argument("acquisition_threshold must be finite and in [0,1]");
     }
     acquisition_threshold_ = static_cast<float>(acquisition_threshold);
+    tracking_validation_iou_ = declare_parameter<double>("tracking_validation_iou", 0.1);
+    if (!std::isfinite(tracking_validation_iou_) ||
+        tracking_validation_iou_ <= 0.0 || tracking_validation_iou_ > 1.0) {
+        throw std::invalid_argument("tracking_validation_iou must be finite and in (0,1]");
+    }
 
     RCLCPP_INFO(get_logger(), "Loading vision models with %s execution requested", config.useCuda ? "CUDA" : "CPU");
     yolo_detector_ = std::make_unique<YoloDetector>(config);
@@ -50,8 +56,15 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
         siam_tracker = std::make_unique<LightTrack>(init_model.c_str(), update_model.c_str(), config.useCuda);
     }
     RCLCPP_INFO(get_logger(),
-                "Vision sessions initialized; detection >= %.3f, acquisition > %.3f, YOLO refresh=%d frames",
-                config.confThreshold, acquisition_threshold_, yolo_refresh_interval_);
+                "Vision sessions initialized; detection >= %.3f, acquisition > %.3f, "
+                "YOLO refresh=%d frames, tracking validation IoU >= %.3f (spatial support only)",
+                config.confThreshold, acquisition_threshold_, yolo_refresh_interval_,
+                tracking_validation_iou_);
+    if (enable_tracking_ && yolo_refresh_interval_ == 0) {
+        RCLCPP_WARN(get_logger(),
+            "YOLO refresh=0: periodic YOLO support validation is disabled; "
+            "LightTrack continues until its box becomes invalid");
+    }
 
     uav_detect_result_publisher_ = create_publisher<uav_common_msg::msg::RectMsg>("/camera_detect_result", 10);
     // Keep one recent frame. Best-effort delivery showed large-image gaps in SITL.
@@ -116,71 +129,100 @@ void UavTopicSubscrib::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     std::vector<Detection> candidates;
     int selected_candidate = -1;
     if (need_detection) {
+        // Validate the old template's current-frame prediction, never a stale
+        // box or a template already replaced by this frame's global detection.
+        if (refresh_yolo) {
+            track_frame(frame, result_rect, result_confidence, status_text, color);
+        }
         ++yolo_frame_count_;
         candidates = yolo_detector_->detect(frame);
-        const Detection* best = nullptr;
-        for (const auto& det : candidates) {
-            if (!best || det.conf > best->conf) {
-                best = &det;
-            }
+        if (refresh_yolo) {
+            tracker_frames_since_yolo_ = 0;
         }
-        if (!best) {
+        const auto decision = vision_tracking::select_detection(candidates,
+            cv::Rect(0, 0, frame.cols, frame.rows), refresh_yolo ? &result_rect : nullptr,
+            tracking_validation_iou_, acquisition_threshold_);
+        const Detection* best = decision.candidate_index >= 0 ?
+            &candidates[decision.candidate_index] : nullptr;
+        if (decision.action == vision_tracking::DetectionAction::Acquire) {
+            selected_candidate = decision.candidate_index;
+            const cv::Rect& safe_rect = decision.box;
+            ++acquisition_count_;
+            acquired = true;
+            tracker_frames_since_yolo_ = 0;
+            RCLCPP_INFO(get_logger(),
+                "[VISION_DIAG] source=YOLO outcome=%s frame=%llu refresh=%s "
+                "candidates=%zu selected=%d support_iou=%.4f confidence=%.4f "
+                "bbox=%d,%d,%d,%d acquisition=%llu",
+                refresh_yolo ? "matched_refresh" : "acquired",
+                static_cast<unsigned long long>(frame_count_),
+                refresh_yolo ? "true" : "false", candidates.size(), selected_candidate,
+                decision.support_iou, best->conf,
+                safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
+                static_cast<unsigned long long>(acquisition_count_));
+            if (enable_tracking_) {
+                Bbox box{static_cast<float>(safe_rect.x), static_cast<float>(safe_rect.y),
+                         static_cast<float>(safe_rect.x + safe_rect.width),
+                         static_cast<float>(safe_rect.y + safe_rect.height)};
+                siam_tracker->init(frame.data, box, frame.rows, frame.cols);
+                tracked_image_size_ = frame.size();
+                tracking_ = true;
+                status_text = refresh_yolo ? "Matched Track Refresh" : "Global Track Init";
+                color = cv::Scalar(255, 0, 0);
+            } else {
+                status_text = "YOLO Detect (Score: " + std::to_string(best->conf).substr(0, 4) + ")";
+                color = cv::Scalar(0, 0, 255);
+            }
+            result_rect = safe_rect;
+            result_confidence = best->conf;
+        } else if (decision.action == vision_tracking::DetectionAction::KeepTracker) {
+            RCLCPP_INFO(get_logger(),
+                "[VISION_DIAG] source=LightTrack outcome=low_score_support frame=%llu "
+                "candidates=%zu support_candidate=%d support_iou=%.4f detection_confidence=%.6f "
+                "required_gt=%.6f tracker_confidence=%.4f",
+                static_cast<unsigned long long>(frame_count_), candidates.size(),
+                decision.candidate_index, decision.support_iou, best->conf,
+                acquisition_threshold_, result_confidence);
+            status_text = "Tracking (YOLO Support)";
+        } else if (refresh_yolo) {
+            // Revoke this callback's result as well as internal tracking state.
+            // A global acquisition is permitted only on the next camera frame.
+            if (tracking_) {
+                ++tracker_loss_count_;
+            }
+            tracking_ = false;
+            result_rect = cv::Rect(-1, -1, -1, -1);
+            result_confidence = std::numeric_limits<float>::quiet_NaN();
+            status_text = "Track Lost (No YOLO Support)";
+            color = cv::Scalar(0, 255, 255);
+            RCLCPP_WARN(get_logger(),
+                "[VISION_DIAG] source=UNKNOWN outcome=%s frame=%llu candidates=%zu "
+                "selected=%d support_iou=%.4f required_iou=%.4f loss=%llu; "
+                "global acquisition deferred to next frame",
+                best ? "rejected_supported_box" : "no_support",
+                static_cast<unsigned long long>(frame_count_), candidates.size(),
+                decision.candidate_index, decision.support_iou, tracking_validation_iou_,
+                static_cast<unsigned long long>(tracker_loss_count_));
+        } else if (!best) {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                 "[VISION_DIAG] source=YOLO outcome=no_candidate frame=%llu "
-                "refresh=%s yolo_frames=%llu acquisitions=%llu",
+                "refresh=false yolo_frames=%llu acquisitions=%llu",
                 static_cast<unsigned long long>(frame_count_),
-                refresh_yolo ? "true" : "false",
                 static_cast<unsigned long long>(yolo_frame_count_),
                 static_cast<unsigned long long>(acquisition_count_));
         } else if (best->conf > acquisition_threshold_) {
-            const cv::Rect safe_rect = best->box & cv::Rect(0, 0, frame.cols, frame.rows);
-            if (safe_rect.width > 0 && safe_rect.height > 0 && safe_rect.area() >= 10) {
-                ++acquisition_count_;
-                acquired = true;
-                if (frame_capture_) {
-                    selected_candidate = static_cast<int>(best - candidates.data());
-                }
-                tracker_frames_since_yolo_ = 0;
-                RCLCPP_INFO(get_logger(),
-                    "[VISION_DIAG] source=YOLO outcome=acquired frame=%llu refresh=%s "
-                    "candidates=%zu confidence=%.4f bbox=%d,%d,%d,%d acquisition=%llu",
-                    static_cast<unsigned long long>(frame_count_),
-                    refresh_yolo ? "true" : "false", candidates.size(), best->conf,
-                    safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height,
-                    static_cast<unsigned long long>(acquisition_count_));
-                if (enable_tracking_) {
-                    Bbox box{static_cast<float>(safe_rect.x), static_cast<float>(safe_rect.y),
-                             static_cast<float>(safe_rect.x + safe_rect.width),
-                             static_cast<float>(safe_rect.y + safe_rect.height)};
-                    siam_tracker->init(frame.data, box, frame.rows, frame.cols);
-                    tracked_image_size_ = frame.size();
-                    tracking_ = true;
-                    status_text = "Global Track Init";
-                    color = cv::Scalar(255, 0, 0);
-                } else {
-                    status_text = "YOLO Detect (Score: " + std::to_string(best->conf).substr(0, 4) + ")";
-                    color = cv::Scalar(0, 0, 255);
-                }
-                result_rect = safe_rect;
-                result_confidence = best->conf;
-            } else {
-                RCLCPP_WARN(get_logger(),
-                    "[VISION_DIAG] source=YOLO outcome=rejected_box frame=%llu "
-                    "confidence=%.4f raw_bbox=%d,%d,%d,%d clipped_bbox=%d,%d,%d,%d",
-                    static_cast<unsigned long long>(frame_count_), best->conf,
-                    best->box.x, best->box.y, best->box.width, best->box.height,
-                    safe_rect.x, safe_rect.y, safe_rect.width, safe_rect.height);
-            }
+            RCLCPP_WARN(get_logger(),
+                "[VISION_DIAG] source=YOLO outcome=rejected_box frame=%llu "
+                "confidence=%.4f raw_bbox=%d,%d,%d,%d clipped_bbox=%d,%d,%d,%d",
+                static_cast<unsigned long long>(frame_count_), best->conf,
+                best->box.x, best->box.y, best->box.width, best->box.height,
+                decision.box.x, decision.box.y, decision.box.width, decision.box.height);
         } else {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                 "[VISION_DIAG] source=YOLO outcome=below_acquisition frame=%llu "
-                "refresh=%s candidates=%zu confidence=%.6f required_gt=%.6f",
-                static_cast<unsigned long long>(frame_count_),
-                refresh_yolo ? "true" : "false", candidates.size(),
+                "refresh=false candidates=%zu confidence=%.6f required_gt=%.6f",
+                static_cast<unsigned long long>(frame_count_), candidates.size(),
                 best->conf, acquisition_threshold_);
-        }
-        if (refresh_yolo && !acquired) {
-            track_frame(frame, result_rect, result_confidence, status_text, color);
         }
     } else {
         track_frame(frame, result_rect, result_confidence, status_text, color);

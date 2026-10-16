@@ -2,12 +2,15 @@
 
 # =======================================================
 # PX4 双机仿真启动脚本
-# Drone 1: gz_x500_depth (带深度相机, Instance 1)
+# Drone 1: gz_x500_depth_external_view (RGB 排除本机 visual, Instance 1)
 # Drone 2: gz_x500       (普通版,     Instance 2)
 # 世界: grass_world
 # =======================================================
 
 set -euo pipefail
+
+# Resolve repository assets before switching to the external PX4 working directory.
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 export PATH="$HOME/.local/bin:$PATH"
 PX4_ROOT="${PX4_ROOT:-$HOME/PX4-Autopilot}"
@@ -41,12 +44,60 @@ fi
 LOG_MAX_SIZE="5M"
 LOG_MAX_FILES=2
 
-for command in MicroXRCEAgent ros2 setsid; do
+for command in MicroXRCEAgent ros2 setsid gz; do
     command -v "$command" >/dev/null || {
         echo "错误：未找到 $command，请先加载 ROS 和本地工具环境"
         exit 1
     }
 done
+
+# A leftover model is external to the new self instance and would still be seen.
+# Use a fresh world by default; an explicit occupied partition must fail closed.
+export GZ_PARTITION="${GZ_PARTITION:-intercept_${UID}_$$}"
+echo "Gazebo partition: $GZ_PARTITION"
+GZ_TOPICS="$(gz topic -l)"
+while IFS= read -r topic; do
+    case "$topic" in
+        /world/*/clock)
+            echo "错误：该Gazebo分区已有世界；拒绝复用遗留模型：$GZ_PARTITION" >&2
+            echo "请unset GZ_PARTITION或使用全新分区；本脚本不会关闭其他仿真。" >&2
+            exit 1
+            ;;
+    esac
+done <<< "$GZ_TOPICS"
+
+# Deploy only the repository-owned wrapper; never replace upstream or user models.
+MODEL_NAME=x500_depth_external_view
+MODEL_SOURCE_DIR="$REPO_ROOT/assets/gazebo_models/$MODEL_NAME"
+PX4_MODELS_DIR="$PWD/Tools/simulation/gz/models"
+MODEL_DEPLOY_PATH="$PX4_MODELS_DIR/$MODEL_NAME"
+for resource in model.sdf model.config; do
+    if [ ! -r "$MODEL_SOURCE_DIR/$resource" ] || [ ! -s "$MODEL_SOURCE_DIR/$resource" ]; then
+        echo "错误：缺少或无法读取本机 visual 过滤模型资源：$MODEL_SOURCE_DIR/$resource" >&2
+        exit 1
+    fi
+done
+if [ ! -d "$PX4_MODELS_DIR" ]; then
+    echo "错误：未找到 PX4 Gazebo 模型目录：$PX4_MODELS_DIR" >&2
+    exit 1
+fi
+for dependency in x500 x500_base OakD-Lite; do
+    if [ ! -r "$PX4_MODELS_DIR/$dependency/model.sdf" ]; then
+        echo "错误：缺少或无法读取上游模型：$PX4_MODELS_DIR/$dependency/model.sdf" >&2
+        exit 1
+    fi
+done
+if [ -e "$MODEL_DEPLOY_PATH" ] || [ -L "$MODEL_DEPLOY_PATH" ]; then
+    if [ ! -L "$MODEL_DEPLOY_PATH" ] || \
+        [ "$(readlink -f -- "$MODEL_DEPLOY_PATH")" != "$MODEL_SOURCE_DIR" ]; then
+        echo "错误：模型路径已存在且不是预期的 repo 资源符号链接：$MODEL_DEPLOY_PATH" >&2
+        echo "预期指向：$MODEL_SOURCE_DIR；保留现有文件，请手动处理冲突。" >&2
+        exit 1
+    fi
+elif ! ln -sT -- "$MODEL_SOURCE_DIR" "$MODEL_DEPLOY_PATH"; then
+    echo "错误：无法部署本机 visual 过滤模型：$MODEL_DEPLOY_PATH" >&2
+    exit 1
+fi
 
 CONFIG_DIR=$(mktemp -d)
 PIDS=()
@@ -83,11 +134,11 @@ sleep 2
 #    同时拉起 Gazebo 仿真服务器 + grass_world
 # -------------------------------------------------------
 echo ""
-echo "🚀 正在启动 Drone 1 (gz_x500_depth, Instance 1)..."
+echo "🚀 正在启动 Drone 1 (gz_x500_depth_external_view, Instance 1)..."
 PX4_GZ_WORLD=grass_world \
 PX4_SYS_AUTOSTART=4002 \
 PX4_GZ_MODEL_POSE="$PX4_SELF_POSE" \
-PX4_SIM_MODEL=gz_x500_depth \
+PX4_SIM_MODEL=gz_x500_depth_external_view \
     setsid bash -o pipefail -c './build/px4_sitl_default/bin/px4 -d -i 1 2>&1 | rotatelogs -n "$1" drone1.log "$2"' \
     bash "$LOG_MAX_FILES" "$LOG_MAX_SIZE" &
 PID1=$!
@@ -106,7 +157,7 @@ sleep 15
 
 	cat > "$CONFIG_DIR/camera_bridge.yaml" << 'YEOF'
 - ros_topic_name: "/camera/image"
-  gz_topic_name: "/world/grass_world/model/x500_depth_1/link/camera_link/sensor/IMX214/image"
+  gz_topic_name: "/world/grass_world/model/x500_depth_external_view_1/link/camera_link/sensor/IMX214/image"
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
   direction: GZ_TO_ROS

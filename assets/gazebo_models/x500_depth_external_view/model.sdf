@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version='1.9' xmlns:experimental="http://sdformat.org/schemas/experimental">
+  <model name='x500_depth_external_view'>
+    <include merge='true'>
+      <uri>x500</uri>
+      <!-- Only this instance uses bit 0; GUI and the unmodified depth sensor retain all bits. -->
+      <experimental:params>
+        <visual element_id="base_link::base_link_visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::5010_motor_base_0">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::5010_motor_base_1">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::5010_motor_base_2">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::5010_motor_base_3">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::NXP_FMUK66_FRONT">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::NXP_FMUK66_TOP">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="base_link::RDDRONE_FMUK66_TOP">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_0::rotor_0_visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_0::rotor_0_visual_motor_bell">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_1::rotor_1_visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_1::rotor_1_visual_motor_top">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_2::rotor_2_visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_2::rotor_2_visual_motor_top">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_3::rotor_3_visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <visual element_id="rotor_3::rotor_3_visual_motor_top">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+      </experimental:params>
+    </include>
+    <include merge='true'>
+      <uri>model://OakD-Lite</uri>
+      <pose>.12 .03 .242 0 0 0</pose>
+      <experimental:params>
+        <visual element_id="camera_link::OakD-Lite/visual">
+          <visibility_flags action="add">1</visibility_flags>
+        </visual>
+        <!-- Schema-default camera name; add only the RGB mask, preserving all camera settings. -->
+        <camera element_id="camera_link::IMX214::__default__">
+          <visibility_mask action="add">2</visibility_mask>
+        </camera>
+      </experimental:params>
+    </include>
+    <joint name="CameraJoint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+      <pose relative_to="base_link">.12 .03 .242 0 0 0</pose>
+    </joint>
+  </model>
+</sdf>

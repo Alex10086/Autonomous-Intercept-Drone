@@ -193,7 +193,7 @@ export GZ_PARTITION=intercept_jazzy
 分别在四个终端执行：
 
 1. `~/.local/bin/qgroundcontrol`（本机用户级入口；保持地面站打开）。
-2. `bash ~/PX4-Autopilot/run_swarm.sh`。先将本仓库的世界文件放入 PX4 的 `Tools/simulation/gz/worlds/grass_world.sdf`；可将启动脚本链接到 PX4 根目录。`PX4_ROOT` 可覆盖默认源码目录，`HEADLESS=1` 可关闭 Gazebo GUI。
+2. `bash "$HOME/intercept_ws/src/Autonomous-Intercept-Drone/run_swarm.sh"`（按实际仓库路径调整）。先部署 `assets/gazebo_world/grass_world.sdf` 到PX4世界目录；必须运行保留完整assets的仓库脚本，不再复制或单独链接脚本到PX4根目录。启动器部署独立自机模型包装，不覆盖上游模型。`PX4_ROOT` 可覆盖PX4目录，`HEADLESS=1` 关闭GUI。
 3. `ros2 run uav_target_sim uav_target_sim`。
 4. `ros2 run uav_png_intercept uav_png_intercept`。需要记录时，先启动下一节的 `experiment_recorder`，设置 `algorithm:=pure_png`。
 
@@ -202,7 +202,7 @@ export GZ_PARTITION=intercept_jazzy
 
 ### 2.2 Jazzy 视觉检测与制导
 
-当前 VisionPNG 默认基线为高获取门槛 + refresh5 + raw，真实 CUDA 检测/跟踪及固定圆周 SITL 已验证。24 m 高门槛刷新组3/3首次命中，16.8 m对应组2/3；均为小样本GPS距离评估，不代表物理碰撞或普遍稳定成功率。RL不在本基线验证范围。
+历史冻结基线为 `visionpng-baseline-high08-refresh5-raw`，保留其24 m首次3/3、16.8 m首次2/3的小样本GPS评估。当前版本在其后加入本机RGB自见隔离和同帧YOLO支持复核，旧命中率不能直接当作新版本性能；不是物理碰撞或普遍安全保证。RL不在本次范围。
 
 视觉输入链路为 `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`。检测节点不发布飞控命令，不要同时运行 `uav_png_intercept` 或其他拦截机控制节点。
 
@@ -212,7 +212,7 @@ Vision PNG 只在新的有效检测观测上更新一次 LOS／PNG 和 yaw-PD �
 
 接收年龄不等于图像年龄或推理时延；实际时序以逐观测诊断和native时钟映射分析为准。`uav_vision_png/test/test_visual_freshness.py` 的真实节点回归覆盖过期、恢复、重复坐标新帧和姿态时间对齐等行为；节点回归本身不证明实际拦截命中率。
 
-组合前端默认每5个Tracker帧尝试YOLO刷新，仅在候选分数严格大于0.8且框合法时重新初始化；未获取成功则继续Tracker，下一帧再尝试YOLO。LightTrack尺寸更新保持现有自适应学习率公式。原raw argmax跳变失锁门槛的删除属于历史策略变化，本基线未恢复；当前Tracker仍仅按框面积判有效，不能将高分或未失锁当作位置正确。`[VISION_DIAG]` 保留获取、拒绝和进程计数。
+组合前端默认5个跟踪帧后，在下一帧用旧模板预测并运行YOLO复核。只在与当前Tracker框IoU达到 `tracking_validation_iou=0.1` 的候选中选择最高分；分数严格大于0.8才更新模板，0.4–0.8的同位候选支持保留Tracker并重置复核周期。没有同位支持则本帧发布无效框并退出跟踪，下一帧再全图获取，不能让失效Tracker无限刷新观测年龄，也不能用不相符的全局最高分直接覆盖当前跟踪。IoU只提供空间支持，不保证身份。`refresh=0` 显式关闭此复核，不适合无目标自动制导。
 
 
 使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
@@ -244,7 +244,7 @@ ros2 run uav_vision_png uav_vision_png
 
 * `use_cuda` 默认 `true`。CUDA 初始化或推理失败时退出并报告错误，不会悄悄回退 CPU；显式 CPU 诊断可传 `-p use_cuda:=false`。
 * `enable_tracking` 默认 `true`；`show_debug_window` 默认 `true`。无显示环境传 `-p show_debug_window:=false`。
-* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。冻结基线：`confidence_threshold=0.4` 仅用于候选后处理；独立 `acquisition_threshold=0.8` 要求最高候选分数严格 `>0.8` 才能初始化/覆盖Tracker；`yolo_refresh_interval=5`。IoU仍为0.45，图像默认Reliable/Depth1。不能把候选有效等同于允许更新模板。
+* 默认候选 `confidence_threshold=0.4`、获取严格 `acquisition_threshold=0.8`、`yolo_refresh_interval=5` 保持；NMS IoU仍为0.45。新增 `tracking_validation_iou=0.1`（有限且 `0<值<=1`），要求同帧检测支持Tracker；它与NMS门槛不同，runner同名CLI可覆盖并记录。模型路径仍可覆盖，图像默认Reliable/Depth1。
 * 每张实际处理图像发布一次结果并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
 
 视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
@@ -515,7 +515,7 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 
 高门槛+refresh组实际YOLO调用占整个检测进程处理帧的85%–90%（含起飞/等待），并非始终每6帧一次：刷新未获取成功时计数不清零、下一帧重试。此行为在实验中保持不变。完整九轮指标、初始身份图片、真假候选和时刻分解在 `analysis/results.json`、`analysis/policy_diagnosis.json`、`review/`。本批不启用KF、不改默认策略、不追加遮罩或关联机制；原raw argmax失锁门槛仍是尚未单独验证的变量。
 
-**冻结 VisionPNG 基线：`visionpng-baseline-high08-refresh5-raw`**
+**历史冻结 VisionPNG 基线：`visionpng-baseline-high08-refresh5-raw`（标签不覆写）**
 
 | 范围 | 冻结值 |
 |---|---|
@@ -529,9 +529,23 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 
 冻结依据追加24 m试验（实验版本 `5807967`，`~/intercept_ws/experiment_data/perception_policy_24m/analysis/policy24_diagnosis.json`）：高门槛refresh5三轮首次最近距离0.308/0.418/0.214 m，首次/最终均3/3；无刷新为21.027/21.131/20.872 m、0/3，初始均获取真目标但持续跟踪退化后未失锁。刷新组原图可见YOLO纠正背景跟踪。结合16.8 m结果，选择高门槛refresh5作为当前基线，不宣称已全面解决：高分桨叶仍可能覆盖目标，小目标/姿态变化下Tracker仍可能失效；样本每组仅3次，GPS命中不等同接触证明。
 
-直接启动检测节点、采集脚本和默认runner均使用此基线；现有VisionPNG YAML/launch保持raw与图像姿态同步。默认可复现实验命令为 `ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" --groups near far --trials 3`，无需额外获取/刷新参数。异常图像取证仍为显式 `--capture-anomalies`，不属于必需控制机制。近/远实验分别请求16.8/24 m，并沿用固定圆周入口；普通launch的起飞设置不冒充该实验入口。只有显式实验覆盖才偏离冻结配置，不新增KF、遮罩、融合或关联逻辑。
+以上为历史冻结标签的默认参数与复现实验入口；重现旧行为须切换该标签。当前主线仍保持高获取门槛/refresh5/raw，但增加了下述传感器过滤与复核，不能把旧3/3成绩视为当前版本。普通launch的起飞设置不冒充固定圆周入口，取证仍显式开启。
 
 冻结验证：实际启动默认检测节点及VisionPNG launch并读取运行参数；真实CUDA原图序列确认低分桨叶被拒绝、真目标获取、连续5次Tracker后再YOLO，显式低门槛覆盖仍可用于诊断。默认runner不传任何感知覆盖参数的SITL入口烟测也通过，接管延迟0.103 s；该2 s烟测不启动圆周运动、不启用距离闸门，**不计入16.8/24 m命中率**。验证日志与参数位于 `~/intercept_ws/experiment_data/visionpng_baseline_freeze/`。
+
+**无目标错误接管修复（冻结基线之后）**
+
+用户GUI记录中，接近整屏的错误Tracker框仍以高分被制导接受。真实CUDA负向回放中，160张无外部目标图像原先全部发布有效，其中64张近整屏；修复后仅最初5个Tracker间隔帧有效，随后撤销，整屏框0张，真目标重新出现仍可获取。该回放有刻意场景切换，不冒充实飞轨迹。
+
+按用户选择，`run_swarm.sh` 使用独立 `x500_depth_external_view` 自机包装：17个本机visual设flags=1，只有IMX214 RGB camera mask=2；目标/地面默认flags不变，GUI全mask仍可显示本机。深度传感器参数未改，但未另行验证深度画面。不按像素位置涂黑，不移动相机或修改内参、collision、inertia；实际SDF展开比较确认除模型根名称及可见性字段外相同。包装只引用上游资源，不复制mesh，不修改共享x500_base/OakD；启动时部署repo资源符号链接，冲突报错，不覆盖用户目录。这是SITL成像策略，不等价于实机安装修复。
+
+真实PX4/Gazebo静态目标出现/消失验证：15 s无目标阶段455条检测全部无效，保持SEARCHING，最大平移速度指令0；加入真实渲染x500后进入INTERCEPT，移除后0.724 s开始发送零平移指令。原图确认自身部件已排除、目标仍可见。此场景不是圆周命中率试验。控制端仍有0.15/0.6 s失效/COAST时序，并非立即停车；yaw搜索保留。脚本仍会先起飞到待机高度，再等待目标，不是“没有目标就不起飞”。
+
+复核是新的安全性/连续性取舍，不会保证弱目标总能重获取。24 m圆周回归 `regression_far/2026-10-16_12-57-43` 在一次无候选复核后失效，后续候选长期低于0.8，因缺近期有效检测窗口拒绝接管；保留为入口无效，不记作控制未命中、不降低门槛救场。因此旧24 m的3/3不能迁移到本修复，尚不能宣称等性能替换冻结版。证据均在 `~/intercept_ws/experiment_data/no_target_diagnostic/`。
+
+16.8 m移动圆周回归 `regression_near/2026-10-16_13-02-36` 入口有效，首次最近1.652 m未命中，随后44.057 s最终命中；采样TRACK_LOST占87.4%，表明恢复路径存在但连续性明显更保守，不能宣称性能不变。没有为此降低0.8门槛、扩大入口容差或添加KF。
+
+启动器默认生成本次独立GZ_PARTITION；显式分区若已有world clock则在创建进程前失败，不复用旧模型、更不会杀其他仿真。旧世界残留的另一架自机属于外部visual，可能绕过本机过滤，因此不能继续复用。若已有 `GZ_PARTITION` 环境变量，先 `unset GZ_PARTITION` 再运行原采集命令；启动日志会打印实际分区。共享PX4/ROS话题的其他控制节点仍须先正常关闭。
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 
@@ -547,20 +561,17 @@ Pure 对照仍运行真实检测以保持进程负载接近，并将速度上限
 
 
 0. **启动仿真环境**:
-   启动前，需将本仓库的仿真资源复制到 PX4-Autopilot 目录下：
+   从仓库根目录部署世界文件，并保留仓库内模型包装资源：
 
    ```bash
-   # 步骤1: 将本仓库的 run_swarm.sh 复制到 PX4-Autopilot 根目录（若尚未复制）
-   cp ros2_ws/src/run_swarm.sh ~/PX4-Autopilot/
-
-   # 步骤2: 将自定义世界文件复制到 PX4 Gazebo 世界目录
-   cp ros2_ws/src/assets/gazebo_world/grass_world.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
+   # 只部署世界文件；不要单独复制run_swarm.sh
+   cp assets/gazebo_world/grass_world.sdf \
+     "${PX4_ROOT:-$HOME/PX4-Autopilot}/Tools/simulation/gz/worlds/"
    ```
 
-   > 以上步骤只需执行一次。之后每次启动仿真，直接进入 PX4-Autopilot 目录运行启动脚本即可：
+   > 每次从保留完整assets的仓库目录运行。启动器自动将独立模型包装链接到PX4模型目录，不覆盖上游资源：
    ```bash
-   cd ~/PX4-Autopilot
-   ./run_swarm.sh
+   bash ./run_swarm.sh
    ```
 
    该脚本会自动启动 Gazebo 仿真服务器、两架无人机（px4_1 拦截机 + px4_2 目标机）、MicroXRCEAgent 以及相机话题桥接。

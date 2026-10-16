@@ -537,6 +537,8 @@ def analyze_recording(recording, output):
         'confidence_threshold':requested.get('confidence_threshold'),
         'acquisition_threshold':requested.get('acquisition_threshold'),
         'yolo_refresh_interval':requested.get('yolo_refresh_interval'),
+        'tracking_validation_iou':requested.get('tracking_validation_iou'),
+        'camera_visibility_policy':requested.get('camera_visibility_policy'),
         'initial_distance':initial.get('distance'),
         'initial_height_difference':initial.get('height_difference'),
         'initial_self_velocity':initial.get('self_velocity_ned'),

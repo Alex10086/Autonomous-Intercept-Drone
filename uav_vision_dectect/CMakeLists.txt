@@ -60,6 +60,11 @@ if(BUILD_TESTING)
   add_executable(test_tracking_math test/test_tracking_math.cpp)
   target_include_directories(test_tracking_math PRIVATE include/light_track)
   add_test(NAME tracking_math COMMAND test_tracking_math)
+  add_executable(test_tracking_validation test/test_tracking_validation.cpp)
+  target_include_directories(test_tracking_validation PRIVATE
+    include/uav_vision_dectect ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_tracking_validation ${OpenCV_LIBS})
+  add_test(NAME tracking_validation COMMAND test_tracking_validation)
   add_executable(test_frame_capture test/test_frame_capture.cpp src/frame_capture.cpp)
   target_include_directories(test_frame_capture PRIVATE
     include/uav_vision_dectect "${ONNXRUNTIME_INCLUDE_DIR}" ${OpenCV_INCLUDE_DIRS})
