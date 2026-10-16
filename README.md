@@ -198,6 +198,8 @@ Run these commands in four separate terminals:
 
 ### 2.2 Jazzy Visual Detection and Guidance
 
+**Current temporary `vision_png` default baseline: `visionpng-baseline-high08-refresh5-probation-raw`.** Adopted at the user's request, with implementation `4160914`: bounded probation and capture-attitude rotation compensation, retaining self-visual isolation, unique Gazebo partitions, Reliable QoS and native timing. Candidates.4/global acquisition strictly>.8/refresh5/support IoU.1/hold.35s/recovery2s; raw keeps KF off and control gains unchanged. Fixed-circle first hits were3/3 far and2/3 near; the near long-loss counterexample remains. This is a provisional working baseline, not a claim that stability is solved.
+
 The historical frozen tag `visionpng-baseline-high08-refresh5-raw` retains its small-cohort GPS results (first hits3/3 at24m,2/3 at16.8m). Current post-baseline self-visual isolation and same-image support validation change behavior; old hit rates are not new-version performance or general safety guarantees. RL is outside this scope.
 
 The vision chain is `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`. The detector publishes no flight-control commands; do not simultaneously run `uav_png_intercept` or another interceptor controller.
@@ -221,7 +223,7 @@ colcon build --symlink-install --packages-select uav_vision_dectect uav_vision_p
   --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
   -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT"
 source install/setup.bash
-export ROS_DOMAIN_ID=173
+export ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0
 ```
 
 Models are installed in the ROS package share directory, so startup is independent of the working directory. `--symlink-install` avoids duplicate model copies. Defaults are `GDUT_UAV.onnx` and the LightTrack init/update models; retain the accompanying `.onnx.data` file. This YOLO model outputs `[1,25200,6]`, and published bounding boxes use original 1920×1080 image coordinates, not the 640×640 network input.
@@ -288,6 +290,50 @@ bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archiv
 The script starts recording first, then the repository's `run_swarm.sh`, target, optional detector, and guidance. Shutdown finalizes recording before stopping only its owned processes.
 
 `duration` and `start_timeout` accept integer or decimal seconds, e.g. `60`/`180` or `60.0`/`180.0`. The script normalizes integer inputs to ROS DOUBLE literals; direct `ros2 run ... -p` commands still need floating-point values. If the recorder exits early, startup reports its status and original error instead of a misleading missing-PID `kill` error. Stop other simulations/controllers using the same PX4/vision topics before starting, keeping QGroundControl connected, to avoid consuming another run's data.
+
+**GUI workflow for the temporary baseline (local desktop).** Stop other simulations/controllers sharing `/px4_1` and `/px4_2`; keep only one QGroundControl. The collection script starts simulation, target, detector and guidance itself, so do not launch those twice.
+
+Build once after source changes (the current local version is already built and GUI-smoke-verified):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/.local/opt/intercept/vision-env.bash"
+cd "$HOME/intercept_ws"
+colcon build --symlink-install \
+  --packages-up-to uav_vision_dectect uav_target_sim uav_bc_recorder \
+  --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+Terminal1, unless QGroundControl is already open:
+
+```bash
+unset QT_QPA_PLATFORM
+"$HOME/.local/bin/qgroundcontrol"
+```
+
+Terminal2:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/.local/opt/intercept/vision-env.bash"
+source "$HOME/intercept_ws/install/setup.bash"
+export ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0
+export PX4_SELF_POSE="0,0" PX4_TARGET_POSE="20,0"
+unset HEADLESS GZ_PARTITION QT_QPA_PLATFORM
+
+bash "$HOME/Documents/GitHub/Autonomous-Intercept-Drone/uav_bc_recorder/launch_bc_collection.sh" \
+  circle \
+  "$HOME/intercept_ws/experiment_data/visionpng_baseline_gui" \
+  60.0 \
+  compare \
+  vision_png \
+  180.0
+```
+
+Expect Gazebo and the `Result` detection window, automatic takeoff/acquisition/interception, without manual arming. The duration is the interception recording limit, not total startup time; the final argument is startup wait. Ordinary GUI spawn/automatic takeover is not the fixed24m/16.8m distance/phase admission protocol. Compare saves CSV/meta/summary/bag, not camera video or default anomaly PNGs; change only the profile to `archive` for video. Each run creates a fresh timestamped directory. Hit/DONE/timeout finalizes automatically; to stop early press Ctrl+C once in terminal2 and wait for recorder/process cleanup before closing QGroundControl. Do not use global pkill.
+
+Actual GUI smoke is under `~/intercept_ws/experiment_data/visionpng_probation_baseline_freeze/gui_20261016_150725/`: all three windows present, actual tracked target visible, live default parameters and native CameraInfo verified, launcher exit0 and finalized bag. This10s ordinary-entry smoke missed at1.076m; it proves GUI/default operation only and is not part of the six fixed-range flights.
+
 
 Each startup immediately creates an independent directory beneath `out_dir`, e.g. `2026-10-15_14-30-00_vision_png_circle_001/`, containing `meta.yaml`, `timeseries.csv`, and `summary.csv`. Archive adds `camera.mp4`; compare/archive add `rosbag/` and `rosbag.log`. Atomic directory creation increments the suffix instead of overwriting runs. An optional string `experiment_id` is included in the directory name and metadata, with a separate collision-safe suffix.
 
@@ -461,7 +507,7 @@ Hits use the existing GPS0.8m evaluation radius, not physical-contact proof or G
 
 Near trial2 recovered after .626s/.488s support gaps using .586592/.460884 candidates, then had sustained empty candidates from about4.8s, invalid publication at4.966s and internal expiry at6.600s. First-min horizontal/absolute vertical error was .660/.738m. A309×139 tracker box received weak support from a130×56 YOLO box at only.1171 IoU: overlap does not establish precise localization. **[INFERENCE]** Near-pass appearance/scale, tracker drift or leaving the FOV remain plausible; no native images cover this exact failure segment, so empty detections cannot establish a visible-target YOLO miss.
 
-**Do not formally freeze or overwrite the historical baseline tag yet; retain this safer candidate on main, not the unsafe old behavior.** Safety and24m continuity have end-to-end evidence, but one near60s miss/long loss remains. Next capture the near-approach image window on the same configuration to distinguish detection absence from tracker-coordinate drift, before KF/fusion or any further threshold change. Evidence: `motion_prior_far/2026-10-16_14-41-54`, `motion_prior_near/2026-10-16_14-46-49`, `final_validation_summary.json` and per-group `analysis/continuity_summary.json` under the probation root; all pilot negatives remain. Temporary diagnostic sources are archived in `validation_provenance.json`.
+**Current decision at the user's request: temporarily adopt this version as the `vision_png` default, tagged `visionpng-baseline-high08-refresh5-probation-raw`; preserve the historical tag and do not restore unsafe behavior on main.** This is a provisional diagnostic baseline, not solved performance. Safety and24m continuity have end-to-end evidence, but one near60s miss/long loss remains. Next capture the near-approach image window on the same configuration to distinguish detection absence from tracker-coordinate drift, before KF/fusion or any further threshold change. Evidence: `motion_prior_far/2026-10-16_14-41-54`, `motion_prior_near/2026-10-16_14-46-49`, `final_validation_summary.json` and per-group `analysis/continuity_summary.json` under the probation root; all pilot negatives remain. Temporary diagnostic sources are archived in `validation_provenance.json`.
 
 
 

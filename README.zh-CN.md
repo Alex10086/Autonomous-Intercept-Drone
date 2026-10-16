@@ -202,6 +202,8 @@ export GZ_PARTITION=intercept_jazzy
 
 ### 2.2 Jazzy 视觉检测与制导
 
+**当前 `vision_png` 临时默认基线：`visionpng-baseline-high08-refresh5-probation-raw`。** 按用户指定采用有界待确认＋图像采样姿态补偿版本（算法实现 `4160914`），不回退本机visual隔离、独立Gazebo分区、Reliable及原生时间同步。保持候选0.4／全局首次严格>0.8／refresh5／支持IoU0.1／有效输出宽限0.35s／内部恢复2s；raw即KF关闭，PNG控制参数不变。固定圆周24m首次3/3、16.8m首次2/3；后者仍有长期失锁反例，临时采用不表示性能问题已全部解决。GUI全过程命令见2.3。
+
 历史冻结基线为 `visionpng-baseline-high08-refresh5-raw`，保留其24 m首次3/3、16.8 m首次2/3的小样本GPS评估。当前版本在其后加入本机RGB自见隔离和同帧YOLO支持复核，旧命中率不能直接当作新版本性能；不是物理碰撞或普遍安全保证。RL不在本次范围。
 
 视觉输入链路为 `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`。检测节点不发布飞控命令，不要同时运行 `uav_png_intercept` 或其他拦截机控制节点。
@@ -225,7 +227,7 @@ colcon build --symlink-install --packages-select uav_vision_dectect uav_vision_p
   --parallel-workers 2 --cmake-args -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
   -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT"
 source install/setup.bash
-export ROS_DOMAIN_ID=173
+export ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0
 ```
 
 检测模型由包安装到 ROS share 目录，启动不依赖当前工作目录。`--symlink-install` 避免重复复制模型。默认模型为 `GDUT_UAV.onnx` 和 LightTrack 的 init/update；保留随附的 `.onnx.data` 文件。该 YOLO 模型输出为 `[1,25200,6]`，检测框坐标对应原始 1920×1080 图像，而不是 640×640 网络输入。
@@ -292,6 +294,54 @@ bash uav_bc_recorder/launch_bc_collection.sh circle experiment_data 120.0 archiv
 脚本先启动记录器，再运行仓库的 `run_swarm.sh`、目标机、可选检测和制导；退出时先完成记录文件，再停止自己启动的进程，不会全局 kill 其他实验。
 
 `duration` 和 `start_timeout` 均接受整数或小数秒，例如 `60` / `180` 或 `60.0` / `180.0`；脚本会将纯整数归一为ROS DOUBLE字面量，避免 `INTEGER, expecting DOUBLE`。直接使用 `ros2 run ... -p` 时仍应写浮点值。记录器若提前退出，脚本报告其退出码和原始错误后停止，不再以 `kill: 没有那个进程` 掩盖原因。启动前请关闭其它使用同一组PX4/视觉话题的仿真与控制节点，只保留QGroundControl，避免读到上一套运行的数据。
+
+**当前临时基线的GUI全过程（在本机桌面终端执行）**
+
+先正常关闭其它双机仿真、检测和拦截控制节点；不要并行运行两套共享 `/px4_1`／`/px4_2` 的实验。只保留一个QGroundControl；不要再手动重复启动 `run_swarm.sh`、目标机或检测节点，一键脚本会负责它们。
+
+首次或源码更新后构建一次（本机该版本已构建并通过GUI烟测）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/.local/opt/intercept/vision-env.bash"
+cd "$HOME/intercept_ws"
+colcon build --symlink-install \
+  --packages-up-to uav_vision_dectect uav_target_sim uav_bc_recorder \
+  --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+终端1：启动地面站，保持打开；若已经打开同一个QGroundControl，跳过此步。
+
+```bash
+unset QT_QPA_PLATFORM
+"$HOME/.local/bin/qgroundcontrol"
+```
+
+终端2：加载环境并启动完整GUI＋记录：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/.local/opt/intercept/vision-env.bash"
+source "$HOME/intercept_ws/install/setup.bash"
+export ROS_DOMAIN_ID=0 PX4_PARAM_UXRCE_DDS_DOM_ID=0
+export PX4_SELF_POSE="0,0" PX4_TARGET_POSE="20,0"
+unset HEADLESS GZ_PARTITION QT_QPA_PLATFORM
+
+bash "$HOME/Documents/GitHub/Autonomous-Intercept-Drone/uav_bc_recorder/launch_bc_collection.sh" \
+  circle \
+  "$HOME/intercept_ws/experiment_data/visionpng_baseline_gui" \
+  60.0 \
+  compare \
+  vision_png \
+  180.0
+```
+
+自动启动顺序：记录器→独立Gazebo双机世界/相机与时钟桥→目标控制/YOLO＋LightTrack→VisionPNG；界面应出现Gazebo和检测窗口 `Result`。自动起飞、搜索、获取及拦截，无需另行手动解锁；`60.0` 是进入拦截后的最长记录时间，`180.0` 是启动等待上限，不是整套流程只运行60s。普通GUI入口使用上述出生位置和普通自动接管，不等同于固定24m/16.8m圆周实验的距离/相位闸门。
+
+`compare` 保存CSV、meta/summary和关键topic bag，不保存第一视角视频，也不默认启用异常PNG；需要视频只把 `compare` 改为 `archive`。输出在指定根目录内新建带时间戳的子目录，不覆盖旧实验。命中/DONE/超时会自动收尾；提前停止在终端2按一次 `Ctrl+C`，等待bag/CSV完成并关闭本次子进程，再关闭地面站，不用全局 `pkill`。
+
+真实GUI烟测 `~/intercept_ws/experiment_data/visionpng_probation_baseline_freeze/gui_20261016_150725/`：Gazebo、QGroundControl和 `Result` 窗口存在，截图中实际目标带跟踪框；读取运行参数确认默认CUDA/refresh5/hold0.35/timeout2/raw/image同步，实际CameraInfo收到，脚本退出0、bag finalized。该10s普通入口烟测最近1.076m、未命中，仅证明GUI全链路与默认值，不计入上述固定距离六次结果。
+
 
 每次启动都立即在 `out_dir` 下原子创建独立目录，不覆盖历史数据；同秒启动自动递增编号。可用字符串参数 `experiment_id` 指定标识，目录仍带防碰撞后缀。
 
@@ -576,7 +626,7 @@ runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默�
 
 16.8m第二次在支持年龄0.626s/0.488s时，分别用0.586592/0.460884候选恢复，证明短漏检后模板仍可用；但末段约4.8s起持续无候选，4.966s撤销有效输出，6.600s内部过期。最近点水平0.660m、高差绝对值0.738m，仍未进入0.8m判据。另有Tracker框`309×139`与低分YOLO框`130×56`仅IoU0.1171的支持，说明“有重叠支持”不等于定位精确。**[INFERENCE]** 近接尺度/外观变化、Tracker几何漂移或目标出画仍可能影响结果；该段未保存原生图像，不能仅凭空候选认定YOLO漏掉了可见目标。
 
-**结论：暂不正式冻结新baseline，不覆盖历史冻结标签，也不将main回退到无目标不安全版本。** 保留该候选用于后续诊断；安全退出和24m弱分恢复有端到端证据，但16.8m仍有一次60s未命中和长期失锁。下一步优先用同一配置记录近接窗口的原图，区分YOLO可见目标漏检与Tracker坐标漂移，不先加KF/融合、不再放宽门槛。完整结果 `final_validation_summary.json`、分组 `analysis/continuity_summary.json`、bag/日志及首版负向记录全部保留；临时诊断源码归档于 `validation_provenance.json`。
+**当前决定（按用户指定）：暂时将本版本作为 `vision_png` 默认基线，标签 `visionpng-baseline-high08-refresh5-probation-raw`；历史冻结标签不覆写，main不回退旧的不安全行为。** 这是阶段性诊断基线，不宣称性能问题已解决：安全退出和24m弱分恢复有端到端证据，但16.8m仍有一次60s未命中和长期失锁。下一步优先用同一配置记录近接窗口原图，区分YOLO可见目标漏检与Tracker坐标漂移，不先加KF/融合、不放宽门槛。完整结果 `final_validation_summary.json`、分组 `analysis/continuity_summary.json`、bag/日志及首版负向记录全部保留；临时诊断源码归档于 `validation_provenance.json`。
 
 
 
