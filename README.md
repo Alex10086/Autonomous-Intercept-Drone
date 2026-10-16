@@ -444,7 +444,25 @@ Actual CUDA native-image replay passed single/three-frame miss recovery from a0.
 
 Only the unexpired probation fallback now rotates its last confirmed box using real `/camera/camera_info` K and capture-epoch self attitude. Existing current-tracker support retains priority and only actual YOLO evidence renews permission. Reuse ClockHistory/DdsClock/AttitudeHistory with independently consumed state callbacks and post-inference capture-time SLERP; no receipt-pose substitution, target-motion model, GPS translation, ROI expansion, lowered global gate or control change. Cross-generation/calibration changes and behind/outside projections invalidate the prior; missing pose/calibration retains the conservative old pixel fallback. PNG changes only install/export existing headers and Eigen.
 
-The new CUDA replay passed all10 assertions. Real PX4/Gazebo `live_20261016_143920` passed15.003s empty-scene SEARCHING/zero translation, static12m acquisition, zero translation0.950s after removal and internal expiry. Actual CameraInfo is1920×1080, fx≈1397.2236/fy≈1397.2235; capture_rotation and native attitude brackets were observed. Geometry/clock regressions passed. These are not moving-circle results; keep the pilot under `formal_far/`, offline evidence under `rotation_evidence/`, and evaluate the final six on one fixed new source version.
+The new CUDA replay passed all10 assertions. Real PX4/Gazebo `live_20261016_143920` passed15.003s empty-scene SEARCHING/zero translation, static12m acquisition, zero translation0.950s after removal and internal expiry. Actual CameraInfo is1920×1080, fx≈1397.2236/fy≈1397.2235; capture_rotation and native attitude brackets were observed. Geometry/clock regressions passed. These are not moving-circle results; the pilot remains under `formal_far/`, offline evidence under `rotation_evidence/`, and final six-flight results on one fixed source follow.
+
+**Final six flights on fixed source `4160914`.** All three24m and three16.8m entries were valid, with identical recorded source and clean trees. Keep fixed-circle admission, raw/image/Reliable, candidate.4/global>.8, refresh5, IoU.1, hold.35s/recovery2s and all original control gains; no entry bypass.
+
+| Requested range | Trial | First minimum m | First 0.8m hit s | Full-record TRACK_LOST |
+|---|---:|---:|---:|---:|
+| 24m | 1 | .788 | 8.263 | 25.9% |
+| 24m | 2 | .682 | 8.180 | 23.8% |
+| 24m | 3 | .401 | 7.995 | 0.0% |
+| 16.8m | 1 | .612 | 6.767 | 24.0% |
+| 16.8m | 2 | .990 | No hit in60s | 79.2% |
+| 16.8m | 3 | .696 | 5.571 | 27.2% |
+
+Hits use the existing GPS0.8m evaluation radius, not physical-contact proof or GPS guidance. Fractions include the existing2s post-hit tail; misses run60s. Pooled sample-weighted TRACK_LOST is16.7% far/67.7% near versus the old single near reference87.4%; this is neither paired nor statistical-significance evidence. Each far flight had exactly one global acquisition and an actual accepted rotation-compensated local recovery at .781096/.771598/.769793, IoU.3627/.3189/.4100, not a lowered first-acquisition gate.
+
+Near trial2 recovered after .626s/.488s support gaps using .586592/.460884 candidates, then had sustained empty candidates from about4.8s, invalid publication at4.966s and internal expiry at6.600s. First-min horizontal/absolute vertical error was .660/.738m. A309×139 tracker box received weak support from a130×56 YOLO box at only.1171 IoU: overlap does not establish precise localization. **[INFERENCE]** Near-pass appearance/scale, tracker drift or leaving the FOV remain plausible; no native images cover this exact failure segment, so empty detections cannot establish a visible-target YOLO miss.
+
+**Do not formally freeze or overwrite the historical baseline tag yet; retain this safer candidate on main, not the unsafe old behavior.** Safety and24m continuity have end-to-end evidence, but one near60s miss/long loss remains. Next capture the near-approach image window on the same configuration to distinguish detection absence from tracker-coordinate drift, before KF/fusion or any further threshold change. Evidence: `motion_prior_far/2026-10-16_14-41-54`, `motion_prior_near/2026-10-16_14-46-49`, `final_validation_summary.json` and per-group `analysis/continuity_summary.json` under the probation root; all pilot negatives remain. Temporary diagnostic sources are archived in `validation_provenance.json`.
+
 
 
 Only if the cause remains ambiguous, add matched far Pure PNG controls:
