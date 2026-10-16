@@ -37,7 +37,7 @@ UavTopicSubscrib::UavTopicSubscrib() : Node("uav_vision_dectect")
     config.confThreshold = static_cast<float>(
         declare_parameter<double>("confidence_threshold", 0.4));
     config.iouThreshold = 0.45f;
-    const double acquisition_threshold = declare_parameter<double>("acquisition_threshold", 0.0);
+    const double acquisition_threshold = declare_parameter<double>("acquisition_threshold", 0.8);
     if (!std::isfinite(acquisition_threshold) ||
         acquisition_threshold < 0.0 || acquisition_threshold > 1.0) {
         throw std::invalid_argument("acquisition_threshold must be finite and in [0,1]");

@@ -202,17 +202,17 @@ export GZ_PARTITION=intercept_jazzy
 
 ### 2.2 Jazzy 视觉检测与制导
 
-实测已通过默认 CUDA 模式的真实模型检测/跟踪、检测框发布、悬停推力收敛，以及 `uav_vision_png` 从起飞进入 `SEARCHING` / `INTERCEPT`。三个模型的 ONNX profiling 均记录了 CUDA 卷积运算；验证不是假检测框，也不是只检查 Provider 名称。完整拦截命中和 RL 仍未验证。
+当前 VisionPNG 默认基线为高获取门槛 + refresh5 + raw，真实 CUDA 检测/跟踪及固定圆周 SITL 已验证。24 m 高门槛刷新组3/3首次命中，16.8 m对应组2/3；均为小样本GPS距离评估，不代表物理碰撞或普遍稳定成功率。RL不在本基线验证范围。
 
 视觉输入链路为 `/camera/image` → `uav_vision_dectect` → `/camera_detect_result` → `uav_vision_png`。检测节点不发布飞控命令，不要同时运行 `uav_png_intercept` 或其他拦截机控制节点。
 
-Vision PNG 只在新的有效检测回调中，用该回调接收时的姿态快照更新一次 LOS／PNG 和 yaw-PD 历史；相同 bbox 坐标的新消息仍正常处理，不按坐标去重。已移除 40 Hz PNG 重算定时器。200 Hz 控制循环保留原有速度公式、增益和垂向补偿；新帧之间不推进视觉历史。
+Vision PNG 只在新的有效检测观测上更新一次 LOS／PNG 和 yaw-PD 历史；默认按图像时间映射与四元数SLERP取得拍摄时刻姿态，不使用接收姿态替代。相同 bbox 坐标的新图像仍正常处理，不按坐标去重。200 Hz 控制循环保留现有速度公式、增益和垂向补偿；新帧之间不推进视觉历史。
 
 失锁配置改为秒数：`freshness_timeout: 0.15`、`track_lost_timeout: 0.6`，要求有限且 `0 < freshness_timeout < track_lost_timeout`。无目标结果不更新缓存观测、不刷新计时，也不立即触发 COAST；仅在最后有效检测的单调接收年龄超过 0.15 s 时进入 COAST，达到 0.6 s 时进入 TRACK_LOST，完全没有消息时同样生效。新鲜窗口内恢复有效检测会延续 LOS／PNG 和 yaw-PD 历史，不重新初始化。COAST 保持最后速度／偏航率并继续命中评价，TRACK_LOST 保留原制动搜索策略；只有从这些失锁状态恢复时才重新初始化 PNG 和 yaw 差分参考，避免跨失锁差分。旧 `coast_thresh`／`lost_thresh` 帧数参数已删除，需迁移配置。
 
-此版本没有实现拍摄时刻姿态插值，也不能用接收年龄判断图像的真实推理延迟。`uav_vision_png/test/test_visual_freshness.py` 使用隔离话题启动真实节点，覆盖旧框＋新姿态、相同坐标新帧、短暂无目标不重置历史、静默／无目标超时、恢复和 COAST 命中；节点回归本身不证明实际拦截命中率。
+接收年龄不等于图像年龄或推理时延；实际时序以逐观测诊断和native时钟映射分析为准。`uav_vision_png/test/test_visual_freshness.py` 的真实节点回归覆盖过期、恢复、重复坐标新帧和姿态时间对齐等行为；节点回归本身不证明实际拦截命中率。
 
-组合前端现在每 5 个跟踪帧重新运行一次 YOLO，并在获得有效框时重新初始化 LightTrack。LightTrack 的尺寸更新两个分量都使用 `penalty × score × lr` 自适应学习率；原来比较 18×18 raw score 展平 argmax 跳变的门限会拒绝高分且仍在画面内的正常运动，现已删除。`[VISION_DIAG]` 日志区分 YOLO 无候选／获取和 LightTrack 出画失效，并在退出时汇总计数。
+组合前端默认每5个Tracker帧尝试YOLO刷新，仅在候选分数严格大于0.8且框合法时重新初始化；未获取成功则继续Tracker，下一帧再尝试YOLO。LightTrack尺寸更新保持现有自适应学习率公式。原raw argmax跳变失锁门槛的删除属于历史策略变化，本基线未恢复；当前Tracker仍仅按框面积判有效，不能将高分或未失锁当作位置正确。`[VISION_DIAG]` 保留获取、拒绝和进程计数。
 
 
 使用 ONNX Runtime C++ GPU SDK 1.23.2，以及支持 Blackwell 的 CUDA 12.8 和 cuDNN 9 运行库；不需要完整 CUDA Toolkit、PyTorch 或 TensorRT。SDK 可安装在 `~/.local/opt/intercept/onnxruntime`，CUDA/cuDNN 动态库可放在独立用户级环境，避免改动系统 Python。参见 [ONNX CUDA 依赖说明](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)。
@@ -244,7 +244,7 @@ ros2 run uav_vision_png uav_vision_png
 
 * `use_cuda` 默认 `true`。CUDA 初始化或推理失败时退出并报告错误，不会悄悄回退 CPU；显式 CPU 诊断可传 `-p use_cuda:=false`。
 * `enable_tracking` 默认 `true`；`show_debug_window` 默认 `true`。无显示环境传 `-p show_debug_window:=false`。
-* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。`confidence_threshold` 默认为 `0.4`；YOLO 后处理和跟踪器捕获共用该阈值，不再用第二个更严格的门槛丢弃已有有效候选框。IoU 阈值仍为 `0.45`。
+* `yolo_model_path`、`tracker_init_model_path`、`tracker_update_model_path` 可覆盖安装目录中的默认模型。冻结基线：`confidence_threshold=0.4` 仅用于候选后处理；独立 `acquisition_threshold=0.8` 要求最高候选分数严格 `>0.8` 才能初始化/覆盖Tracker；`yolo_refresh_interval=5`。IoU仍为0.45，图像默认Reliable/Depth1。不能把候选有效等同于允许更新模板。
 * 每张实际处理图像发布一次结果并保留图像时间戳；丢失目标时 bbox 四个字段均为 `-1`，不重复发布旧框伪装成新检测。
 
 视觉制导到达待机高度且悬停推力估计收敛后进入 `SEARCHING`，收到有效检测框后进入 `INTERCEPT`。`/vpng_data` 可观察真实 LOS 和像素误差；只有启动进程或看到话题存在，不等于识别或拦截成功。
@@ -485,7 +485,7 @@ runner 将 `diagnostic_capture_dir` 指向该轮 `anomaly_frames/`；单独启�
 
 上游 `6f2d53b` 在正常跟踪时不运行 YOLO，检测候选阈值为 `>=0.4`，获取模板另要求严格 `>0.8`。本地 `b74d7c7` 取消第二道门槛、`97a27ab` 增加周期刷新并删除 raw argmax 跳变失锁判据；这是策略变化，不应全部称为确定性 bug 修复。对照保留整数候选索引、时间同步、Reliable/Depth1、raw 及现有失锁判据，不整提交回滚。
 
-runner 新增 `--confidence-threshold`（默认 0.4）、`--acquisition-threshold`（默认 0.0）、`--yolo-refresh-interval`（默认 5），分别透传同名节点参数并写入协议/分析。获取比较为 `score > acquisition_threshold`；默认 0.0 保持现有候选获取行为，0.8 恢复原独立严格门槛，不能用提高检测阈值替代。参数仅在启动时读取。
+runner 的 `--confidence-threshold` 默认0.4、`--acquisition-threshold`现默认0.8、`--yolo-refresh-interval`默认5，与检测节点直接启动一致。获取比较为 `score > acquisition_threshold`。下表记录 `2237ead` 时期的策略对照，低门槛参考现在须显式传 `--acquisition-threshold 0.0`，无刷新对照显式传 `--yolo-refresh-interval 0`；不能用提高检测阈值替代独立获取门槛。参数仅在启动时读取。
 
 | 对照 | 检测候选 | 获取 | refresh |
 |---|---:|---:|---:|
@@ -512,6 +512,24 @@ runner 新增 `--confidence-threshold`（默认 0.4）、`--acquisition-threshol
 高门槛组第2轮 `event_frame_1847_89_761000000` 更明确显示：同帧桨叶0.814677、真实目标0.800589均过门槛，最高分桨叶覆盖了仍跟随真目标的Tracker。发生于18.921 s，**晚于该轮6.375 s首次近接**，不能拿它解释该轮首次未命中；它证明0.8并非身份保证，周期刷新仍保留错误覆盖入口。另有Tracker跟空天空却报大框和高分的后段图片，当前面积判据仍不足以判断真正失锁。
 
 高门槛+refresh组实际YOLO调用占整个检测进程处理帧的85%–90%（含起飞/等待），并非始终每6帧一次：刷新未获取成功时计数不清零、下一帧重试。此行为在实验中保持不变。完整九轮指标、初始身份图片、真假候选和时刻分解在 `analysis/results.json`、`analysis/policy_diagnosis.json`、`review/`。本批不启用KF、不改默认策略、不追加遮罩或关联机制；原raw argmax失锁门槛仍是尚未单独验证的变量。
+
+**冻结 VisionPNG 基线：`visionpng-baseline-high08-refresh5-raw`**
+
+| 范围 | 冻结值 |
+|---|---|
+| 感知 | Combined（YOLO获取/刷新 + LightTrack）；默认CUDA、GDUT_UAV及现有LightTrack模型 |
+| 候选/模板门槛 | YOLO候选 `>=0.4`；获取/覆盖模板严格 `>0.8`；IoU 0.45 |
+| 刷新 | 5个Tracker帧后尝试YOLO；失败后保留现有逐帧重试行为 |
+| 图像输入 | IMX214 1920×1080，Reliable，KeepLast 1，现有内参及安装不变 |
+| 观测/姿态 | `pixel_estimator=raw`（KF关闭）；`attitude_sync=true`；Gazebo/native DDS时间映射 |
+| 控制/评估 | speed 5 m/s，kv=kz=4，d_gain=2，yaw 0.0008/0.0002，k_ey=0.0056；GPS命中半径0.8 m |
+| 失锁 | 保留当前Tracker面积判据；控制观测超时0.15/0.6 s；未恢复原raw argmax门槛 |
+
+冻结依据追加24 m试验（实验版本 `5807967`，`~/intercept_ws/experiment_data/perception_policy_24m/analysis/policy24_diagnosis.json`）：高门槛refresh5三轮首次最近距离0.308/0.418/0.214 m，首次/最终均3/3；无刷新为21.027/21.131/20.872 m、0/3，初始均获取真目标但持续跟踪退化后未失锁。刷新组原图可见YOLO纠正背景跟踪。结合16.8 m结果，选择高门槛refresh5作为当前基线，不宣称已全面解决：高分桨叶仍可能覆盖目标，小目标/姿态变化下Tracker仍可能失效；样本每组仅3次，GPS命中不等同接触证明。
+
+直接启动检测节点、采集脚本和默认runner均使用此基线；现有VisionPNG YAML/launch保持raw与图像姿态同步。默认可复现实验命令为 `ros2 run uav_bc_recorder phase2_runner --repo-root "$PWD" --groups near far --trials 3`，无需额外获取/刷新参数。异常图像取证仍为显式 `--capture-anomalies`，不属于必需控制机制。近/远实验分别请求16.8/24 m，并沿用固定圆周入口；普通launch的起飞设置不冒充该实验入口。只有显式实验覆盖才偏离冻结配置，不新增KF、遮罩、融合或关联逻辑。
+
+冻结验证：实际启动默认检测节点及VisionPNG launch并读取运行参数；真实CUDA原图序列确认低分桨叶被拒绝、真目标获取、连续5次Tracker后再YOLO，显式低门槛覆盖仍可用于诊断。默认runner不传任何感知覆盖参数的SITL入口烟测也通过，接管延迟0.103 s；该2 s烟测不启动圆周运动、不启用距离闸门，**不计入16.8/24 m命中率**。验证日志与参数位于 `~/intercept_ws/experiment_data/visionpng_baseline_freeze/`。
 
 仅在视觉与 PNG 本体原因仍不清楚时，使用相同协议补 Pure PNG：
 

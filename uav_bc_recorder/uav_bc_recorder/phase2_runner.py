@@ -435,8 +435,8 @@ def main(argv=None):
                         help='Camera subscription reliability; reliable matches the Gazebo large-image publisher')
     parser.add_argument('--confidence-threshold',type=float,default=0.4,
                         help='YOLO post-processing candidate threshold')
-    parser.add_argument('--acquisition-threshold',type=float,default=0.0,
-                        help='Independent strict score > threshold gate; 0 retains the current reference')
+    parser.add_argument('--acquisition-threshold',type=float,default=0.8,
+                        help='Frozen VisionPNG baseline: strict score > 0.8; use 0 only for low-gate diagnostics')
     parser.add_argument('--yolo-refresh-interval',type=int,default=5,
                         help='Tracker frames before YOLO refresh; 0 retains acquisition-only YOLO')
     parser.add_argument('--capture-anomalies',action='store_true',

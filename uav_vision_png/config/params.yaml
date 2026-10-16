@@ -34,7 +34,7 @@ uav_vision_png:
     px4_time_domain: "gazebo_dds"
     # Image-epoch quaternion SLERP. false is the explicit receipt-pose A/B control.
     attitude_sync: true
-    # P2 single-variable A/B. Raw remains default until flight evidence supports KF.
+    # Frozen VisionPNG baseline: image-epoch raw LOS; KF is opt-in diagnostics only.
     pixel_estimator: "raw"
     pixel_measurement_std: 4.0       # pixels; same for YOLO/LightTrack in P2
     pixel_acceleration_std: 1000.0   # pixels/s^2
@@ -53,7 +53,7 @@ uav_vision_png:
     # Experiments override tolerances to 0.08 m / 0.2 m/s, settling to 2 s.
 
     # ---- 视觉观测超时（秒；从最后有效检测的接收时刻起算）----
-    # 明确无目标立即 COAST；完全不发消息也会按时间进入 COAST / TRACK_LOST。
+    # 无目标不刷新有效接收时间；超过 freshness_timeout 进入 COAST。
     freshness_timeout: 0.15
     track_lost_timeout: 0.6
 
